@@ -39,7 +39,7 @@ export function useModuleContent(contentPath: string | undefined): UseModuleCont
     const controller = new AbortController();
     setState(s => ({ ...s, loading: true, error: null, notFound: false }));
 
-    fetch(`/${contentPath}`, { signal: controller.signal })
+    fetch(`${import.meta.env.BASE_URL}${contentPath}`, { signal: controller.signal })
       .then(async res => {
         // Vite SPA fallback returns index.html (text/html) for missing files — treat as 404
         const ct = res.headers.get('content-type') ?? '';
