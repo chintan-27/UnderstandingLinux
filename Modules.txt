@@ -1,0 +1,834 @@
+# The complete “matter to Linux” master map
+
+## 0. Meta-foundations: how to study a system this large
+Before the technical material, there is a layer of method.
+
+### 0.1 Systems thinking
+Topics: abstraction layers, interfaces, invariants, tradeoffs, bottlenecks, failure modes, feedback loops, emergent behavior.
+
+### 0.2 Modeling
+Topics: physical models, mathematical models, state machines, probabilistic models, performance models.
+
+### 0.3 Experimental method
+Topics: hypothesis, measurement, instrumentation, controlled variables, reproducibility.
+
+### 0.4 Engineering reasoning
+Topics: correctness, robustness, safety margins, complexity, maintainability, cost, power, latency, throughput.
+
+---
+
+# Part I: Mathematics for the whole stack
+
+## 1. Basic algebra and quantitative reasoning
+Topics: equations, inequalities, exponents, logarithms, scientific notation, ratios, dimensional analysis, unit conversion, orders of magnitude.
+
+## 2. Trigonometry
+Topics: sinusoids, phase, frequency, amplitude, polar form, oscillations.
+
+## 3. Complex numbers
+Topics: real/imaginary parts, Euler’s formula, phasors, impedance intuition.
+
+## 4. Calculus
+Topics: limits, derivatives, integrals, partial derivatives, multivariable calculus, Taylor expansion, ordinary differential equations.
+
+## 5. Linear algebra
+Topics: vectors, matrices, linear transformations, rank, eigenvalues, diagonalization, orthogonality.
+
+## 6. Probability
+Topics: random variables, expectation, variance, distributions, independence, conditional probability, Bayes.
+
+## 7. Statistics
+Topics: estimation, sampling, confidence intervals, regression, variance analysis, measurement error.
+
+## 8. Discrete mathematics
+Topics: logic, proof, induction, sets, relations, functions, combinatorics, graphs, trees, recurrences.
+
+## 9. Information theory
+Topics: entropy, coding, noise, redundancy, channel capacity, compression intuition.
+
+## 10. Optimization
+Topics: constrained optimization, convexity intuition, objective functions, local vs global minima.
+
+## 11. Numerical methods
+Topics: approximation, floating-point error, stability, iterative methods.
+
+## 12. Queueing theory
+Topics: arrivals, service rates, utilization, latency, throughput, bottleneck modeling.
+
+## 13. Graph theory
+Topics: shortest paths, spanning trees, flows, cuts, routing relevance.
+
+## 14. Formal languages and automata math
+Topics: grammars, regular languages, context-free languages, automata, computability foundations.
+
+## 15. Logic and formal methods
+Topics: propositional logic, predicate logic, SAT/SMT intuition, model checking basics.
+
+---
+
+# Part II: Physics and chemistry of computation
+
+## 16. Classical mechanics basics
+Topics: force, energy, momentum, vibrations, thermal motion intuition.
+
+## 17. Electromagnetism
+Topics: charge, electric field, potential, current, magnetic field, induction, Maxwell-level intuition.
+
+## 18. Thermodynamics
+Topics: temperature, heat, entropy, energy transfer, dissipation, cooling relevance.
+
+## 19. Statistical mechanics intuition
+Topics: distributions, thermal occupancy, microscopic randomness, material behavior.
+
+## 20. Atomic physics
+Topics: atomic structure, electron shells, quantization, energy levels.
+
+## 21. Quantum mechanics foundations
+Topics: wavefunctions at an intuitive level, quantized states, tunneling, Pauli exclusion, energy bands.
+
+## 22. Chemistry foundations
+Topics: atoms, molecules, bonding, valence, reactions, oxidation, reduction.
+
+## 23. Materials science
+Topics: crystal structures, defects, grain boundaries, stress, diffusion, phase behavior.
+
+## 24. Solid-state physics
+Topics: bands, band gaps, Fermi level, carriers, mobility, recombination, scattering.
+
+## 25. Semiconductor physics
+Topics: intrinsic/extrinsic semiconductors, doping, drift, diffusion, p-n junctions, depletion regions.
+
+## 26. Semiconductor manufacturing
+Topics: silicon purification, ingot growth, wafering, oxidation, deposition, photolithography, ion implantation, diffusion, etching, CMP, metallization, yield, packaging, testing.
+
+## 27. Reliability physics
+Topics: electromigration, dielectric breakdown, thermal cycling, aging, failure distributions.
+
+---
+
+# Part III: Electricity, electronics, and signals
+
+## 28. Basic electrical quantities
+Topics: charge, current, voltage, resistance, power, energy.
+
+## 29. Circuit laws
+Topics: Ohm’s law, Kirchhoff’s current and voltage laws.
+
+## 30. Network analysis
+Topics: nodal analysis, mesh analysis, equivalent circuits, Thévenin/Norton.
+
+## 31. Capacitors and inductors
+Topics: storage, transients, RC/RL/RLC behavior, resonance intuition.
+
+## 32. Analog signals
+Topics: waveforms, frequency domain, bandwidth, filtering basics.
+
+## 33. Devices
+Topics: resistors, capacitors, inductors, diodes, BJTs, MOSFETs, sensors, oscillators.
+
+## 34. Amplifiers and analog basics
+Topics: gain, biasing, small-signal thinking, comparators, op-amp intuition.
+
+## 35. Noise
+Topics: thermal noise, shot noise, SNR, interference, jitter.
+
+## 36. Power electronics and regulation
+Topics: regulators, power supplies, decoupling, distribution, power integrity.
+
+## 37. Signal integrity
+Topics: transmission lines, reflections, crosstalk, grounding, EMI/EMC.
+
+## 38. Clocks and timing
+Topics: oscillators, PLL intuition, skew, jitter, timing closure relevance.
+
+---
+
+# Part IV: Digital logic and hardware design
+
+## 39. Boolean algebra
+Topics: truth tables, simplification, canonical forms, De Morgan, minimization.
+
+## 40. CMOS logic
+Topics: inverter, NAND, NOR, transistor-level gate design, fanout, delay, dynamic/static power.
+
+## 41. Combinational blocks
+Topics: adders, multiplexers, decoders, encoders, comparators, shifters, ALU pieces.
+
+## 42. Sequential logic
+Topics: latches, flip-flops, registers, counters, memory elements.
+
+## 43. Finite-state machines
+Topics: state encoding, transition logic, control design.
+
+## 44. Synchronous design
+Topics: setup/hold, clock domains, metastability, reset strategies.
+
+## 45. Asynchronous design basics
+Topics: handshakes, hazards, synchronization.
+
+## 46. Hardware description languages
+Topics: Verilog/VHDL/SystemVerilog concepts, simulation, synthesis.
+
+## 47. Verification
+Topics: testbenches, assertions, formal verification basics, timing analysis.
+
+## 48. FPGA and ASIC workflows
+Topics: synthesis, place-and-route, timing closure, constraints.
+
+---
+
+# Part V: Computer architecture and microarchitecture
+
+## 49. Machine organization
+Topics: datapath, control, register file, ALU, buses.
+
+## 50. Instruction set architecture
+Topics: opcodes, instruction formats, registers, addressing modes, privilege levels.
+
+## 51. Assembly language
+Topics: arithmetic, branches, stack, procedures, calling conventions.
+
+## 52. Microarchitecture
+Topics: single-cycle, multi-cycle, pipelined designs.
+
+## 53. Pipelining
+Topics: hazards, forwarding, stalling, branch prediction basics.
+
+## 54. Superscalar and out-of-order execution
+Topics: renaming, reorder buffers, issue queues, speculation.
+
+## 55. Caches
+Topics: locality, mapping, replacement, coherence intuition.
+
+## 56. Virtual memory hardware
+Topics: page tables, TLBs, address translation hardware.
+
+## 57. Interrupts and exceptions
+Topics: traps, faults, interrupts, context save/restore.
+
+## 58. Memory technologies
+Topics: SRAM, DRAM, ROM, flash, persistent memory concepts.
+
+## 59. Interconnects and buses
+Topics: PCIe intuition, memory buses, on-chip interconnects.
+
+## 60. Multiprocessors
+Topics: shared memory, cache coherence, NUMA, inter-socket behavior.
+
+## 61. Accelerators
+Topics: GPU concepts, DMA-heavy devices, offload models.
+
+## 62. Firmware
+Topics: boot ROM, UEFI/BIOS concepts, hardware initialization.
+
+---
+
+# Part VI: How software becomes machine behavior
+
+## 63. Binary data representation
+Topics: bits, bytes, endianness, two’s complement, fixed point, IEEE floating point.
+
+## 64. C language at systems depth
+Topics: memory model, storage duration, pointers, arrays, structs, unions, UB, volatile.
+
+## 65. Other systems languages
+Topics: C++, Rust basics in systems context, ABI interaction.
+
+## 66. Assemblers and object generation
+Topics: symbols, relocation, instruction encoding.
+
+## 67. Linkers
+Topics: static linking, dynamic linking, symbol resolution, GOT/PLT intuition.
+
+## 68. Executable formats
+Topics: ELF sections, segments, symbols, relocations, shared objects.
+
+## 69. Loaders and runtime startup
+Topics: process image, runtime initialization, dynamic loader.
+
+## 70. Compilers
+Topics: lexical analysis, parsing, IR, optimization, code generation.
+
+## 71. Compiler optimizations
+Topics: inlining, vectorization, alias analysis, loop optimizations.
+
+## 72. Build systems
+Topics: Make, dependency graphs, reproducible builds, cross-compilation.
+
+## 73. Debug info and tooling
+Topics: DWARF intuition, symbol tables, stack unwinding.
+
+---
+
+# Part VII: Operating systems in general
+
+## 74. What an OS does
+Topics: abstraction, resource management, isolation, multiplexing.
+
+## 75. Processes
+Topics: process model, process state, creation, termination.
+
+## 76. Threads
+Topics: user vs kernel threads, concurrency models.
+
+## 77. Scheduling
+Topics: policies, fairness, latency, throughput, real-time concepts.
+
+## 78. Context switching
+Topics: register state, MMU context, kernel entry/exit costs.
+
+## 79. Memory management
+Topics: allocation, fragmentation, paging, segmentation history, demand paging.
+
+## 80. Virtual memory
+Topics: address spaces, translation, protection, copy-on-write, mmap.
+
+## 81. Synchronization
+Topics: locks, semaphores, monitors, condition variables, atomics.
+
+## 82. Deadlocks and liveness
+Topics: deadlock conditions, avoidance, starvation, fairness.
+
+## 83. File systems
+Topics: files, directories, metadata, naming, consistency, journaling.
+
+## 84. I/O systems
+Topics: buffering, spooling, interrupt-driven I/O, DMA.
+
+## 85. Device abstraction
+Topics: device models, block vs character, control paths.
+
+## 86. IPC
+Topics: pipes, message queues, shared memory, sockets, signals.
+
+## 87. Protection and security
+Topics: users, permissions, privilege, authentication basics.
+
+## 88. Distributed OS ideas
+Topics: naming, location transparency, failures, consistency.
+
+---
+
+# Part VIII: Linux user-space foundations
+
+## 89. Linux philosophy and Unix lineage
+Topics: everything is a file intuition, composability, text streams, process-centric design.
+
+## 90. Shells
+Topics: parsing, expansion, redirection, pipelines, job control.
+
+## 91. Core utilities
+Topics: grep, sed, awk, find, xargs, sort, cut, tr, ps, top.
+
+## 92. Filesystem hierarchy and conventions
+Topics: `/bin`, `/usr`, `/etc`, `/proc`, `/sys`, `/dev`, `/var`, `/home`.
+
+## 93. Users, groups, permissions
+Topics: ownership, mode bits, ACL concepts, sudo basics.
+
+## 94. Processes in practice
+Topics: fork/exec, signals, sessions, daemons.
+
+## 95. Shared libraries and libc
+Topics: libc role, dynamic loader, ABI, API vs ABI.
+
+## 96. Init and service management
+Topics: init concepts, service lifecycle, boot userspace.
+
+## 97. Package ecosystems
+Topics: package managers, repositories, dependencies, source vs binary packaging.
+
+## 98. Logging and observability
+Topics: syslog concepts, journals, log rotation, metrics basics.
+
+## 99. Scripting
+Topics: shell scripting, Python for systems automation.
+
+---
+
+# Part IX: Linux kernel architecture
+
+## 100. Kernel high-level structure
+Topics: monolithic kernel, modules, subsystems, syscall boundary.
+
+## 101. Kernel source tree organization
+Topics: arch, mm, fs, net, drivers, kernel, lib, include.
+
+## 102. Boot path
+Topics: firmware handoff, bootloader, kernel decompression, early init, initramfs, userspace init.
+
+## 103. System call path
+Topics: entry, dispatch, privilege transition, return to userspace.
+
+## 104. Process and task model
+Topics: task_struct, scheduling entities, PID model, namespaces relation.
+
+## 105. Scheduler internals
+Topics: CFS intuition, run queues, priorities, realtime scheduling.
+
+## 106. Memory management internals
+Topics: pages, zones, buddy allocator, slab/slub, page cache, reclaim.
+
+## 107. Virtual memory areas
+Topics: mappings, faults, anonymous/file-backed memory, mmap path.
+
+## 108. Interrupt handling
+Topics: hard IRQ, softirq, tasklets history, threaded interrupts.
+
+## 109. Timers and timekeeping
+Topics: jiffies, hrtimers, clocksources, timers, scheduler clock.
+
+## 110. Synchronization in kernel
+Topics: spinlocks, mutexes, rwlocks, RCU, atomics, memory barriers.
+
+## 111. VFS
+Topics: dentries, inodes, superblocks, file objects, path resolution.
+
+## 112. Block layer
+Topics: requests, queues, elevators, bio structures.
+
+## 113. Character device infrastructure
+Topics: device nodes, file operations, ioctl concepts.
+
+## 114. Module system
+Topics: loadable modules, symbol export, taint basics.
+
+## 115. Kernel memory allocation APIs
+Topics: kmalloc, vmalloc, GFP flags, allocation contexts.
+
+## 116. Workqueues and deferred execution
+Topics: bottom halves, workqueues, task scheduling in kernel.
+
+## 117. Kernel tracing and observability
+Topics: ftrace, tracepoints, perf events, eBPF concepts.
+
+## 118. Security subsystems
+Topics: capabilities, LSM framework, seccomp, audit basics.
+
+## 119. Namespaces and cgroups
+Topics: process isolation, resource control, container primitives.
+
+## 120. Kernel configuration and build
+Topics: Kconfig, Makefiles, modules vs built-in, image generation.
+
+---
+
+# Part X: Linux drivers — “all the drivers” as a structured domain
+
+You asked specifically about drivers in detail. “All drivers” is too large to enumerate device by device, so the right way is by **driver classes and kernel frameworks**.
+
+## 121. Driver fundamentals
+Topics: what a driver is, probing, binding, device IDs, resources, lifecycles.
+
+## 122. Device model
+Topics: buses, devices, drivers, classes, sysfs representation.
+
+## 123. Platform devices and device tree / ACPI concepts
+Topics: hardware description, enumeration models.
+
+## 124. PCI/PCIe drivers
+Topics: enumeration, BARs, interrupts, DMA, config space.
+
+## 125. USB drivers
+Topics: host controllers, endpoints, transfers, classes, hotplug.
+
+## 126. I2C and SPI drivers
+Topics: bus transactions, peripherals, sensors, embedded devices.
+
+## 127. UART and serial subsystems
+Topics: TTY layer, serial ports, consoles.
+
+## 128. GPIO and pin control
+Topics: general purpose I/O, pin multiplexing, interrupts.
+
+## 129. Input subsystem
+Topics: keyboards, mice, touchscreens, event devices.
+
+## 130. Storage drivers
+Topics: SATA, NVMe concepts, SCSI layer, block interfaces.
+
+## 131. Network drivers
+Topics: NIC initialization, RX/TX rings, NAPI, interrupts, offloads.
+
+## 132. Graphics drivers
+Topics: DRM/KMS concepts, framebuffer history, display pipelines.
+
+## 133. Audio drivers
+Topics: ALSA concepts, PCM, mixer, streaming.
+
+## 134. Camera and media drivers
+Topics: V4L2 concepts, buffers, pipelines.
+
+## 135. Power management in drivers
+Topics: suspend/resume, runtime PM, clock control, regulators.
+
+## 136. Interrupt-driven and DMA-capable drivers
+Topics: mapping memory, coherency, completion paths.
+
+## 137. Driver concurrency and synchronization
+Topics: locks, IRQ-safe paths, sleep vs atomic context.
+
+## 138. User-kernel interfaces for drivers
+Topics: ioctl, sysfs, procfs, netlink, mmap, read/write, poll.
+
+## 139. Debugging drivers
+Topics: dmesg, dynamic debug, tracepoints, lockdep, sanitizers.
+
+## 140. Security and robustness of drivers
+Topics: input validation, lifetime bugs, race bugs, DMA safety.
+
+If you later want, I can break just **drivers** into a separate 100-topic map.
+
+---
+
+# Part XI: Linux networking — complete structured map
+
+## 141. Networking fundamentals
+Topics: layering, framing, packets, switching, routing.
+
+## 142. Physical and link layer basics
+Topics: copper, fiber, signaling intuition, Ethernet framing, MAC addresses.
+
+## 143. IP layer
+Topics: IPv4, IPv6, addressing, subnetting, fragmentation, TTL/hop limit.
+
+## 144. Routing
+Topics: forwarding tables, ARP/ND, gateways, dynamic routing intuition.
+
+## 145. Transport layer
+Topics: TCP, UDP, ports, reliability, flow control, congestion control.
+
+## 146. DNS and naming
+Topics: recursive resolution, caching, record types, stub resolvers.
+
+## 147. Application protocols
+Topics: HTTP, TLS concepts, SSH, SMTP, NTP, DHCP at a systems level.
+
+## 148. Sockets API
+Topics: socket lifecycle, bind, listen, accept, connect, send/recv, nonblocking I/O.
+
+## 149. Linux network stack internals
+Topics: sk_buff, receive path, transmit path, routing lookup, socket buffers.
+
+## 150. NIC interaction
+Topics: DMA rings, interrupts, NAPI, checksum offload, segmentation offload.
+
+## 151. Netfilter and packet processing
+Topics: filtering, NAT, hooks, packet traversal intuition.
+
+## 152. Traffic control
+Topics: qdiscs, shaping, policing, queueing behavior.
+
+## 153. Virtual networking
+Topics: bridges, veth, tap/tun, namespaces, overlays.
+
+## 154. Performance engineering for networking
+Topics: zero-copy ideas, batching, RSS, RPS, CPU affinity, latency vs throughput.
+
+## 155. Wireless networking basics
+Topics: Wi-Fi architecture, association, channels, encryption at a high level.
+
+## 156. Network security
+Topics: TLS fundamentals, firewalls, VPN concepts, authentication, spoofing basics.
+
+## 157. Observability
+Topics: tcpdump, ss, iproute2, ethtool, perf, tracing.
+
+## 158. Distributed systems interplay
+Topics: retries, timeouts, partial failure, idempotency, backpressure.
+
+---
+
+# Part XII: Storage and filesystems
+
+## 159. Magnetic storage basics
+Topics: disks, sectors, seeks, rotational latency.
+
+## 160. Flash storage and SSDs
+Topics: pages, blocks, wear leveling, garbage collection, FTL.
+
+## 161. RAID and redundancy
+Topics: striping, mirroring, parity, failure tradeoffs.
+
+## 162. Linux block layer deep dive
+Topics: requests, elevators, multiqueue block layer.
+
+## 163. Filesystem design
+Topics: allocation, metadata, journaling, crash consistency, copy-on-write ideas.
+
+## 164. Linux filesystems
+Topics: ext4 concepts, XFS concepts, Btrfs concepts at a high level.
+
+## 165. Page cache and writeback
+Topics: caching, dirty pages, flushing, consistency semantics.
+
+## 166. Memory-mapped files
+Topics: mmap interaction with page cache and virtual memory.
+
+## 167. Storage performance
+Topics: IOPS, throughput, queue depth, fsync costs, latency distributions.
+
+---
+
+# Part XIII: Concurrency, parallelism, and multicore systems
+
+## 168. Threads and shared memory
+Topics: race conditions, critical sections, synchronization patterns.
+
+## 169. Atomics and memory ordering
+Topics: acquire/release intuition, fences, happens-before.
+
+## 170. Cache coherence
+Topics: coherence states, false sharing, cache line bouncing.
+
+## 171. NUMA
+Topics: locality, remote memory access, placement.
+
+## 172. Parallel programming models
+Topics: threads, event loops, async I/O, work stealing, task models.
+
+## 173. Performance scaling laws
+Topics: Amdahl, Gustafson, bottleneck reasoning.
+
+## 174. Kernel concurrency patterns
+Topics: RCU, lock hierarchies, per-CPU data, interrupt concurrency.
+
+---
+
+# Part XIV: Security
+
+## 175. Security foundations
+Topics: threat models, attack surface, least privilege, trust boundaries.
+
+## 176. Linux permissions and identity
+Topics: UID/GID, capabilities, setuid, ACL concepts.
+
+## 177. Memory safety and exploitation basics
+Topics: overflows, use-after-free intuition, mitigations.
+
+## 178. Kernel security
+Topics: module trust, LSMs, seccomp, namespaces as isolation building blocks.
+
+## 179. Cryptography fundamentals
+Topics: hashing, symmetric/asymmetric encryption, signatures, key exchange at a conceptual level.
+
+## 180. Secure networking
+Topics: TLS, certificates, SSH trust models, VPN concepts.
+
+## 181. Authentication and authorization
+Topics: passwords, PAM concepts, tokens, policy.
+
+## 182. System hardening
+Topics: patching, least privilege, auditing, isolation, logging, attack surface reduction.
+
+---
+
+# Part XV: Performance, profiling, and observability
+
+## 183. Performance models
+Topics: latency, throughput, utilization, service time, queueing.
+
+## 184. CPU profiling
+Topics: sampling, instrumentation, flame graph intuition.
+
+## 185. Memory profiling
+Topics: allocation patterns, working set, cache misses, page faults.
+
+## 186. I/O profiling
+Topics: disk latency, queueing, block traces.
+
+## 187. Network profiling
+Topics: packet drops, retransmissions, queueing, socket buffers.
+
+## 188. Linux observability tools
+Topics: ps, top, vmstat, iostat, sar, perf, strace, ltrace, ftrace, eBPF overview.
+
+## 189. Benchmarking methodology
+Topics: warmup, noise, isolation, representative workloads, measurement error.
+
+---
+
+# Part XVI: Containers, virtualization, and cloud-era Linux
+
+## 190. Virtualization basics
+Topics: type 1/type 2 intuition, hardware virtualization support, guest/host boundary.
+
+## 191. KVM concepts
+Topics: VM execution model, virtual devices, hypervisor interactions.
+
+## 192. Containers
+Topics: namespaces, cgroups, filesystem layering, OCI intuition.
+
+## 193. Orchestration concepts
+Topics: scheduling, service discovery, health checks, resource limits.
+
+## 194. Storage and networking in containers
+Topics: overlay filesystems, bridge networking, CNI-level intuition.
+
+---
+
+# Part XVII: Programming around Linux
+
+## 195. System programming in C
+Topics: processes, files, signals, pipes, sockets, epoll, threads.
+
+## 196. Async I/O models
+Topics: select, poll, epoll, io_uring concepts.
+
+## 197. Daemon and service design
+Topics: lifecycle, supervision, signals, logging, config, reloads.
+
+## 198. Interprocess communication design
+Topics: pipes, shared memory, RPC, sockets, protocol design.
+
+## 199. Error handling and robustness
+Topics: errno, retries, backoff, partial failure handling.
+
+## 200. ABI, API, and compatibility
+Topics: versioning, syscall stability, library compatibility.
+
+---
+
+# Part XVIII: Compilers, languages, and runtimes as they meet Linux
+
+## 201. Runtime systems
+Topics: process startup, stacks, heaps, allocators, garbage collection interaction with OS.
+
+## 202. Memory allocators
+Topics: malloc internals, arenas, fragmentation, tcache intuition.
+
+## 203. Managed runtimes on Linux
+Topics: JVM/.NET/Go runtime interactions with threads, memory, syscalls.
+
+## 204. FFI and language interoperability
+Topics: calling conventions, shared libraries, symbol interfaces.
+
+---
+
+# Part XIX: Distributed systems above Linux
+
+## 205. Time and clocks
+Topics: monotonic vs wall clocks, synchronization, drift.
+
+## 206. Failure models
+Topics: crash, omission, partition, partial failure.
+
+## 207. RPC and service communication
+Topics: retries, deadlines, serialization, load balancing.
+
+## 208. Consistency basics
+Topics: replication, consensus intuition, eventual consistency.
+
+## 209. Linux as a node in a distributed system
+Topics: resource isolation, observability, network and storage interactions.
+
+---
+
+# Part XX: Advanced engineering practice
+
+## 210. Source control and collaboration
+Topics: Git, branching, patch workflows, code review.
+
+## 211. Testing
+Topics: unit, integration, system, stress, fuzzing.
+
+## 212. Continuous integration
+Topics: reproducibility, automation, artifact pipelines.
+
+## 213. Reliability engineering
+Topics: SLOs, error budgets, incident response, capacity planning.
+
+## 214. Kernel contribution workflow
+Topics: patches, subsystem maintainers, coding style, mailing list culture.
+
+## 215. Reading specifications and standards
+Topics: RFCs, ABI docs, architecture manuals, vendor docs.
+
+---
+
+# Part XXI: Mathematical dependencies by topic
+
+You asked to include the math as well, so here is the dependency map.
+
+## Math needed for semiconductor physics
+Algebra, logarithms, calculus, differential equations, probability/stat mech intuition.
+
+## Math needed for circuits
+Algebra, calculus, complex numbers, differential equations, linear algebra.
+
+## Math needed for signal integrity and communications
+Trigonometry, complex numbers, Fourier intuition, probability.
+
+## Math needed for digital logic
+Discrete math, Boolean algebra, combinatorics.
+
+## Math needed for architecture and performance
+Discrete math, probability, queueing theory, linear algebra intuition.
+
+## Math needed for compilers
+Discrete math, formal languages, graph theory, logic.
+
+## Math needed for OS scheduling and performance
+Probability, statistics, queueing theory, optimization.
+
+## Math needed for networking
+Probability, graph theory, queueing theory, information theory.
+
+## Math needed for security and cryptography
+Number theory basics, probability, algebra, complexity intuition.
+
+---
+
+# Part XXII: What “all drivers” and “all networking” really mean in practice
+
+If your goal is mastery, there are three different levels of knowing a domain.
+
+## Level 1: Architectural knowledge
+You know every major subsystem, why it exists, how it fits, and the key abstractions.
+
+## Level 2: Operational knowledge
+You can use tools, debug issues, read traces, inspect code paths, and explain behavior.
+
+## Level 3: Implementer knowledge
+You can read and write kernel or systems code in that area.
+
+For **drivers**, “all drivers” is not realistic at Level 3, because the Linux kernel supports enormous amounts of hardware. But **all driver frameworks and concepts** absolutely is realistic.
+
+For **networking**, “all networking” is similarly huge, but **all core Linux networking architecture and protocols** is realistic.
+
+---
+
+# Part XXIII: A practical study order
+
+Even though you asked to list everything, it still needs an order. The best order is:
+
+math foundations → physics/chemistry of semiconductors → circuits → digital logic → architecture → C/assembly/toolchain → operating systems → Linux internals → drivers → networking → performance → security → containers/virtualization → distributed systems → kernel source mastery.
+
+That order follows causality.
+
+---
+
+# Part XXIV: The actual curriculum I recommend we use together
+
+I would break this into **12 supermodules**:
+
+**Supermodule 1:** Math for physical computing  
+**Supermodule 2:** Physics and chemistry of materials and semiconductors  
+**Supermodule 3:** Electricity, analog electronics, and signals  
+**Supermodule 4:** Digital logic and hardware design  
+**Supermodule 5:** Computer architecture and machine execution  
+**Supermodule 6:** C, assembly, compilers, linking, and binaries  
+**Supermodule 7:** Core operating systems  
+**Supermodule 8:** Linux user space and system programming  
+**Supermodule 9:** Linux kernel internals  
+**Supermodule 10:** Drivers and hardware interaction  
+**Supermodule 11:** Networking and distributed communication  
+**Supermodule 12:** Performance, security, virtualization, and advanced Linux engineering
+
+Each supermodule can then be split into weekly modules.
+
+---
+
+# Part XXV: What I think we should do next
+
+The best next step is not to expand the map further, but to **freeze the syllabus and begin at the true bottom**.

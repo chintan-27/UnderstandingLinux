@@ -1,0 +1,3669 @@
+{
+  "supermodules": [
+    {
+      "id": 1,
+      "title": "Math for Physical Computing",
+      "slug": "math-for-physical-computing",
+      "description": "Algebra through information theory — the mathematical toolkit every layer of the stack draws from.",
+      "moduleCount": 15,
+      "moduleIds": [
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7,
+        8,
+        9,
+        10,
+        11,
+        12,
+        13,
+        14,
+        15
+      ]
+    },
+    {
+      "id": 2,
+      "title": "Physics and Chemistry of Computing",
+      "slug": "physics-and-chemistry-of-computing",
+      "description": "From atomic structure to semiconductor physics: why matter behaves the way it does inside a chip.",
+      "moduleCount": 12,
+      "moduleIds": [
+        16,
+        17,
+        18,
+        19,
+        20,
+        21,
+        22,
+        23,
+        24,
+        25,
+        26,
+        27
+      ]
+    },
+    {
+      "id": 3,
+      "title": "Electricity, Electronics, and Signals",
+      "slug": "electricity-electronics-and-signals",
+      "description": "Circuit laws, analog signals, noise, and the physical foundations of digital hardware.",
+      "moduleCount": 11,
+      "moduleIds": [
+        28,
+        29,
+        30,
+        31,
+        32,
+        33,
+        34,
+        35,
+        36,
+        37,
+        38
+      ]
+    },
+    {
+      "id": 4,
+      "title": "Digital Logic and Hardware Design",
+      "slug": "digital-logic-and-hardware-design",
+      "description": "Boolean algebra through HDLs, FPGAs, and timing closure — how logic gates become computation.",
+      "moduleCount": 10,
+      "moduleIds": [
+        39,
+        40,
+        41,
+        42,
+        43,
+        44,
+        45,
+        46,
+        47,
+        48
+      ]
+    },
+    {
+      "id": 5,
+      "title": "Computer Architecture and Machine Execution",
+      "slug": "computer-architecture-and-machine-execution",
+      "description": "ISA, pipelining, caches, virtual memory, and multiprocessors — the hardware a program runs on.",
+      "moduleCount": 14,
+      "moduleIds": [
+        49,
+        50,
+        51,
+        52,
+        53,
+        54,
+        55,
+        56,
+        57,
+        58,
+        59,
+        60,
+        61,
+        62
+      ]
+    },
+    {
+      "id": 6,
+      "title": "C, Assembly, Compilers, Linking, and Binaries",
+      "slug": "c-assembly-compilers-linking-and-binaries",
+      "description": "How source code becomes machine instructions: C semantics, toolchains, ELF, and runtime startup.",
+      "moduleCount": 11,
+      "moduleIds": [
+        63,
+        64,
+        65,
+        66,
+        67,
+        68,
+        69,
+        70,
+        71,
+        72,
+        73
+      ]
+    },
+    {
+      "id": 7,
+      "title": "Core Operating Systems",
+      "slug": "core-operating-systems",
+      "description": "Processes, scheduling, memory management, filesystems, IPC, and OS security fundamentals.",
+      "moduleCount": 15,
+      "moduleIds": [
+        74,
+        75,
+        76,
+        77,
+        78,
+        79,
+        80,
+        81,
+        82,
+        83,
+        84,
+        85,
+        86,
+        87,
+        88
+      ]
+    },
+    {
+      "id": 8,
+      "title": "Linux User Space and System Programming",
+      "slug": "linux-user-space-and-system-programming",
+      "description": "The Unix philosophy in practice: shells, core utilities, libc, init, and systems programming.",
+      "moduleCount": 11,
+      "moduleIds": [
+        89,
+        90,
+        91,
+        92,
+        93,
+        94,
+        95,
+        96,
+        97,
+        98,
+        99
+      ]
+    },
+    {
+      "id": 9,
+      "title": "Linux Kernel Internals",
+      "slug": "linux-kernel-internals",
+      "description": "The kernel source tree, syscall path, scheduler, MM, VFS, block layer, and eBPF — from the inside.",
+      "moduleCount": 21,
+      "moduleIds": [
+        100,
+        101,
+        102,
+        103,
+        104,
+        105,
+        106,
+        107,
+        108,
+        109,
+        110,
+        111,
+        112,
+        113,
+        114,
+        115,
+        116,
+        117,
+        118,
+        119,
+        120
+      ]
+    },
+    {
+      "id": 10,
+      "title": "Drivers and Hardware Interaction",
+      "slug": "drivers-and-hardware-interaction",
+      "description": "All driver frameworks: PCI, USB, I2C, SPI, input, storage, network, graphics, power management.",
+      "moduleCount": 20,
+      "moduleIds": [
+        121,
+        122,
+        123,
+        124,
+        125,
+        126,
+        127,
+        128,
+        129,
+        130,
+        131,
+        132,
+        133,
+        134,
+        135,
+        136,
+        137,
+        138,
+        139,
+        140
+      ]
+    },
+    {
+      "id": 11,
+      "title": "Networking and Distributed Communication",
+      "slug": "networking-and-distributed-communication",
+      "description": "The full Linux network stack: sockets through netfilter, NIC drivers through distributed system patterns.",
+      "moduleCount": 23,
+      "moduleIds": [
+        141,
+        142,
+        143,
+        144,
+        145,
+        146,
+        147,
+        148,
+        149,
+        150,
+        151,
+        152,
+        153,
+        154,
+        155,
+        156,
+        157,
+        158,
+        205,
+        206,
+        207,
+        208,
+        209
+      ]
+    },
+    {
+      "id": 12,
+      "title": "Performance, Security, Virtualization, and Beyond",
+      "slug": "performance-security-virtualization-and-beyond",
+      "description": "Profiling, kernel security, containers, KVM, storage performance, and advanced Linux engineering.",
+      "moduleCount": 52,
+      "moduleIds": [
+        159,
+        160,
+        161,
+        162,
+        163,
+        164,
+        165,
+        166,
+        167,
+        168,
+        169,
+        170,
+        171,
+        172,
+        173,
+        174,
+        175,
+        176,
+        177,
+        178,
+        179,
+        180,
+        181,
+        182,
+        183,
+        184,
+        185,
+        186,
+        187,
+        188,
+        189,
+        190,
+        191,
+        192,
+        193,
+        194,
+        195,
+        196,
+        197,
+        198,
+        199,
+        200,
+        201,
+        202,
+        203,
+        204,
+        210,
+        211,
+        212,
+        213,
+        214,
+        215
+      ]
+    }
+  ],
+  "modules": [
+    {
+      "id": 1,
+      "title": "Basic algebra and quantitative reasoning",
+      "slug": "basic-algebra-and-quantitative-reasoning",
+      "part": "I",
+      "partTitle": "Mathematics for the whole stack",
+      "supermoduleId": 1,
+      "topics": [
+        "equations",
+        "inequalities",
+        "exponents",
+        "logarithms",
+        "scientific notation",
+        "ratios",
+        "dimensional analysis",
+        "unit conversion",
+        "orders of magnitude"
+      ],
+      "contentPath": "content/modules/001-basic-algebra-and-quantitative-reasoning.md"
+    },
+    {
+      "id": 2,
+      "title": "Trigonometry",
+      "slug": "trigonometry",
+      "part": "I",
+      "partTitle": "Mathematics for the whole stack",
+      "supermoduleId": 1,
+      "topics": [
+        "sinusoids",
+        "phase",
+        "frequency",
+        "amplitude",
+        "polar form",
+        "oscillations"
+      ],
+      "contentPath": "content/modules/002-trigonometry.md"
+    },
+    {
+      "id": 3,
+      "title": "Complex numbers",
+      "slug": "complex-numbers",
+      "part": "I",
+      "partTitle": "Mathematics for the whole stack",
+      "supermoduleId": 1,
+      "topics": [
+        "real/imaginary parts",
+        "Euler’s formula",
+        "phasors",
+        "impedance intuition"
+      ],
+      "contentPath": "content/modules/003-complex-numbers.md"
+    },
+    {
+      "id": 4,
+      "title": "Calculus",
+      "slug": "calculus",
+      "part": "I",
+      "partTitle": "Mathematics for the whole stack",
+      "supermoduleId": 1,
+      "topics": [
+        "limits",
+        "derivatives",
+        "integrals",
+        "partial derivatives",
+        "multivariable calculus",
+        "Taylor expansion",
+        "ordinary differential equations"
+      ],
+      "contentPath": "content/modules/004-calculus.md"
+    },
+    {
+      "id": 5,
+      "title": "Linear algebra",
+      "slug": "linear-algebra",
+      "part": "I",
+      "partTitle": "Mathematics for the whole stack",
+      "supermoduleId": 1,
+      "topics": [
+        "vectors",
+        "matrices",
+        "linear transformations",
+        "rank",
+        "eigenvalues",
+        "diagonalization",
+        "orthogonality"
+      ],
+      "contentPath": "content/modules/005-linear-algebra.md"
+    },
+    {
+      "id": 6,
+      "title": "Probability",
+      "slug": "probability",
+      "part": "I",
+      "partTitle": "Mathematics for the whole stack",
+      "supermoduleId": 1,
+      "topics": [
+        "random variables",
+        "expectation",
+        "variance",
+        "distributions",
+        "independence",
+        "conditional probability",
+        "Bayes"
+      ],
+      "contentPath": "content/modules/006-probability.md"
+    },
+    {
+      "id": 7,
+      "title": "Statistics",
+      "slug": "statistics",
+      "part": "I",
+      "partTitle": "Mathematics for the whole stack",
+      "supermoduleId": 1,
+      "topics": [
+        "estimation",
+        "sampling",
+        "confidence intervals",
+        "regression",
+        "variance analysis",
+        "measurement error"
+      ],
+      "contentPath": "content/modules/007-statistics.md"
+    },
+    {
+      "id": 8,
+      "title": "Discrete mathematics",
+      "slug": "discrete-mathematics",
+      "part": "I",
+      "partTitle": "Mathematics for the whole stack",
+      "supermoduleId": 1,
+      "topics": [
+        "logic",
+        "proof",
+        "induction",
+        "sets",
+        "relations",
+        "functions",
+        "combinatorics",
+        "graphs",
+        "trees",
+        "recurrences"
+      ],
+      "contentPath": "content/modules/008-discrete-mathematics.md"
+    },
+    {
+      "id": 9,
+      "title": "Information theory",
+      "slug": "information-theory",
+      "part": "I",
+      "partTitle": "Mathematics for the whole stack",
+      "supermoduleId": 1,
+      "topics": [
+        "entropy",
+        "coding",
+        "noise",
+        "redundancy",
+        "channel capacity",
+        "compression intuition"
+      ],
+      "contentPath": "content/modules/009-information-theory.md"
+    },
+    {
+      "id": 10,
+      "title": "Optimization",
+      "slug": "optimization",
+      "part": "I",
+      "partTitle": "Mathematics for the whole stack",
+      "supermoduleId": 1,
+      "topics": [
+        "constrained optimization",
+        "convexity intuition",
+        "objective functions",
+        "local vs global minima"
+      ],
+      "contentPath": "content/modules/010-optimization.md"
+    },
+    {
+      "id": 11,
+      "title": "Numerical methods",
+      "slug": "numerical-methods",
+      "part": "I",
+      "partTitle": "Mathematics for the whole stack",
+      "supermoduleId": 1,
+      "topics": [
+        "approximation",
+        "floating-point error",
+        "stability",
+        "iterative methods"
+      ],
+      "contentPath": "content/modules/011-numerical-methods.md"
+    },
+    {
+      "id": 12,
+      "title": "Queueing theory",
+      "slug": "queueing-theory",
+      "part": "I",
+      "partTitle": "Mathematics for the whole stack",
+      "supermoduleId": 1,
+      "topics": [
+        "arrivals",
+        "service rates",
+        "utilization",
+        "latency",
+        "throughput",
+        "bottleneck modeling"
+      ],
+      "contentPath": "content/modules/012-queueing-theory.md"
+    },
+    {
+      "id": 13,
+      "title": "Graph theory",
+      "slug": "graph-theory",
+      "part": "I",
+      "partTitle": "Mathematics for the whole stack",
+      "supermoduleId": 1,
+      "topics": [
+        "shortest paths",
+        "spanning trees",
+        "flows",
+        "cuts",
+        "routing relevance"
+      ],
+      "contentPath": "content/modules/013-graph-theory.md"
+    },
+    {
+      "id": 14,
+      "title": "Formal languages and automata math",
+      "slug": "formal-languages-and-automata-math",
+      "part": "I",
+      "partTitle": "Mathematics for the whole stack",
+      "supermoduleId": 1,
+      "topics": [
+        "grammars",
+        "regular languages",
+        "context-free languages",
+        "automata",
+        "computability foundations"
+      ],
+      "contentPath": "content/modules/014-formal-languages-and-automata-math.md"
+    },
+    {
+      "id": 15,
+      "title": "Logic and formal methods",
+      "slug": "logic-and-formal-methods",
+      "part": "I",
+      "partTitle": "Mathematics for the whole stack",
+      "supermoduleId": 1,
+      "topics": [
+        "propositional logic",
+        "predicate logic",
+        "SAT/SMT intuition",
+        "model checking basics"
+      ],
+      "contentPath": "content/modules/015-logic-and-formal-methods.md"
+    },
+    {
+      "id": 16,
+      "title": "Classical mechanics basics",
+      "slug": "classical-mechanics-basics",
+      "part": "II",
+      "partTitle": "Physics and chemistry of computation",
+      "supermoduleId": 2,
+      "topics": [
+        "force",
+        "energy",
+        "momentum",
+        "vibrations",
+        "thermal motion intuition"
+      ],
+      "contentPath": "content/modules/016-classical-mechanics-basics.md"
+    },
+    {
+      "id": 17,
+      "title": "Electromagnetism",
+      "slug": "electromagnetism",
+      "part": "II",
+      "partTitle": "Physics and chemistry of computation",
+      "supermoduleId": 2,
+      "topics": [
+        "charge",
+        "electric field",
+        "potential",
+        "current",
+        "magnetic field",
+        "induction",
+        "Maxwell-level intuition"
+      ],
+      "contentPath": "content/modules/017-electromagnetism.md"
+    },
+    {
+      "id": 18,
+      "title": "Thermodynamics",
+      "slug": "thermodynamics",
+      "part": "II",
+      "partTitle": "Physics and chemistry of computation",
+      "supermoduleId": 2,
+      "topics": [
+        "temperature",
+        "heat",
+        "entropy",
+        "energy transfer",
+        "dissipation",
+        "cooling relevance"
+      ],
+      "contentPath": "content/modules/018-thermodynamics.md"
+    },
+    {
+      "id": 19,
+      "title": "Statistical mechanics intuition",
+      "slug": "statistical-mechanics-intuition",
+      "part": "II",
+      "partTitle": "Physics and chemistry of computation",
+      "supermoduleId": 2,
+      "topics": [
+        "distributions",
+        "thermal occupancy",
+        "microscopic randomness",
+        "material behavior"
+      ],
+      "contentPath": "content/modules/019-statistical-mechanics-intuition.md"
+    },
+    {
+      "id": 20,
+      "title": "Atomic physics",
+      "slug": "atomic-physics",
+      "part": "II",
+      "partTitle": "Physics and chemistry of computation",
+      "supermoduleId": 2,
+      "topics": [
+        "atomic structure",
+        "electron shells",
+        "quantization",
+        "energy levels"
+      ],
+      "contentPath": "content/modules/020-atomic-physics.md"
+    },
+    {
+      "id": 21,
+      "title": "Quantum mechanics foundations",
+      "slug": "quantum-mechanics-foundations",
+      "part": "II",
+      "partTitle": "Physics and chemistry of computation",
+      "supermoduleId": 2,
+      "topics": [
+        "wavefunctions at an intuitive level",
+        "quantized states",
+        "tunneling",
+        "Pauli exclusion",
+        "energy bands"
+      ],
+      "contentPath": "content/modules/021-quantum-mechanics-foundations.md"
+    },
+    {
+      "id": 22,
+      "title": "Chemistry foundations",
+      "slug": "chemistry-foundations",
+      "part": "II",
+      "partTitle": "Physics and chemistry of computation",
+      "supermoduleId": 2,
+      "topics": [
+        "atoms",
+        "molecules",
+        "bonding",
+        "valence",
+        "reactions",
+        "oxidation",
+        "reduction"
+      ],
+      "contentPath": "content/modules/022-chemistry-foundations.md"
+    },
+    {
+      "id": 23,
+      "title": "Materials science",
+      "slug": "materials-science",
+      "part": "II",
+      "partTitle": "Physics and chemistry of computation",
+      "supermoduleId": 2,
+      "topics": [
+        "crystal structures",
+        "defects",
+        "grain boundaries",
+        "stress",
+        "diffusion",
+        "phase behavior"
+      ],
+      "contentPath": "content/modules/023-materials-science.md"
+    },
+    {
+      "id": 24,
+      "title": "Solid-state physics",
+      "slug": "solid-state-physics",
+      "part": "II",
+      "partTitle": "Physics and chemistry of computation",
+      "supermoduleId": 2,
+      "topics": [
+        "bands",
+        "band gaps",
+        "Fermi level",
+        "carriers",
+        "mobility",
+        "recombination",
+        "scattering"
+      ],
+      "contentPath": "content/modules/024-solid-state-physics.md"
+    },
+    {
+      "id": 25,
+      "title": "Semiconductor physics",
+      "slug": "semiconductor-physics",
+      "part": "II",
+      "partTitle": "Physics and chemistry of computation",
+      "supermoduleId": 2,
+      "topics": [
+        "intrinsic/extrinsic semiconductors",
+        "doping",
+        "drift",
+        "diffusion",
+        "p-n junctions",
+        "depletion regions"
+      ],
+      "contentPath": "content/modules/025-semiconductor-physics.md"
+    },
+    {
+      "id": 26,
+      "title": "Semiconductor manufacturing",
+      "slug": "semiconductor-manufacturing",
+      "part": "II",
+      "partTitle": "Physics and chemistry of computation",
+      "supermoduleId": 2,
+      "topics": [
+        "silicon purification",
+        "ingot growth",
+        "wafering",
+        "oxidation",
+        "deposition",
+        "photolithography",
+        "ion implantation",
+        "diffusion",
+        "etching",
+        "CMP",
+        "metallization",
+        "yield",
+        "packaging",
+        "testing"
+      ],
+      "contentPath": "content/modules/026-semiconductor-manufacturing.md"
+    },
+    {
+      "id": 27,
+      "title": "Reliability physics",
+      "slug": "reliability-physics",
+      "part": "II",
+      "partTitle": "Physics and chemistry of computation",
+      "supermoduleId": 2,
+      "topics": [
+        "electromigration",
+        "dielectric breakdown",
+        "thermal cycling",
+        "aging",
+        "failure distributions"
+      ],
+      "contentPath": "content/modules/027-reliability-physics.md"
+    },
+    {
+      "id": 28,
+      "title": "Basic electrical quantities",
+      "slug": "basic-electrical-quantities",
+      "part": "III",
+      "partTitle": "Electricity, electronics, and signals",
+      "supermoduleId": 3,
+      "topics": [
+        "charge",
+        "current",
+        "voltage",
+        "resistance",
+        "power",
+        "energy"
+      ],
+      "contentPath": "content/modules/028-basic-electrical-quantities.md"
+    },
+    {
+      "id": 29,
+      "title": "Circuit laws",
+      "slug": "circuit-laws",
+      "part": "III",
+      "partTitle": "Electricity, electronics, and signals",
+      "supermoduleId": 3,
+      "topics": [
+        "Ohm’s law",
+        "Kirchhoff’s current and voltage laws"
+      ],
+      "contentPath": "content/modules/029-circuit-laws.md"
+    },
+    {
+      "id": 30,
+      "title": "Network analysis",
+      "slug": "network-analysis",
+      "part": "III",
+      "partTitle": "Electricity, electronics, and signals",
+      "supermoduleId": 3,
+      "topics": [
+        "nodal analysis",
+        "mesh analysis",
+        "equivalent circuits",
+        "Thévenin/Norton"
+      ],
+      "contentPath": "content/modules/030-network-analysis.md"
+    },
+    {
+      "id": 31,
+      "title": "Capacitors and inductors",
+      "slug": "capacitors-and-inductors",
+      "part": "III",
+      "partTitle": "Electricity, electronics, and signals",
+      "supermoduleId": 3,
+      "topics": [
+        "storage",
+        "transients",
+        "RC/RL/RLC behavior",
+        "resonance intuition"
+      ],
+      "contentPath": "content/modules/031-capacitors-and-inductors.md"
+    },
+    {
+      "id": 32,
+      "title": "Analog signals",
+      "slug": "analog-signals",
+      "part": "III",
+      "partTitle": "Electricity, electronics, and signals",
+      "supermoduleId": 3,
+      "topics": [
+        "waveforms",
+        "frequency domain",
+        "bandwidth",
+        "filtering basics"
+      ],
+      "contentPath": "content/modules/032-analog-signals.md"
+    },
+    {
+      "id": 33,
+      "title": "Devices",
+      "slug": "devices",
+      "part": "III",
+      "partTitle": "Electricity, electronics, and signals",
+      "supermoduleId": 3,
+      "topics": [
+        "resistors",
+        "capacitors",
+        "inductors",
+        "diodes",
+        "BJTs",
+        "MOSFETs",
+        "sensors",
+        "oscillators"
+      ],
+      "contentPath": "content/modules/033-devices.md"
+    },
+    {
+      "id": 34,
+      "title": "Amplifiers and analog basics",
+      "slug": "amplifiers-and-analog-basics",
+      "part": "III",
+      "partTitle": "Electricity, electronics, and signals",
+      "supermoduleId": 3,
+      "topics": [
+        "gain",
+        "biasing",
+        "small-signal thinking",
+        "comparators",
+        "op-amp intuition"
+      ],
+      "contentPath": "content/modules/034-amplifiers-and-analog-basics.md"
+    },
+    {
+      "id": 35,
+      "title": "Noise",
+      "slug": "noise",
+      "part": "III",
+      "partTitle": "Electricity, electronics, and signals",
+      "supermoduleId": 3,
+      "topics": [
+        "thermal noise",
+        "shot noise",
+        "SNR",
+        "interference",
+        "jitter"
+      ],
+      "contentPath": "content/modules/035-noise.md"
+    },
+    {
+      "id": 36,
+      "title": "Power electronics and regulation",
+      "slug": "power-electronics-and-regulation",
+      "part": "III",
+      "partTitle": "Electricity, electronics, and signals",
+      "supermoduleId": 3,
+      "topics": [
+        "regulators",
+        "power supplies",
+        "decoupling",
+        "distribution",
+        "power integrity"
+      ],
+      "contentPath": "content/modules/036-power-electronics-and-regulation.md"
+    },
+    {
+      "id": 37,
+      "title": "Signal integrity",
+      "slug": "signal-integrity",
+      "part": "III",
+      "partTitle": "Electricity, electronics, and signals",
+      "supermoduleId": 3,
+      "topics": [
+        "transmission lines",
+        "reflections",
+        "crosstalk",
+        "grounding",
+        "EMI/EMC"
+      ],
+      "contentPath": "content/modules/037-signal-integrity.md"
+    },
+    {
+      "id": 38,
+      "title": "Clocks and timing",
+      "slug": "clocks-and-timing",
+      "part": "III",
+      "partTitle": "Electricity, electronics, and signals",
+      "supermoduleId": 3,
+      "topics": [
+        "oscillators",
+        "PLL intuition",
+        "skew",
+        "jitter",
+        "timing closure relevance"
+      ],
+      "contentPath": "content/modules/038-clocks-and-timing.md"
+    },
+    {
+      "id": 39,
+      "title": "Boolean algebra",
+      "slug": "boolean-algebra",
+      "part": "IV",
+      "partTitle": "Digital logic and hardware design",
+      "supermoduleId": 4,
+      "topics": [
+        "truth tables",
+        "simplification",
+        "canonical forms",
+        "De Morgan",
+        "minimization"
+      ],
+      "contentPath": "content/modules/039-boolean-algebra.md"
+    },
+    {
+      "id": 40,
+      "title": "CMOS logic",
+      "slug": "cmos-logic",
+      "part": "IV",
+      "partTitle": "Digital logic and hardware design",
+      "supermoduleId": 4,
+      "topics": [
+        "inverter",
+        "NAND",
+        "NOR",
+        "transistor-level gate design",
+        "fanout",
+        "delay",
+        "dynamic/static power"
+      ],
+      "contentPath": "content/modules/040-cmos-logic.md"
+    },
+    {
+      "id": 41,
+      "title": "Combinational blocks",
+      "slug": "combinational-blocks",
+      "part": "IV",
+      "partTitle": "Digital logic and hardware design",
+      "supermoduleId": 4,
+      "topics": [
+        "adders",
+        "multiplexers",
+        "decoders",
+        "encoders",
+        "comparators",
+        "shifters",
+        "ALU pieces"
+      ],
+      "contentPath": "content/modules/041-combinational-blocks.md"
+    },
+    {
+      "id": 42,
+      "title": "Sequential logic",
+      "slug": "sequential-logic",
+      "part": "IV",
+      "partTitle": "Digital logic and hardware design",
+      "supermoduleId": 4,
+      "topics": [
+        "latches",
+        "flip-flops",
+        "registers",
+        "counters",
+        "memory elements"
+      ],
+      "contentPath": "content/modules/042-sequential-logic.md"
+    },
+    {
+      "id": 43,
+      "title": "Finite-state machines",
+      "slug": "finite-state-machines",
+      "part": "IV",
+      "partTitle": "Digital logic and hardware design",
+      "supermoduleId": 4,
+      "topics": [
+        "state encoding",
+        "transition logic",
+        "control design"
+      ],
+      "contentPath": "content/modules/043-finite-state-machines.md"
+    },
+    {
+      "id": 44,
+      "title": "Synchronous design",
+      "slug": "synchronous-design",
+      "part": "IV",
+      "partTitle": "Digital logic and hardware design",
+      "supermoduleId": 4,
+      "topics": [
+        "setup/hold",
+        "clock domains",
+        "metastability",
+        "reset strategies"
+      ],
+      "contentPath": "content/modules/044-synchronous-design.md"
+    },
+    {
+      "id": 45,
+      "title": "Asynchronous design basics",
+      "slug": "asynchronous-design-basics",
+      "part": "IV",
+      "partTitle": "Digital logic and hardware design",
+      "supermoduleId": 4,
+      "topics": [
+        "handshakes",
+        "hazards",
+        "synchronization"
+      ],
+      "contentPath": "content/modules/045-asynchronous-design-basics.md"
+    },
+    {
+      "id": 46,
+      "title": "Hardware description languages",
+      "slug": "hardware-description-languages",
+      "part": "IV",
+      "partTitle": "Digital logic and hardware design",
+      "supermoduleId": 4,
+      "topics": [
+        "Verilog/VHDL/SystemVerilog concepts",
+        "simulation",
+        "synthesis"
+      ],
+      "contentPath": "content/modules/046-hardware-description-languages.md"
+    },
+    {
+      "id": 47,
+      "title": "Verification",
+      "slug": "verification",
+      "part": "IV",
+      "partTitle": "Digital logic and hardware design",
+      "supermoduleId": 4,
+      "topics": [
+        "testbenches",
+        "assertions",
+        "formal verification basics",
+        "timing analysis"
+      ],
+      "contentPath": "content/modules/047-verification.md"
+    },
+    {
+      "id": 48,
+      "title": "FPGA and ASIC workflows",
+      "slug": "fpga-and-asic-workflows",
+      "part": "IV",
+      "partTitle": "Digital logic and hardware design",
+      "supermoduleId": 4,
+      "topics": [
+        "synthesis",
+        "place-and-route",
+        "timing closure",
+        "constraints"
+      ],
+      "contentPath": "content/modules/048-fpga-and-asic-workflows.md"
+    },
+    {
+      "id": 49,
+      "title": "Machine organization",
+      "slug": "machine-organization",
+      "part": "V",
+      "partTitle": "Computer architecture and microarchitecture",
+      "supermoduleId": 5,
+      "topics": [
+        "datapath",
+        "control",
+        "register file",
+        "ALU",
+        "buses"
+      ],
+      "contentPath": "content/modules/049-machine-organization.md"
+    },
+    {
+      "id": 50,
+      "title": "Instruction set architecture",
+      "slug": "instruction-set-architecture",
+      "part": "V",
+      "partTitle": "Computer architecture and microarchitecture",
+      "supermoduleId": 5,
+      "topics": [
+        "opcodes",
+        "instruction formats",
+        "registers",
+        "addressing modes",
+        "privilege levels"
+      ],
+      "contentPath": "content/modules/050-instruction-set-architecture.md"
+    },
+    {
+      "id": 51,
+      "title": "Assembly language",
+      "slug": "assembly-language",
+      "part": "V",
+      "partTitle": "Computer architecture and microarchitecture",
+      "supermoduleId": 5,
+      "topics": [
+        "arithmetic",
+        "branches",
+        "stack",
+        "procedures",
+        "calling conventions"
+      ],
+      "contentPath": "content/modules/051-assembly-language.md"
+    },
+    {
+      "id": 52,
+      "title": "Microarchitecture",
+      "slug": "microarchitecture",
+      "part": "V",
+      "partTitle": "Computer architecture and microarchitecture",
+      "supermoduleId": 5,
+      "topics": [
+        "single-cycle",
+        "multi-cycle",
+        "pipelined designs"
+      ],
+      "contentPath": "content/modules/052-microarchitecture.md"
+    },
+    {
+      "id": 53,
+      "title": "Pipelining",
+      "slug": "pipelining",
+      "part": "V",
+      "partTitle": "Computer architecture and microarchitecture",
+      "supermoduleId": 5,
+      "topics": [
+        "hazards",
+        "forwarding",
+        "stalling",
+        "branch prediction basics"
+      ],
+      "contentPath": "content/modules/053-pipelining.md"
+    },
+    {
+      "id": 54,
+      "title": "Superscalar and out-of-order execution",
+      "slug": "superscalar-and-out-of-order-execution",
+      "part": "V",
+      "partTitle": "Computer architecture and microarchitecture",
+      "supermoduleId": 5,
+      "topics": [
+        "renaming",
+        "reorder buffers",
+        "issue queues",
+        "speculation"
+      ],
+      "contentPath": "content/modules/054-superscalar-and-out-of-order-execution.md"
+    },
+    {
+      "id": 55,
+      "title": "Caches",
+      "slug": "caches",
+      "part": "V",
+      "partTitle": "Computer architecture and microarchitecture",
+      "supermoduleId": 5,
+      "topics": [
+        "locality",
+        "mapping",
+        "replacement",
+        "coherence intuition"
+      ],
+      "contentPath": "content/modules/055-caches.md"
+    },
+    {
+      "id": 56,
+      "title": "Virtual memory hardware",
+      "slug": "virtual-memory-hardware",
+      "part": "V",
+      "partTitle": "Computer architecture and microarchitecture",
+      "supermoduleId": 5,
+      "topics": [
+        "page tables",
+        "TLBs",
+        "address translation hardware"
+      ],
+      "contentPath": "content/modules/056-virtual-memory-hardware.md"
+    },
+    {
+      "id": 57,
+      "title": "Interrupts and exceptions",
+      "slug": "interrupts-and-exceptions",
+      "part": "V",
+      "partTitle": "Computer architecture and microarchitecture",
+      "supermoduleId": 5,
+      "topics": [
+        "traps",
+        "faults",
+        "interrupts",
+        "context save/restore"
+      ],
+      "contentPath": "content/modules/057-interrupts-and-exceptions.md"
+    },
+    {
+      "id": 58,
+      "title": "Memory technologies",
+      "slug": "memory-technologies",
+      "part": "V",
+      "partTitle": "Computer architecture and microarchitecture",
+      "supermoduleId": 5,
+      "topics": [
+        "SRAM",
+        "DRAM",
+        "ROM",
+        "flash",
+        "persistent memory concepts"
+      ],
+      "contentPath": "content/modules/058-memory-technologies.md"
+    },
+    {
+      "id": 59,
+      "title": "Interconnects and buses",
+      "slug": "interconnects-and-buses",
+      "part": "V",
+      "partTitle": "Computer architecture and microarchitecture",
+      "supermoduleId": 5,
+      "topics": [
+        "PCIe intuition",
+        "memory buses",
+        "on-chip interconnects"
+      ],
+      "contentPath": "content/modules/059-interconnects-and-buses.md"
+    },
+    {
+      "id": 60,
+      "title": "Multiprocessors",
+      "slug": "multiprocessors",
+      "part": "V",
+      "partTitle": "Computer architecture and microarchitecture",
+      "supermoduleId": 5,
+      "topics": [
+        "shared memory",
+        "cache coherence",
+        "NUMA",
+        "inter-socket behavior"
+      ],
+      "contentPath": "content/modules/060-multiprocessors.md"
+    },
+    {
+      "id": 61,
+      "title": "Accelerators",
+      "slug": "accelerators",
+      "part": "V",
+      "partTitle": "Computer architecture and microarchitecture",
+      "supermoduleId": 5,
+      "topics": [
+        "GPU concepts",
+        "DMA-heavy devices",
+        "offload models"
+      ],
+      "contentPath": "content/modules/061-accelerators.md"
+    },
+    {
+      "id": 62,
+      "title": "Firmware",
+      "slug": "firmware",
+      "part": "V",
+      "partTitle": "Computer architecture and microarchitecture",
+      "supermoduleId": 5,
+      "topics": [
+        "boot ROM",
+        "UEFI/BIOS concepts",
+        "hardware initialization"
+      ],
+      "contentPath": "content/modules/062-firmware.md"
+    },
+    {
+      "id": 63,
+      "title": "Binary data representation",
+      "slug": "binary-data-representation",
+      "part": "VI",
+      "partTitle": "How software becomes machine behavior",
+      "supermoduleId": 6,
+      "topics": [
+        "bits",
+        "bytes",
+        "endianness",
+        "two’s complement",
+        "fixed point",
+        "IEEE floating point"
+      ],
+      "contentPath": "content/modules/063-binary-data-representation.md"
+    },
+    {
+      "id": 64,
+      "title": "C language at systems depth",
+      "slug": "c-language-at-systems-depth",
+      "part": "VI",
+      "partTitle": "How software becomes machine behavior",
+      "supermoduleId": 6,
+      "topics": [
+        "memory model",
+        "storage duration",
+        "pointers",
+        "arrays",
+        "structs",
+        "unions",
+        "UB",
+        "volatile"
+      ],
+      "contentPath": "content/modules/064-c-language-at-systems-depth.md"
+    },
+    {
+      "id": 65,
+      "title": "Other systems languages",
+      "slug": "other-systems-languages",
+      "part": "VI",
+      "partTitle": "How software becomes machine behavior",
+      "supermoduleId": 6,
+      "topics": [
+        "C++",
+        "Rust basics in systems context",
+        "ABI interaction"
+      ],
+      "contentPath": "content/modules/065-other-systems-languages.md"
+    },
+    {
+      "id": 66,
+      "title": "Assemblers and object generation",
+      "slug": "assemblers-and-object-generation",
+      "part": "VI",
+      "partTitle": "How software becomes machine behavior",
+      "supermoduleId": 6,
+      "topics": [
+        "symbols",
+        "relocation",
+        "instruction encoding"
+      ],
+      "contentPath": "content/modules/066-assemblers-and-object-generation.md"
+    },
+    {
+      "id": 67,
+      "title": "Linkers",
+      "slug": "linkers",
+      "part": "VI",
+      "partTitle": "How software becomes machine behavior",
+      "supermoduleId": 6,
+      "topics": [
+        "static linking",
+        "dynamic linking",
+        "symbol resolution",
+        "GOT/PLT intuition"
+      ],
+      "contentPath": "content/modules/067-linkers.md"
+    },
+    {
+      "id": 68,
+      "title": "Executable formats",
+      "slug": "executable-formats",
+      "part": "VI",
+      "partTitle": "How software becomes machine behavior",
+      "supermoduleId": 6,
+      "topics": [
+        "ELF sections",
+        "segments",
+        "symbols",
+        "relocations",
+        "shared objects"
+      ],
+      "contentPath": "content/modules/068-executable-formats.md"
+    },
+    {
+      "id": 69,
+      "title": "Loaders and runtime startup",
+      "slug": "loaders-and-runtime-startup",
+      "part": "VI",
+      "partTitle": "How software becomes machine behavior",
+      "supermoduleId": 6,
+      "topics": [
+        "process image",
+        "runtime initialization",
+        "dynamic loader"
+      ],
+      "contentPath": "content/modules/069-loaders-and-runtime-startup.md"
+    },
+    {
+      "id": 70,
+      "title": "Compilers",
+      "slug": "compilers",
+      "part": "VI",
+      "partTitle": "How software becomes machine behavior",
+      "supermoduleId": 6,
+      "topics": [
+        "lexical analysis",
+        "parsing",
+        "IR",
+        "optimization",
+        "code generation"
+      ],
+      "contentPath": "content/modules/070-compilers.md"
+    },
+    {
+      "id": 71,
+      "title": "Compiler optimizations",
+      "slug": "compiler-optimizations",
+      "part": "VI",
+      "partTitle": "How software becomes machine behavior",
+      "supermoduleId": 6,
+      "topics": [
+        "inlining",
+        "vectorization",
+        "alias analysis",
+        "loop optimizations"
+      ],
+      "contentPath": "content/modules/071-compiler-optimizations.md"
+    },
+    {
+      "id": 72,
+      "title": "Build systems",
+      "slug": "build-systems",
+      "part": "VI",
+      "partTitle": "How software becomes machine behavior",
+      "supermoduleId": 6,
+      "topics": [
+        "Make",
+        "dependency graphs",
+        "reproducible builds",
+        "cross-compilation"
+      ],
+      "contentPath": "content/modules/072-build-systems.md"
+    },
+    {
+      "id": 73,
+      "title": "Debug info and tooling",
+      "slug": "debug-info-and-tooling",
+      "part": "VI",
+      "partTitle": "How software becomes machine behavior",
+      "supermoduleId": 6,
+      "topics": [
+        "DWARF intuition",
+        "symbol tables",
+        "stack unwinding"
+      ],
+      "contentPath": "content/modules/073-debug-info-and-tooling.md"
+    },
+    {
+      "id": 74,
+      "title": "What an OS does",
+      "slug": "what-an-os-does",
+      "part": "VII",
+      "partTitle": "Operating systems in general",
+      "supermoduleId": 7,
+      "topics": [
+        "abstraction",
+        "resource management",
+        "isolation",
+        "multiplexing"
+      ],
+      "contentPath": "content/modules/074-what-an-os-does.md"
+    },
+    {
+      "id": 75,
+      "title": "Processes",
+      "slug": "processes",
+      "part": "VII",
+      "partTitle": "Operating systems in general",
+      "supermoduleId": 7,
+      "topics": [
+        "process model",
+        "process state",
+        "creation",
+        "termination"
+      ],
+      "contentPath": "content/modules/075-processes.md"
+    },
+    {
+      "id": 76,
+      "title": "Threads",
+      "slug": "threads",
+      "part": "VII",
+      "partTitle": "Operating systems in general",
+      "supermoduleId": 7,
+      "topics": [
+        "user vs kernel threads",
+        "concurrency models"
+      ],
+      "contentPath": "content/modules/076-threads.md"
+    },
+    {
+      "id": 77,
+      "title": "Scheduling",
+      "slug": "scheduling",
+      "part": "VII",
+      "partTitle": "Operating systems in general",
+      "supermoduleId": 7,
+      "topics": [
+        "policies",
+        "fairness",
+        "latency",
+        "throughput",
+        "real-time concepts"
+      ],
+      "contentPath": "content/modules/077-scheduling.md"
+    },
+    {
+      "id": 78,
+      "title": "Context switching",
+      "slug": "context-switching",
+      "part": "VII",
+      "partTitle": "Operating systems in general",
+      "supermoduleId": 7,
+      "topics": [
+        "register state",
+        "MMU context",
+        "kernel entry/exit costs"
+      ],
+      "contentPath": "content/modules/078-context-switching.md"
+    },
+    {
+      "id": 79,
+      "title": "Memory management",
+      "slug": "memory-management",
+      "part": "VII",
+      "partTitle": "Operating systems in general",
+      "supermoduleId": 7,
+      "topics": [
+        "allocation",
+        "fragmentation",
+        "paging",
+        "segmentation history",
+        "demand paging"
+      ],
+      "contentPath": "content/modules/079-memory-management.md"
+    },
+    {
+      "id": 80,
+      "title": "Virtual memory",
+      "slug": "virtual-memory",
+      "part": "VII",
+      "partTitle": "Operating systems in general",
+      "supermoduleId": 7,
+      "topics": [
+        "address spaces",
+        "translation",
+        "protection",
+        "copy-on-write",
+        "mmap"
+      ],
+      "contentPath": "content/modules/080-virtual-memory.md"
+    },
+    {
+      "id": 81,
+      "title": "Synchronization",
+      "slug": "synchronization",
+      "part": "VII",
+      "partTitle": "Operating systems in general",
+      "supermoduleId": 7,
+      "topics": [
+        "locks",
+        "semaphores",
+        "monitors",
+        "condition variables",
+        "atomics"
+      ],
+      "contentPath": "content/modules/081-synchronization.md"
+    },
+    {
+      "id": 82,
+      "title": "Deadlocks and liveness",
+      "slug": "deadlocks-and-liveness",
+      "part": "VII",
+      "partTitle": "Operating systems in general",
+      "supermoduleId": 7,
+      "topics": [
+        "deadlock conditions",
+        "avoidance",
+        "starvation",
+        "fairness"
+      ],
+      "contentPath": "content/modules/082-deadlocks-and-liveness.md"
+    },
+    {
+      "id": 83,
+      "title": "File systems",
+      "slug": "file-systems",
+      "part": "VII",
+      "partTitle": "Operating systems in general",
+      "supermoduleId": 7,
+      "topics": [
+        "files",
+        "directories",
+        "metadata",
+        "naming",
+        "consistency",
+        "journaling"
+      ],
+      "contentPath": "content/modules/083-file-systems.md"
+    },
+    {
+      "id": 84,
+      "title": "I/O systems",
+      "slug": "io-systems",
+      "part": "VII",
+      "partTitle": "Operating systems in general",
+      "supermoduleId": 7,
+      "topics": [
+        "buffering",
+        "spooling",
+        "interrupt-driven I/O",
+        "DMA"
+      ],
+      "contentPath": "content/modules/084-io-systems.md"
+    },
+    {
+      "id": 85,
+      "title": "Device abstraction",
+      "slug": "device-abstraction",
+      "part": "VII",
+      "partTitle": "Operating systems in general",
+      "supermoduleId": 7,
+      "topics": [
+        "device models",
+        "block vs character",
+        "control paths"
+      ],
+      "contentPath": "content/modules/085-device-abstraction.md"
+    },
+    {
+      "id": 86,
+      "title": "IPC",
+      "slug": "ipc",
+      "part": "VII",
+      "partTitle": "Operating systems in general",
+      "supermoduleId": 7,
+      "topics": [
+        "pipes",
+        "message queues",
+        "shared memory",
+        "sockets",
+        "signals"
+      ],
+      "contentPath": "content/modules/086-ipc.md"
+    },
+    {
+      "id": 87,
+      "title": "Protection and security",
+      "slug": "protection-and-security",
+      "part": "VII",
+      "partTitle": "Operating systems in general",
+      "supermoduleId": 7,
+      "topics": [
+        "users",
+        "permissions",
+        "privilege",
+        "authentication basics"
+      ],
+      "contentPath": "content/modules/087-protection-and-security.md"
+    },
+    {
+      "id": 88,
+      "title": "Distributed OS ideas",
+      "slug": "distributed-os-ideas",
+      "part": "VII",
+      "partTitle": "Operating systems in general",
+      "supermoduleId": 7,
+      "topics": [
+        "naming",
+        "location transparency",
+        "failures",
+        "consistency"
+      ],
+      "contentPath": "content/modules/088-distributed-os-ideas.md"
+    },
+    {
+      "id": 89,
+      "title": "Linux philosophy and Unix lineage",
+      "slug": "linux-philosophy-and-unix-lineage",
+      "part": "VIII",
+      "partTitle": "Linux user-space foundations",
+      "supermoduleId": 8,
+      "topics": [
+        "everything is a file intuition",
+        "composability",
+        "text streams",
+        "process-centric design"
+      ],
+      "contentPath": "content/modules/089-linux-philosophy-and-unix-lineage.md"
+    },
+    {
+      "id": 90,
+      "title": "Shells",
+      "slug": "shells",
+      "part": "VIII",
+      "partTitle": "Linux user-space foundations",
+      "supermoduleId": 8,
+      "topics": [
+        "parsing",
+        "expansion",
+        "redirection",
+        "pipelines",
+        "job control"
+      ],
+      "contentPath": "content/modules/090-shells.md"
+    },
+    {
+      "id": 91,
+      "title": "Core utilities",
+      "slug": "core-utilities",
+      "part": "VIII",
+      "partTitle": "Linux user-space foundations",
+      "supermoduleId": 8,
+      "topics": [
+        "grep",
+        "sed",
+        "awk",
+        "find",
+        "xargs",
+        "sort",
+        "cut",
+        "tr",
+        "ps",
+        "top"
+      ],
+      "contentPath": "content/modules/091-core-utilities.md"
+    },
+    {
+      "id": 92,
+      "title": "Filesystem hierarchy and conventions",
+      "slug": "filesystem-hierarchy-and-conventions",
+      "part": "VIII",
+      "partTitle": "Linux user-space foundations",
+      "supermoduleId": 8,
+      "topics": [
+        "`/bin`",
+        "`/usr`",
+        "`/etc`",
+        "`/proc`",
+        "`/sys`",
+        "`/dev`",
+        "`/var`",
+        "`/home`"
+      ],
+      "contentPath": "content/modules/092-filesystem-hierarchy-and-conventions.md"
+    },
+    {
+      "id": 93,
+      "title": "Users, groups, permissions",
+      "slug": "users-groups-permissions",
+      "part": "VIII",
+      "partTitle": "Linux user-space foundations",
+      "supermoduleId": 8,
+      "topics": [
+        "ownership",
+        "mode bits",
+        "ACL concepts",
+        "sudo basics"
+      ],
+      "contentPath": "content/modules/093-users-groups-permissions.md"
+    },
+    {
+      "id": 94,
+      "title": "Processes in practice",
+      "slug": "processes-in-practice",
+      "part": "VIII",
+      "partTitle": "Linux user-space foundations",
+      "supermoduleId": 8,
+      "topics": [
+        "fork/exec",
+        "signals",
+        "sessions",
+        "daemons"
+      ],
+      "contentPath": "content/modules/094-processes-in-practice.md"
+    },
+    {
+      "id": 95,
+      "title": "Shared libraries and libc",
+      "slug": "shared-libraries-and-libc",
+      "part": "VIII",
+      "partTitle": "Linux user-space foundations",
+      "supermoduleId": 8,
+      "topics": [
+        "libc role",
+        "dynamic loader",
+        "ABI",
+        "API vs ABI"
+      ],
+      "contentPath": "content/modules/095-shared-libraries-and-libc.md"
+    },
+    {
+      "id": 96,
+      "title": "Init and service management",
+      "slug": "init-and-service-management",
+      "part": "VIII",
+      "partTitle": "Linux user-space foundations",
+      "supermoduleId": 8,
+      "topics": [
+        "init concepts",
+        "service lifecycle",
+        "boot userspace"
+      ],
+      "contentPath": "content/modules/096-init-and-service-management.md"
+    },
+    {
+      "id": 97,
+      "title": "Package ecosystems",
+      "slug": "package-ecosystems",
+      "part": "VIII",
+      "partTitle": "Linux user-space foundations",
+      "supermoduleId": 8,
+      "topics": [
+        "package managers",
+        "repositories",
+        "dependencies",
+        "source vs binary packaging"
+      ],
+      "contentPath": "content/modules/097-package-ecosystems.md"
+    },
+    {
+      "id": 98,
+      "title": "Logging and observability",
+      "slug": "logging-and-observability",
+      "part": "VIII",
+      "partTitle": "Linux user-space foundations",
+      "supermoduleId": 8,
+      "topics": [
+        "syslog concepts",
+        "journals",
+        "log rotation",
+        "metrics basics"
+      ],
+      "contentPath": "content/modules/098-logging-and-observability.md"
+    },
+    {
+      "id": 99,
+      "title": "Scripting",
+      "slug": "scripting",
+      "part": "VIII",
+      "partTitle": "Linux user-space foundations",
+      "supermoduleId": 8,
+      "topics": [
+        "shell scripting",
+        "Python for systems automation"
+      ],
+      "contentPath": "content/modules/099-scripting.md"
+    },
+    {
+      "id": 100,
+      "title": "Kernel high-level structure",
+      "slug": "kernel-high-level-structure",
+      "part": "IX",
+      "partTitle": "Linux kernel architecture",
+      "supermoduleId": 9,
+      "topics": [
+        "monolithic kernel",
+        "modules",
+        "subsystems",
+        "syscall boundary"
+      ],
+      "contentPath": "content/modules/100-kernel-high-level-structure.md"
+    },
+    {
+      "id": 101,
+      "title": "Kernel source tree organization",
+      "slug": "kernel-source-tree-organization",
+      "part": "IX",
+      "partTitle": "Linux kernel architecture",
+      "supermoduleId": 9,
+      "topics": [
+        "arch",
+        "mm",
+        "fs",
+        "net",
+        "drivers",
+        "kernel",
+        "lib",
+        "include"
+      ],
+      "contentPath": "content/modules/101-kernel-source-tree-organization.md"
+    },
+    {
+      "id": 102,
+      "title": "Boot path",
+      "slug": "boot-path",
+      "part": "IX",
+      "partTitle": "Linux kernel architecture",
+      "supermoduleId": 9,
+      "topics": [
+        "firmware handoff",
+        "bootloader",
+        "kernel decompression",
+        "early init",
+        "initramfs",
+        "userspace init"
+      ],
+      "contentPath": "content/modules/102-boot-path.md"
+    },
+    {
+      "id": 103,
+      "title": "System call path",
+      "slug": "system-call-path",
+      "part": "IX",
+      "partTitle": "Linux kernel architecture",
+      "supermoduleId": 9,
+      "topics": [
+        "entry",
+        "dispatch",
+        "privilege transition",
+        "return to userspace"
+      ],
+      "contentPath": "content/modules/103-system-call-path.md"
+    },
+    {
+      "id": 104,
+      "title": "Process and task model",
+      "slug": "process-and-task-model",
+      "part": "IX",
+      "partTitle": "Linux kernel architecture",
+      "supermoduleId": 9,
+      "topics": [
+        "task_struct",
+        "scheduling entities",
+        "PID model",
+        "namespaces relation"
+      ],
+      "contentPath": "content/modules/104-process-and-task-model.md"
+    },
+    {
+      "id": 105,
+      "title": "Scheduler internals",
+      "slug": "scheduler-internals",
+      "part": "IX",
+      "partTitle": "Linux kernel architecture",
+      "supermoduleId": 9,
+      "topics": [
+        "CFS intuition",
+        "run queues",
+        "priorities",
+        "realtime scheduling"
+      ],
+      "contentPath": "content/modules/105-scheduler-internals.md"
+    },
+    {
+      "id": 106,
+      "title": "Memory management internals",
+      "slug": "memory-management-internals",
+      "part": "IX",
+      "partTitle": "Linux kernel architecture",
+      "supermoduleId": 9,
+      "topics": [
+        "pages",
+        "zones",
+        "buddy allocator",
+        "slab/slub",
+        "page cache",
+        "reclaim"
+      ],
+      "contentPath": "content/modules/106-memory-management-internals.md"
+    },
+    {
+      "id": 107,
+      "title": "Virtual memory areas",
+      "slug": "virtual-memory-areas",
+      "part": "IX",
+      "partTitle": "Linux kernel architecture",
+      "supermoduleId": 9,
+      "topics": [
+        "mappings",
+        "faults",
+        "anonymous/file-backed memory",
+        "mmap path"
+      ],
+      "contentPath": "content/modules/107-virtual-memory-areas.md"
+    },
+    {
+      "id": 108,
+      "title": "Interrupt handling",
+      "slug": "interrupt-handling",
+      "part": "IX",
+      "partTitle": "Linux kernel architecture",
+      "supermoduleId": 9,
+      "topics": [
+        "hard IRQ",
+        "softirq",
+        "tasklets history",
+        "threaded interrupts"
+      ],
+      "contentPath": "content/modules/108-interrupt-handling.md"
+    },
+    {
+      "id": 109,
+      "title": "Timers and timekeeping",
+      "slug": "timers-and-timekeeping",
+      "part": "IX",
+      "partTitle": "Linux kernel architecture",
+      "supermoduleId": 9,
+      "topics": [
+        "jiffies",
+        "hrtimers",
+        "clocksources",
+        "timers",
+        "scheduler clock"
+      ],
+      "contentPath": "content/modules/109-timers-and-timekeeping.md"
+    },
+    {
+      "id": 110,
+      "title": "Synchronization in kernel",
+      "slug": "synchronization-in-kernel",
+      "part": "IX",
+      "partTitle": "Linux kernel architecture",
+      "supermoduleId": 9,
+      "topics": [
+        "spinlocks",
+        "mutexes",
+        "rwlocks",
+        "RCU",
+        "atomics",
+        "memory barriers"
+      ],
+      "contentPath": "content/modules/110-synchronization-in-kernel.md"
+    },
+    {
+      "id": 111,
+      "title": "VFS",
+      "slug": "vfs",
+      "part": "IX",
+      "partTitle": "Linux kernel architecture",
+      "supermoduleId": 9,
+      "topics": [
+        "dentries",
+        "inodes",
+        "superblocks",
+        "file objects",
+        "path resolution"
+      ],
+      "contentPath": "content/modules/111-vfs.md"
+    },
+    {
+      "id": 112,
+      "title": "Block layer",
+      "slug": "block-layer",
+      "part": "IX",
+      "partTitle": "Linux kernel architecture",
+      "supermoduleId": 9,
+      "topics": [
+        "requests",
+        "queues",
+        "elevators",
+        "bio structures"
+      ],
+      "contentPath": "content/modules/112-block-layer.md"
+    },
+    {
+      "id": 113,
+      "title": "Character device infrastructure",
+      "slug": "character-device-infrastructure",
+      "part": "IX",
+      "partTitle": "Linux kernel architecture",
+      "supermoduleId": 9,
+      "topics": [
+        "device nodes",
+        "file operations",
+        "ioctl concepts"
+      ],
+      "contentPath": "content/modules/113-character-device-infrastructure.md"
+    },
+    {
+      "id": 114,
+      "title": "Module system",
+      "slug": "module-system",
+      "part": "IX",
+      "partTitle": "Linux kernel architecture",
+      "supermoduleId": 9,
+      "topics": [
+        "loadable modules",
+        "symbol export",
+        "taint basics"
+      ],
+      "contentPath": "content/modules/114-module-system.md"
+    },
+    {
+      "id": 115,
+      "title": "Kernel memory allocation APIs",
+      "slug": "kernel-memory-allocation-apis",
+      "part": "IX",
+      "partTitle": "Linux kernel architecture",
+      "supermoduleId": 9,
+      "topics": [
+        "kmalloc",
+        "vmalloc",
+        "GFP flags",
+        "allocation contexts"
+      ],
+      "contentPath": "content/modules/115-kernel-memory-allocation-apis.md"
+    },
+    {
+      "id": 116,
+      "title": "Workqueues and deferred execution",
+      "slug": "workqueues-and-deferred-execution",
+      "part": "IX",
+      "partTitle": "Linux kernel architecture",
+      "supermoduleId": 9,
+      "topics": [
+        "bottom halves",
+        "workqueues",
+        "task scheduling in kernel"
+      ],
+      "contentPath": "content/modules/116-workqueues-and-deferred-execution.md"
+    },
+    {
+      "id": 117,
+      "title": "Kernel tracing and observability",
+      "slug": "kernel-tracing-and-observability",
+      "part": "IX",
+      "partTitle": "Linux kernel architecture",
+      "supermoduleId": 9,
+      "topics": [
+        "ftrace",
+        "tracepoints",
+        "perf events",
+        "eBPF concepts"
+      ],
+      "contentPath": "content/modules/117-kernel-tracing-and-observability.md"
+    },
+    {
+      "id": 118,
+      "title": "Security subsystems",
+      "slug": "security-subsystems",
+      "part": "IX",
+      "partTitle": "Linux kernel architecture",
+      "supermoduleId": 9,
+      "topics": [
+        "capabilities",
+        "LSM framework",
+        "seccomp",
+        "audit basics"
+      ],
+      "contentPath": "content/modules/118-security-subsystems.md"
+    },
+    {
+      "id": 119,
+      "title": "Namespaces and cgroups",
+      "slug": "namespaces-and-cgroups",
+      "part": "IX",
+      "partTitle": "Linux kernel architecture",
+      "supermoduleId": 9,
+      "topics": [
+        "process isolation",
+        "resource control",
+        "container primitives"
+      ],
+      "contentPath": "content/modules/119-namespaces-and-cgroups.md"
+    },
+    {
+      "id": 120,
+      "title": "Kernel configuration and build",
+      "slug": "kernel-configuration-and-build",
+      "part": "IX",
+      "partTitle": "Linux kernel architecture",
+      "supermoduleId": 9,
+      "topics": [
+        "Kconfig",
+        "Makefiles",
+        "modules vs built-in",
+        "image generation"
+      ],
+      "contentPath": "content/modules/120-kernel-configuration-and-build.md"
+    },
+    {
+      "id": 121,
+      "title": "Driver fundamentals",
+      "slug": "driver-fundamentals",
+      "part": "X",
+      "partTitle": "Linux drivers — “all the drivers” as a structured domain",
+      "supermoduleId": 10,
+      "topics": [
+        "what a driver is",
+        "probing",
+        "binding",
+        "device IDs",
+        "resources",
+        "lifecycles"
+      ],
+      "contentPath": "content/modules/121-driver-fundamentals.md"
+    },
+    {
+      "id": 122,
+      "title": "Device model",
+      "slug": "device-model",
+      "part": "X",
+      "partTitle": "Linux drivers — “all the drivers” as a structured domain",
+      "supermoduleId": 10,
+      "topics": [
+        "buses",
+        "devices",
+        "drivers",
+        "classes",
+        "sysfs representation"
+      ],
+      "contentPath": "content/modules/122-device-model.md"
+    },
+    {
+      "id": 123,
+      "title": "Platform devices and device tree / ACPI concepts",
+      "slug": "platform-devices-and-device-tree-acpi-concepts",
+      "part": "X",
+      "partTitle": "Linux drivers — “all the drivers” as a structured domain",
+      "supermoduleId": 10,
+      "topics": [
+        "hardware description",
+        "enumeration models"
+      ],
+      "contentPath": "content/modules/123-platform-devices-and-device-tree-acpi-concepts.md"
+    },
+    {
+      "id": 124,
+      "title": "PCI/PCIe drivers",
+      "slug": "pcipcie-drivers",
+      "part": "X",
+      "partTitle": "Linux drivers — “all the drivers” as a structured domain",
+      "supermoduleId": 10,
+      "topics": [
+        "enumeration",
+        "BARs",
+        "interrupts",
+        "DMA",
+        "config space"
+      ],
+      "contentPath": "content/modules/124-pcipcie-drivers.md"
+    },
+    {
+      "id": 125,
+      "title": "USB drivers",
+      "slug": "usb-drivers",
+      "part": "X",
+      "partTitle": "Linux drivers — “all the drivers” as a structured domain",
+      "supermoduleId": 10,
+      "topics": [
+        "host controllers",
+        "endpoints",
+        "transfers",
+        "classes",
+        "hotplug"
+      ],
+      "contentPath": "content/modules/125-usb-drivers.md"
+    },
+    {
+      "id": 126,
+      "title": "I2C and SPI drivers",
+      "slug": "i2c-and-spi-drivers",
+      "part": "X",
+      "partTitle": "Linux drivers — “all the drivers” as a structured domain",
+      "supermoduleId": 10,
+      "topics": [
+        "bus transactions",
+        "peripherals",
+        "sensors",
+        "embedded devices"
+      ],
+      "contentPath": "content/modules/126-i2c-and-spi-drivers.md"
+    },
+    {
+      "id": 127,
+      "title": "UART and serial subsystems",
+      "slug": "uart-and-serial-subsystems",
+      "part": "X",
+      "partTitle": "Linux drivers — “all the drivers” as a structured domain",
+      "supermoduleId": 10,
+      "topics": [
+        "TTY layer",
+        "serial ports",
+        "consoles"
+      ],
+      "contentPath": "content/modules/127-uart-and-serial-subsystems.md"
+    },
+    {
+      "id": 128,
+      "title": "GPIO and pin control",
+      "slug": "gpio-and-pin-control",
+      "part": "X",
+      "partTitle": "Linux drivers — “all the drivers” as a structured domain",
+      "supermoduleId": 10,
+      "topics": [
+        "general purpose I/O",
+        "pin multiplexing",
+        "interrupts"
+      ],
+      "contentPath": "content/modules/128-gpio-and-pin-control.md"
+    },
+    {
+      "id": 129,
+      "title": "Input subsystem",
+      "slug": "input-subsystem",
+      "part": "X",
+      "partTitle": "Linux drivers — “all the drivers” as a structured domain",
+      "supermoduleId": 10,
+      "topics": [
+        "keyboards",
+        "mice",
+        "touchscreens",
+        "event devices"
+      ],
+      "contentPath": "content/modules/129-input-subsystem.md"
+    },
+    {
+      "id": 130,
+      "title": "Storage drivers",
+      "slug": "storage-drivers",
+      "part": "X",
+      "partTitle": "Linux drivers — “all the drivers” as a structured domain",
+      "supermoduleId": 10,
+      "topics": [
+        "SATA",
+        "NVMe concepts",
+        "SCSI layer",
+        "block interfaces"
+      ],
+      "contentPath": "content/modules/130-storage-drivers.md"
+    },
+    {
+      "id": 131,
+      "title": "Network drivers",
+      "slug": "network-drivers",
+      "part": "X",
+      "partTitle": "Linux drivers — “all the drivers” as a structured domain",
+      "supermoduleId": 10,
+      "topics": [
+        "NIC initialization",
+        "RX/TX rings",
+        "NAPI",
+        "interrupts",
+        "offloads"
+      ],
+      "contentPath": "content/modules/131-network-drivers.md"
+    },
+    {
+      "id": 132,
+      "title": "Graphics drivers",
+      "slug": "graphics-drivers",
+      "part": "X",
+      "partTitle": "Linux drivers — “all the drivers” as a structured domain",
+      "supermoduleId": 10,
+      "topics": [
+        "DRM/KMS concepts",
+        "framebuffer history",
+        "display pipelines"
+      ],
+      "contentPath": "content/modules/132-graphics-drivers.md"
+    },
+    {
+      "id": 133,
+      "title": "Audio drivers",
+      "slug": "audio-drivers",
+      "part": "X",
+      "partTitle": "Linux drivers — “all the drivers” as a structured domain",
+      "supermoduleId": 10,
+      "topics": [
+        "ALSA concepts",
+        "PCM",
+        "mixer",
+        "streaming"
+      ],
+      "contentPath": "content/modules/133-audio-drivers.md"
+    },
+    {
+      "id": 134,
+      "title": "Camera and media drivers",
+      "slug": "camera-and-media-drivers",
+      "part": "X",
+      "partTitle": "Linux drivers — “all the drivers” as a structured domain",
+      "supermoduleId": 10,
+      "topics": [
+        "V4L2 concepts",
+        "buffers",
+        "pipelines"
+      ],
+      "contentPath": "content/modules/134-camera-and-media-drivers.md"
+    },
+    {
+      "id": 135,
+      "title": "Power management in drivers",
+      "slug": "power-management-in-drivers",
+      "part": "X",
+      "partTitle": "Linux drivers — “all the drivers” as a structured domain",
+      "supermoduleId": 10,
+      "topics": [
+        "suspend/resume",
+        "runtime PM",
+        "clock control",
+        "regulators"
+      ],
+      "contentPath": "content/modules/135-power-management-in-drivers.md"
+    },
+    {
+      "id": 136,
+      "title": "Interrupt-driven and DMA-capable drivers",
+      "slug": "interrupt-driven-and-dma-capable-drivers",
+      "part": "X",
+      "partTitle": "Linux drivers — “all the drivers” as a structured domain",
+      "supermoduleId": 10,
+      "topics": [
+        "mapping memory",
+        "coherency",
+        "completion paths"
+      ],
+      "contentPath": "content/modules/136-interrupt-driven-and-dma-capable-drivers.md"
+    },
+    {
+      "id": 137,
+      "title": "Driver concurrency and synchronization",
+      "slug": "driver-concurrency-and-synchronization",
+      "part": "X",
+      "partTitle": "Linux drivers — “all the drivers” as a structured domain",
+      "supermoduleId": 10,
+      "topics": [
+        "locks",
+        "IRQ-safe paths",
+        "sleep vs atomic context"
+      ],
+      "contentPath": "content/modules/137-driver-concurrency-and-synchronization.md"
+    },
+    {
+      "id": 138,
+      "title": "User-kernel interfaces for drivers",
+      "slug": "user-kernel-interfaces-for-drivers",
+      "part": "X",
+      "partTitle": "Linux drivers — “all the drivers” as a structured domain",
+      "supermoduleId": 10,
+      "topics": [
+        "ioctl",
+        "sysfs",
+        "procfs",
+        "netlink",
+        "mmap",
+        "read/write",
+        "poll"
+      ],
+      "contentPath": "content/modules/138-user-kernel-interfaces-for-drivers.md"
+    },
+    {
+      "id": 139,
+      "title": "Debugging drivers",
+      "slug": "debugging-drivers",
+      "part": "X",
+      "partTitle": "Linux drivers — “all the drivers” as a structured domain",
+      "supermoduleId": 10,
+      "topics": [
+        "dmesg",
+        "dynamic debug",
+        "tracepoints",
+        "lockdep",
+        "sanitizers"
+      ],
+      "contentPath": "content/modules/139-debugging-drivers.md"
+    },
+    {
+      "id": 140,
+      "title": "Security and robustness of drivers",
+      "slug": "security-and-robustness-of-drivers",
+      "part": "X",
+      "partTitle": "Linux drivers — “all the drivers” as a structured domain",
+      "supermoduleId": 10,
+      "topics": [
+        "input validation",
+        "lifetime bugs",
+        "race bugs",
+        "DMA safety"
+      ],
+      "contentPath": "content/modules/140-security-and-robustness-of-drivers.md"
+    },
+    {
+      "id": 141,
+      "title": "Networking fundamentals",
+      "slug": "networking-fundamentals",
+      "part": "XI",
+      "partTitle": "Linux networking — complete structured map",
+      "supermoduleId": 11,
+      "topics": [
+        "layering",
+        "framing",
+        "packets",
+        "switching",
+        "routing"
+      ],
+      "contentPath": "content/modules/141-networking-fundamentals.md"
+    },
+    {
+      "id": 142,
+      "title": "Physical and link layer basics",
+      "slug": "physical-and-link-layer-basics",
+      "part": "XI",
+      "partTitle": "Linux networking — complete structured map",
+      "supermoduleId": 11,
+      "topics": [
+        "copper",
+        "fiber",
+        "signaling intuition",
+        "Ethernet framing",
+        "MAC addresses"
+      ],
+      "contentPath": "content/modules/142-physical-and-link-layer-basics.md"
+    },
+    {
+      "id": 143,
+      "title": "IP layer",
+      "slug": "ip-layer",
+      "part": "XI",
+      "partTitle": "Linux networking — complete structured map",
+      "supermoduleId": 11,
+      "topics": [
+        "IPv4",
+        "IPv6",
+        "addressing",
+        "subnetting",
+        "fragmentation",
+        "TTL/hop limit"
+      ],
+      "contentPath": "content/modules/143-ip-layer.md"
+    },
+    {
+      "id": 144,
+      "title": "Routing",
+      "slug": "routing",
+      "part": "XI",
+      "partTitle": "Linux networking — complete structured map",
+      "supermoduleId": 11,
+      "topics": [
+        "forwarding tables",
+        "ARP/ND",
+        "gateways",
+        "dynamic routing intuition"
+      ],
+      "contentPath": "content/modules/144-routing.md"
+    },
+    {
+      "id": 145,
+      "title": "Transport layer",
+      "slug": "transport-layer",
+      "part": "XI",
+      "partTitle": "Linux networking — complete structured map",
+      "supermoduleId": 11,
+      "topics": [
+        "TCP",
+        "UDP",
+        "ports",
+        "reliability",
+        "flow control",
+        "congestion control"
+      ],
+      "contentPath": "content/modules/145-transport-layer.md"
+    },
+    {
+      "id": 146,
+      "title": "DNS and naming",
+      "slug": "dns-and-naming",
+      "part": "XI",
+      "partTitle": "Linux networking — complete structured map",
+      "supermoduleId": 11,
+      "topics": [
+        "recursive resolution",
+        "caching",
+        "record types",
+        "stub resolvers"
+      ],
+      "contentPath": "content/modules/146-dns-and-naming.md"
+    },
+    {
+      "id": 147,
+      "title": "Application protocols",
+      "slug": "application-protocols",
+      "part": "XI",
+      "partTitle": "Linux networking — complete structured map",
+      "supermoduleId": 11,
+      "topics": [
+        "HTTP",
+        "TLS concepts",
+        "SSH",
+        "SMTP",
+        "NTP",
+        "DHCP at a systems level"
+      ],
+      "contentPath": "content/modules/147-application-protocols.md"
+    },
+    {
+      "id": 148,
+      "title": "Sockets API",
+      "slug": "sockets-api",
+      "part": "XI",
+      "partTitle": "Linux networking — complete structured map",
+      "supermoduleId": 11,
+      "topics": [
+        "socket lifecycle",
+        "bind",
+        "listen",
+        "accept",
+        "connect",
+        "send/recv",
+        "nonblocking I/O"
+      ],
+      "contentPath": "content/modules/148-sockets-api.md"
+    },
+    {
+      "id": 149,
+      "title": "Linux network stack internals",
+      "slug": "linux-network-stack-internals",
+      "part": "XI",
+      "partTitle": "Linux networking — complete structured map",
+      "supermoduleId": 11,
+      "topics": [
+        "sk_buff",
+        "receive path",
+        "transmit path",
+        "routing lookup",
+        "socket buffers"
+      ],
+      "contentPath": "content/modules/149-linux-network-stack-internals.md"
+    },
+    {
+      "id": 150,
+      "title": "NIC interaction",
+      "slug": "nic-interaction",
+      "part": "XI",
+      "partTitle": "Linux networking — complete structured map",
+      "supermoduleId": 11,
+      "topics": [
+        "DMA rings",
+        "interrupts",
+        "NAPI",
+        "checksum offload",
+        "segmentation offload"
+      ],
+      "contentPath": "content/modules/150-nic-interaction.md"
+    },
+    {
+      "id": 151,
+      "title": "Netfilter and packet processing",
+      "slug": "netfilter-and-packet-processing",
+      "part": "XI",
+      "partTitle": "Linux networking — complete structured map",
+      "supermoduleId": 11,
+      "topics": [
+        "filtering",
+        "NAT",
+        "hooks",
+        "packet traversal intuition"
+      ],
+      "contentPath": "content/modules/151-netfilter-and-packet-processing.md"
+    },
+    {
+      "id": 152,
+      "title": "Traffic control",
+      "slug": "traffic-control",
+      "part": "XI",
+      "partTitle": "Linux networking — complete structured map",
+      "supermoduleId": 11,
+      "topics": [
+        "qdiscs",
+        "shaping",
+        "policing",
+        "queueing behavior"
+      ],
+      "contentPath": "content/modules/152-traffic-control.md"
+    },
+    {
+      "id": 153,
+      "title": "Virtual networking",
+      "slug": "virtual-networking",
+      "part": "XI",
+      "partTitle": "Linux networking — complete structured map",
+      "supermoduleId": 11,
+      "topics": [
+        "bridges",
+        "veth",
+        "tap/tun",
+        "namespaces",
+        "overlays"
+      ],
+      "contentPath": "content/modules/153-virtual-networking.md"
+    },
+    {
+      "id": 154,
+      "title": "Performance engineering for networking",
+      "slug": "performance-engineering-for-networking",
+      "part": "XI",
+      "partTitle": "Linux networking — complete structured map",
+      "supermoduleId": 11,
+      "topics": [
+        "zero-copy ideas",
+        "batching",
+        "RSS",
+        "RPS",
+        "CPU affinity",
+        "latency vs throughput"
+      ],
+      "contentPath": "content/modules/154-performance-engineering-for-networking.md"
+    },
+    {
+      "id": 155,
+      "title": "Wireless networking basics",
+      "slug": "wireless-networking-basics",
+      "part": "XI",
+      "partTitle": "Linux networking — complete structured map",
+      "supermoduleId": 11,
+      "topics": [
+        "Wi-Fi architecture",
+        "association",
+        "channels",
+        "encryption at a high level"
+      ],
+      "contentPath": "content/modules/155-wireless-networking-basics.md"
+    },
+    {
+      "id": 156,
+      "title": "Network security",
+      "slug": "network-security",
+      "part": "XI",
+      "partTitle": "Linux networking — complete structured map",
+      "supermoduleId": 11,
+      "topics": [
+        "TLS fundamentals",
+        "firewalls",
+        "VPN concepts",
+        "authentication",
+        "spoofing basics"
+      ],
+      "contentPath": "content/modules/156-network-security.md"
+    },
+    {
+      "id": 157,
+      "title": "Observability",
+      "slug": "observability",
+      "part": "XI",
+      "partTitle": "Linux networking — complete structured map",
+      "supermoduleId": 11,
+      "topics": [
+        "tcpdump",
+        "ss",
+        "iproute2",
+        "ethtool",
+        "perf",
+        "tracing"
+      ],
+      "contentPath": "content/modules/157-observability.md"
+    },
+    {
+      "id": 158,
+      "title": "Distributed systems interplay",
+      "slug": "distributed-systems-interplay",
+      "part": "XI",
+      "partTitle": "Linux networking — complete structured map",
+      "supermoduleId": 11,
+      "topics": [
+        "retries",
+        "timeouts",
+        "partial failure",
+        "idempotency",
+        "backpressure"
+      ],
+      "contentPath": "content/modules/158-distributed-systems-interplay.md"
+    },
+    {
+      "id": 159,
+      "title": "Magnetic storage basics",
+      "slug": "magnetic-storage-basics",
+      "part": "XII",
+      "partTitle": "Storage and filesystems",
+      "supermoduleId": 12,
+      "topics": [
+        "disks",
+        "sectors",
+        "seeks",
+        "rotational latency"
+      ],
+      "contentPath": "content/modules/159-magnetic-storage-basics.md"
+    },
+    {
+      "id": 160,
+      "title": "Flash storage and SSDs",
+      "slug": "flash-storage-and-ssds",
+      "part": "XII",
+      "partTitle": "Storage and filesystems",
+      "supermoduleId": 12,
+      "topics": [
+        "pages",
+        "blocks",
+        "wear leveling",
+        "garbage collection",
+        "FTL"
+      ],
+      "contentPath": "content/modules/160-flash-storage-and-ssds.md"
+    },
+    {
+      "id": 161,
+      "title": "RAID and redundancy",
+      "slug": "raid-and-redundancy",
+      "part": "XII",
+      "partTitle": "Storage and filesystems",
+      "supermoduleId": 12,
+      "topics": [
+        "striping",
+        "mirroring",
+        "parity",
+        "failure tradeoffs"
+      ],
+      "contentPath": "content/modules/161-raid-and-redundancy.md"
+    },
+    {
+      "id": 162,
+      "title": "Linux block layer deep dive",
+      "slug": "linux-block-layer-deep-dive",
+      "part": "XII",
+      "partTitle": "Storage and filesystems",
+      "supermoduleId": 12,
+      "topics": [
+        "requests",
+        "elevators",
+        "multiqueue block layer"
+      ],
+      "contentPath": "content/modules/162-linux-block-layer-deep-dive.md"
+    },
+    {
+      "id": 163,
+      "title": "Filesystem design",
+      "slug": "filesystem-design",
+      "part": "XII",
+      "partTitle": "Storage and filesystems",
+      "supermoduleId": 12,
+      "topics": [
+        "allocation",
+        "metadata",
+        "journaling",
+        "crash consistency",
+        "copy-on-write ideas"
+      ],
+      "contentPath": "content/modules/163-filesystem-design.md"
+    },
+    {
+      "id": 164,
+      "title": "Linux filesystems",
+      "slug": "linux-filesystems",
+      "part": "XII",
+      "partTitle": "Storage and filesystems",
+      "supermoduleId": 12,
+      "topics": [
+        "ext4 concepts",
+        "XFS concepts",
+        "Btrfs concepts at a high level"
+      ],
+      "contentPath": "content/modules/164-linux-filesystems.md"
+    },
+    {
+      "id": 165,
+      "title": "Page cache and writeback",
+      "slug": "page-cache-and-writeback",
+      "part": "XII",
+      "partTitle": "Storage and filesystems",
+      "supermoduleId": 12,
+      "topics": [
+        "caching",
+        "dirty pages",
+        "flushing",
+        "consistency semantics"
+      ],
+      "contentPath": "content/modules/165-page-cache-and-writeback.md"
+    },
+    {
+      "id": 166,
+      "title": "Memory-mapped files",
+      "slug": "memory-mapped-files",
+      "part": "XII",
+      "partTitle": "Storage and filesystems",
+      "supermoduleId": 12,
+      "topics": [
+        "mmap interaction with page cache and virtual memory"
+      ],
+      "contentPath": "content/modules/166-memory-mapped-files.md"
+    },
+    {
+      "id": 167,
+      "title": "Storage performance",
+      "slug": "storage-performance",
+      "part": "XII",
+      "partTitle": "Storage and filesystems",
+      "supermoduleId": 12,
+      "topics": [
+        "IOPS",
+        "throughput",
+        "queue depth",
+        "fsync costs",
+        "latency distributions"
+      ],
+      "contentPath": "content/modules/167-storage-performance.md"
+    },
+    {
+      "id": 168,
+      "title": "Threads and shared memory",
+      "slug": "threads-and-shared-memory",
+      "part": "XIII",
+      "partTitle": "Concurrency, parallelism, and multicore systems",
+      "supermoduleId": 12,
+      "topics": [
+        "race conditions",
+        "critical sections",
+        "synchronization patterns"
+      ],
+      "contentPath": "content/modules/168-threads-and-shared-memory.md"
+    },
+    {
+      "id": 169,
+      "title": "Atomics and memory ordering",
+      "slug": "atomics-and-memory-ordering",
+      "part": "XIII",
+      "partTitle": "Concurrency, parallelism, and multicore systems",
+      "supermoduleId": 12,
+      "topics": [
+        "acquire/release intuition",
+        "fences",
+        "happens-before"
+      ],
+      "contentPath": "content/modules/169-atomics-and-memory-ordering.md"
+    },
+    {
+      "id": 170,
+      "title": "Cache coherence",
+      "slug": "cache-coherence",
+      "part": "XIII",
+      "partTitle": "Concurrency, parallelism, and multicore systems",
+      "supermoduleId": 12,
+      "topics": [
+        "coherence states",
+        "false sharing",
+        "cache line bouncing"
+      ],
+      "contentPath": "content/modules/170-cache-coherence.md"
+    },
+    {
+      "id": 171,
+      "title": "NUMA",
+      "slug": "numa",
+      "part": "XIII",
+      "partTitle": "Concurrency, parallelism, and multicore systems",
+      "supermoduleId": 12,
+      "topics": [
+        "locality",
+        "remote memory access",
+        "placement"
+      ],
+      "contentPath": "content/modules/171-numa.md"
+    },
+    {
+      "id": 172,
+      "title": "Parallel programming models",
+      "slug": "parallel-programming-models",
+      "part": "XIII",
+      "partTitle": "Concurrency, parallelism, and multicore systems",
+      "supermoduleId": 12,
+      "topics": [
+        "threads",
+        "event loops",
+        "async I/O",
+        "work stealing",
+        "task models"
+      ],
+      "contentPath": "content/modules/172-parallel-programming-models.md"
+    },
+    {
+      "id": 173,
+      "title": "Performance scaling laws",
+      "slug": "performance-scaling-laws",
+      "part": "XIII",
+      "partTitle": "Concurrency, parallelism, and multicore systems",
+      "supermoduleId": 12,
+      "topics": [
+        "Amdahl",
+        "Gustafson",
+        "bottleneck reasoning"
+      ],
+      "contentPath": "content/modules/173-performance-scaling-laws.md"
+    },
+    {
+      "id": 174,
+      "title": "Kernel concurrency patterns",
+      "slug": "kernel-concurrency-patterns",
+      "part": "XIII",
+      "partTitle": "Concurrency, parallelism, and multicore systems",
+      "supermoduleId": 12,
+      "topics": [
+        "RCU",
+        "lock hierarchies",
+        "per-CPU data",
+        "interrupt concurrency"
+      ],
+      "contentPath": "content/modules/174-kernel-concurrency-patterns.md"
+    },
+    {
+      "id": 175,
+      "title": "Security foundations",
+      "slug": "security-foundations",
+      "part": "XIV",
+      "partTitle": "Security",
+      "supermoduleId": 12,
+      "topics": [
+        "threat models",
+        "attack surface",
+        "least privilege",
+        "trust boundaries"
+      ],
+      "contentPath": "content/modules/175-security-foundations.md"
+    },
+    {
+      "id": 176,
+      "title": "Linux permissions and identity",
+      "slug": "linux-permissions-and-identity",
+      "part": "XIV",
+      "partTitle": "Security",
+      "supermoduleId": 12,
+      "topics": [
+        "UID/GID",
+        "capabilities",
+        "setuid",
+        "ACL concepts"
+      ],
+      "contentPath": "content/modules/176-linux-permissions-and-identity.md"
+    },
+    {
+      "id": 177,
+      "title": "Memory safety and exploitation basics",
+      "slug": "memory-safety-and-exploitation-basics",
+      "part": "XIV",
+      "partTitle": "Security",
+      "supermoduleId": 12,
+      "topics": [
+        "overflows",
+        "use-after-free intuition",
+        "mitigations"
+      ],
+      "contentPath": "content/modules/177-memory-safety-and-exploitation-basics.md"
+    },
+    {
+      "id": 178,
+      "title": "Kernel security",
+      "slug": "kernel-security",
+      "part": "XIV",
+      "partTitle": "Security",
+      "supermoduleId": 12,
+      "topics": [
+        "module trust",
+        "LSMs",
+        "seccomp",
+        "namespaces as isolation building blocks"
+      ],
+      "contentPath": "content/modules/178-kernel-security.md"
+    },
+    {
+      "id": 179,
+      "title": "Cryptography fundamentals",
+      "slug": "cryptography-fundamentals",
+      "part": "XIV",
+      "partTitle": "Security",
+      "supermoduleId": 12,
+      "topics": [
+        "hashing",
+        "symmetric/asymmetric encryption",
+        "signatures",
+        "key exchange at a conceptual level"
+      ],
+      "contentPath": "content/modules/179-cryptography-fundamentals.md"
+    },
+    {
+      "id": 180,
+      "title": "Secure networking",
+      "slug": "secure-networking",
+      "part": "XIV",
+      "partTitle": "Security",
+      "supermoduleId": 12,
+      "topics": [
+        "TLS",
+        "certificates",
+        "SSH trust models",
+        "VPN concepts"
+      ],
+      "contentPath": "content/modules/180-secure-networking.md"
+    },
+    {
+      "id": 181,
+      "title": "Authentication and authorization",
+      "slug": "authentication-and-authorization",
+      "part": "XIV",
+      "partTitle": "Security",
+      "supermoduleId": 12,
+      "topics": [
+        "passwords",
+        "PAM concepts",
+        "tokens",
+        "policy"
+      ],
+      "contentPath": "content/modules/181-authentication-and-authorization.md"
+    },
+    {
+      "id": 182,
+      "title": "System hardening",
+      "slug": "system-hardening",
+      "part": "XIV",
+      "partTitle": "Security",
+      "supermoduleId": 12,
+      "topics": [
+        "patching",
+        "least privilege",
+        "auditing",
+        "isolation",
+        "logging",
+        "attack surface reduction"
+      ],
+      "contentPath": "content/modules/182-system-hardening.md"
+    },
+    {
+      "id": 183,
+      "title": "Performance models",
+      "slug": "performance-models",
+      "part": "XV",
+      "partTitle": "Performance, profiling, and observability",
+      "supermoduleId": 12,
+      "topics": [
+        "latency",
+        "throughput",
+        "utilization",
+        "service time",
+        "queueing"
+      ],
+      "contentPath": "content/modules/183-performance-models.md"
+    },
+    {
+      "id": 184,
+      "title": "CPU profiling",
+      "slug": "cpu-profiling",
+      "part": "XV",
+      "partTitle": "Performance, profiling, and observability",
+      "supermoduleId": 12,
+      "topics": [
+        "sampling",
+        "instrumentation",
+        "flame graph intuition"
+      ],
+      "contentPath": "content/modules/184-cpu-profiling.md"
+    },
+    {
+      "id": 185,
+      "title": "Memory profiling",
+      "slug": "memory-profiling",
+      "part": "XV",
+      "partTitle": "Performance, profiling, and observability",
+      "supermoduleId": 12,
+      "topics": [
+        "allocation patterns",
+        "working set",
+        "cache misses",
+        "page faults"
+      ],
+      "contentPath": "content/modules/185-memory-profiling.md"
+    },
+    {
+      "id": 186,
+      "title": "I/O profiling",
+      "slug": "io-profiling",
+      "part": "XV",
+      "partTitle": "Performance, profiling, and observability",
+      "supermoduleId": 12,
+      "topics": [
+        "disk latency",
+        "queueing",
+        "block traces"
+      ],
+      "contentPath": "content/modules/186-io-profiling.md"
+    },
+    {
+      "id": 187,
+      "title": "Network profiling",
+      "slug": "network-profiling",
+      "part": "XV",
+      "partTitle": "Performance, profiling, and observability",
+      "supermoduleId": 12,
+      "topics": [
+        "packet drops",
+        "retransmissions",
+        "queueing",
+        "socket buffers"
+      ],
+      "contentPath": "content/modules/187-network-profiling.md"
+    },
+    {
+      "id": 188,
+      "title": "Linux observability tools",
+      "slug": "linux-observability-tools",
+      "part": "XV",
+      "partTitle": "Performance, profiling, and observability",
+      "supermoduleId": 12,
+      "topics": [
+        "ps",
+        "top",
+        "vmstat",
+        "iostat",
+        "sar",
+        "perf",
+        "strace",
+        "ltrace",
+        "ftrace",
+        "eBPF overview"
+      ],
+      "contentPath": "content/modules/188-linux-observability-tools.md"
+    },
+    {
+      "id": 189,
+      "title": "Benchmarking methodology",
+      "slug": "benchmarking-methodology",
+      "part": "XV",
+      "partTitle": "Performance, profiling, and observability",
+      "supermoduleId": 12,
+      "topics": [
+        "warmup",
+        "noise",
+        "isolation",
+        "representative workloads",
+        "measurement error"
+      ],
+      "contentPath": "content/modules/189-benchmarking-methodology.md"
+    },
+    {
+      "id": 190,
+      "title": "Virtualization basics",
+      "slug": "virtualization-basics",
+      "part": "XVI",
+      "partTitle": "Containers, virtualization, and cloud-era Linux",
+      "supermoduleId": 12,
+      "topics": [
+        "type 1/type 2 intuition",
+        "hardware virtualization support",
+        "guest/host boundary"
+      ],
+      "contentPath": "content/modules/190-virtualization-basics.md"
+    },
+    {
+      "id": 191,
+      "title": "KVM concepts",
+      "slug": "kvm-concepts",
+      "part": "XVI",
+      "partTitle": "Containers, virtualization, and cloud-era Linux",
+      "supermoduleId": 12,
+      "topics": [
+        "VM execution model",
+        "virtual devices",
+        "hypervisor interactions"
+      ],
+      "contentPath": "content/modules/191-kvm-concepts.md"
+    },
+    {
+      "id": 192,
+      "title": "Containers",
+      "slug": "containers",
+      "part": "XVI",
+      "partTitle": "Containers, virtualization, and cloud-era Linux",
+      "supermoduleId": 12,
+      "topics": [
+        "namespaces",
+        "cgroups",
+        "filesystem layering",
+        "OCI intuition"
+      ],
+      "contentPath": "content/modules/192-containers.md"
+    },
+    {
+      "id": 193,
+      "title": "Orchestration concepts",
+      "slug": "orchestration-concepts",
+      "part": "XVI",
+      "partTitle": "Containers, virtualization, and cloud-era Linux",
+      "supermoduleId": 12,
+      "topics": [
+        "scheduling",
+        "service discovery",
+        "health checks",
+        "resource limits"
+      ],
+      "contentPath": "content/modules/193-orchestration-concepts.md"
+    },
+    {
+      "id": 194,
+      "title": "Storage and networking in containers",
+      "slug": "storage-and-networking-in-containers",
+      "part": "XVI",
+      "partTitle": "Containers, virtualization, and cloud-era Linux",
+      "supermoduleId": 12,
+      "topics": [
+        "overlay filesystems",
+        "bridge networking",
+        "CNI-level intuition"
+      ],
+      "contentPath": "content/modules/194-storage-and-networking-in-containers.md"
+    },
+    {
+      "id": 195,
+      "title": "System programming in C",
+      "slug": "system-programming-in-c",
+      "part": "XVII",
+      "partTitle": "Programming around Linux",
+      "supermoduleId": 12,
+      "topics": [
+        "processes",
+        "files",
+        "signals",
+        "pipes",
+        "sockets",
+        "epoll",
+        "threads"
+      ],
+      "contentPath": "content/modules/195-system-programming-in-c.md"
+    },
+    {
+      "id": 196,
+      "title": "Async I/O models",
+      "slug": "async-io-models",
+      "part": "XVII",
+      "partTitle": "Programming around Linux",
+      "supermoduleId": 12,
+      "topics": [
+        "select",
+        "poll",
+        "epoll",
+        "io_uring concepts"
+      ],
+      "contentPath": "content/modules/196-async-io-models.md"
+    },
+    {
+      "id": 197,
+      "title": "Daemon and service design",
+      "slug": "daemon-and-service-design",
+      "part": "XVII",
+      "partTitle": "Programming around Linux",
+      "supermoduleId": 12,
+      "topics": [
+        "lifecycle",
+        "supervision",
+        "signals",
+        "logging",
+        "config",
+        "reloads"
+      ],
+      "contentPath": "content/modules/197-daemon-and-service-design.md"
+    },
+    {
+      "id": 198,
+      "title": "Interprocess communication design",
+      "slug": "interprocess-communication-design",
+      "part": "XVII",
+      "partTitle": "Programming around Linux",
+      "supermoduleId": 12,
+      "topics": [
+        "pipes",
+        "shared memory",
+        "RPC",
+        "sockets",
+        "protocol design"
+      ],
+      "contentPath": "content/modules/198-interprocess-communication-design.md"
+    },
+    {
+      "id": 199,
+      "title": "Error handling and robustness",
+      "slug": "error-handling-and-robustness",
+      "part": "XVII",
+      "partTitle": "Programming around Linux",
+      "supermoduleId": 12,
+      "topics": [
+        "errno",
+        "retries",
+        "backoff",
+        "partial failure handling"
+      ],
+      "contentPath": "content/modules/199-error-handling-and-robustness.md"
+    },
+    {
+      "id": 200,
+      "title": "ABI, API, and compatibility",
+      "slug": "abi-api-and-compatibility",
+      "part": "XVII",
+      "partTitle": "Programming around Linux",
+      "supermoduleId": 12,
+      "topics": [
+        "versioning",
+        "syscall stability",
+        "library compatibility"
+      ],
+      "contentPath": "content/modules/200-abi-api-and-compatibility.md"
+    },
+    {
+      "id": 201,
+      "title": "Runtime systems",
+      "slug": "runtime-systems",
+      "part": "XVIII",
+      "partTitle": "Compilers, languages, and runtimes as they meet Linux",
+      "supermoduleId": 12,
+      "topics": [
+        "process startup",
+        "stacks",
+        "heaps",
+        "allocators",
+        "garbage collection interaction with OS"
+      ],
+      "contentPath": "content/modules/201-runtime-systems.md"
+    },
+    {
+      "id": 202,
+      "title": "Memory allocators",
+      "slug": "memory-allocators",
+      "part": "XVIII",
+      "partTitle": "Compilers, languages, and runtimes as they meet Linux",
+      "supermoduleId": 12,
+      "topics": [
+        "malloc internals",
+        "arenas",
+        "fragmentation",
+        "tcache intuition"
+      ],
+      "contentPath": "content/modules/202-memory-allocators.md"
+    },
+    {
+      "id": 203,
+      "title": "Managed runtimes on Linux",
+      "slug": "managed-runtimes-on-linux",
+      "part": "XVIII",
+      "partTitle": "Compilers, languages, and runtimes as they meet Linux",
+      "supermoduleId": 12,
+      "topics": [
+        "JVM/.NET/Go runtime interactions with threads",
+        "memory",
+        "syscalls"
+      ],
+      "contentPath": "content/modules/203-managed-runtimes-on-linux.md"
+    },
+    {
+      "id": 204,
+      "title": "FFI and language interoperability",
+      "slug": "ffi-and-language-interoperability",
+      "part": "XVIII",
+      "partTitle": "Compilers, languages, and runtimes as they meet Linux",
+      "supermoduleId": 12,
+      "topics": [
+        "calling conventions",
+        "shared libraries",
+        "symbol interfaces"
+      ],
+      "contentPath": "content/modules/204-ffi-and-language-interoperability.md"
+    },
+    {
+      "id": 205,
+      "title": "Time and clocks",
+      "slug": "time-and-clocks",
+      "part": "XIX",
+      "partTitle": "Distributed systems above Linux",
+      "supermoduleId": 11,
+      "topics": [
+        "monotonic vs wall clocks",
+        "synchronization",
+        "drift"
+      ],
+      "contentPath": "content/modules/205-time-and-clocks.md"
+    },
+    {
+      "id": 206,
+      "title": "Failure models",
+      "slug": "failure-models",
+      "part": "XIX",
+      "partTitle": "Distributed systems above Linux",
+      "supermoduleId": 11,
+      "topics": [
+        "crash",
+        "omission",
+        "partition",
+        "partial failure"
+      ],
+      "contentPath": "content/modules/206-failure-models.md"
+    },
+    {
+      "id": 207,
+      "title": "RPC and service communication",
+      "slug": "rpc-and-service-communication",
+      "part": "XIX",
+      "partTitle": "Distributed systems above Linux",
+      "supermoduleId": 11,
+      "topics": [
+        "retries",
+        "deadlines",
+        "serialization",
+        "load balancing"
+      ],
+      "contentPath": "content/modules/207-rpc-and-service-communication.md"
+    },
+    {
+      "id": 208,
+      "title": "Consistency basics",
+      "slug": "consistency-basics",
+      "part": "XIX",
+      "partTitle": "Distributed systems above Linux",
+      "supermoduleId": 11,
+      "topics": [
+        "replication",
+        "consensus intuition",
+        "eventual consistency"
+      ],
+      "contentPath": "content/modules/208-consistency-basics.md"
+    },
+    {
+      "id": 209,
+      "title": "Linux as a node in a distributed system",
+      "slug": "linux-as-a-node-in-a-distributed-system",
+      "part": "XIX",
+      "partTitle": "Distributed systems above Linux",
+      "supermoduleId": 11,
+      "topics": [
+        "resource isolation",
+        "observability",
+        "network and storage interactions"
+      ],
+      "contentPath": "content/modules/209-linux-as-a-node-in-a-distributed-system.md"
+    },
+    {
+      "id": 210,
+      "title": "Source control and collaboration",
+      "slug": "source-control-and-collaboration",
+      "part": "XX",
+      "partTitle": "Advanced engineering practice",
+      "supermoduleId": 12,
+      "topics": [
+        "Git",
+        "branching",
+        "patch workflows",
+        "code review"
+      ],
+      "contentPath": "content/modules/210-source-control-and-collaboration.md"
+    },
+    {
+      "id": 211,
+      "title": "Testing",
+      "slug": "testing",
+      "part": "XX",
+      "partTitle": "Advanced engineering practice",
+      "supermoduleId": 12,
+      "topics": [
+        "unit",
+        "integration",
+        "system",
+        "stress",
+        "fuzzing"
+      ],
+      "contentPath": "content/modules/211-testing.md"
+    },
+    {
+      "id": 212,
+      "title": "Continuous integration",
+      "slug": "continuous-integration",
+      "part": "XX",
+      "partTitle": "Advanced engineering practice",
+      "supermoduleId": 12,
+      "topics": [
+        "reproducibility",
+        "automation",
+        "artifact pipelines"
+      ],
+      "contentPath": "content/modules/212-continuous-integration.md"
+    },
+    {
+      "id": 213,
+      "title": "Reliability engineering",
+      "slug": "reliability-engineering",
+      "part": "XX",
+      "partTitle": "Advanced engineering practice",
+      "supermoduleId": 12,
+      "topics": [
+        "SLOs",
+        "error budgets",
+        "incident response",
+        "capacity planning"
+      ],
+      "contentPath": "content/modules/213-reliability-engineering.md"
+    },
+    {
+      "id": 214,
+      "title": "Kernel contribution workflow",
+      "slug": "kernel-contribution-workflow",
+      "part": "XX",
+      "partTitle": "Advanced engineering practice",
+      "supermoduleId": 12,
+      "topics": [
+        "patches",
+        "subsystem maintainers",
+        "coding style",
+        "mailing list culture"
+      ],
+      "contentPath": "content/modules/214-kernel-contribution-workflow.md"
+    },
+    {
+      "id": 215,
+      "title": "Reading specifications and standards",
+      "slug": "reading-specifications-and-standards",
+      "part": "XX",
+      "partTitle": "Advanced engineering practice",
+      "supermoduleId": 12,
+      "topics": [
+        "RFCs",
+        "ABI docs",
+        "architecture manuals",
+        "vendor docs"
+      ],
+      "contentPath": "content/modules/215-reading-specifications-and-standards.md"
+    }
+  ]
+}
