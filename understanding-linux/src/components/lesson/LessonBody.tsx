@@ -1,6 +1,8 @@
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
+import remarkMath from 'remark-math';
 import rehypeHighlight from 'rehype-highlight';
+import rehypeKatex from 'rehype-katex';
 import { CodeBlock } from './CodeBlock';
 import type { ExtraProps } from 'react-markdown';
 import type { ComponentPropsWithoutRef } from 'react';
@@ -55,8 +57,8 @@ export function LessonBody({ markdown }: LessonBodyProps) {
   return (
     <div className="prose-lesson">
       <ReactMarkdown
-        remarkPlugins={[remarkGfm]}
-        rehypePlugins={[rehypeHighlight]}
+        remarkPlugins={[remarkGfm, remarkMath]}
+        rehypePlugins={[rehypeHighlight, rehypeKatex]}
         components={components as Record<string, unknown>}
       >
         {markdown}
