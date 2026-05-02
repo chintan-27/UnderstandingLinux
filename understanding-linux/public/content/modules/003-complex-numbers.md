@@ -1,66 +1,152 @@
 ---
 id: 3
 title: "Complex numbers"
-part: "I"
 supermoduleId: 1
-estimatedMinutes: 50
+estimatedMinutes: 45
 resources:
   - type: book
-    title: "Art of Problem Solving"
-    url: "https://artofproblemsolving.com/"
-  - type: article
-    title: "Khan Academy"
-    url: "https://www.khanacademy.org/math"
-  - type: article
-    title: "Better Explained"
-    url: "https://betterexplained.com/"
+    title: "Concrete Mathematics (Knuth)"
+  - type: book
+    title: "Introduction to Linear Algebra (Strang)"
 ---
-# Complex numbers
 
 ## Why This Matters
 
-Every equation describing hardware — clock rates, memory bandwidth, power dissipation — is math. You need fluency with these tools before touching circuits.
+Every oscillating quantity in a physical system carries two independent pieces of information: how large the oscillation is (amplitude) and where in the cycle it currently sits (phase). Real arithmetic forces you to track these separately, which means every operation on sinusoids requires expanding trigonometric identities. Multiply two sinusoids in real arithmetic and you get a sum-of-products identity; do the same with complex exponentials and you get a single line. Complex numbers are not a convenience — they are the minimal algebraic structure that makes linear time-invariant system analysis tractable.
 
-**Complex numbers** sits within Math for Physical Computing (Supermodule 1). This module covers 4 interconnected topics: real/imaginary parts, Euler’s formula, phasors, impedance intuition. Each builds on the previous, forming a coherent picture of how mathematics works at this level.
+This matters directly for Linux systems work: the ALSA kernel driver applies IIR biquad filters whose coefficients are derived from poles and zeros in the complex plane; `numpy.fft` and `scipy.signal` represent filter transfer functions as ratios of complex polynomials; audio resampling in PipeWire uses sinc interpolation whose frequency-domain behavior is described entirely in terms of $e^{j\omega}$. If you cannot read complex impedance or a transfer function expressed as $H(j\omega)$, you cannot interpret what these subsystems are doing.
+
+---
 
 ## Core Concepts
 
-### Real/imaginary parts
+### Real and Imaginary Parts
 
-**Real/imaginary parts** is a foundational concept within complex numbers. This concept appears throughout mathematics and provides the quantitative foundation for reasoning about hardware and software systems. The key is building intuition for orders of magnitude and the relationships between quantities. In practice, understanding real/imaginary parts allows you to reason about system behavior rather than treating it as a black box.
+A complex number is an ordered pair of real numbers written as a single algebraic object:
 
-### Euler’s formula
+$$z = a + jb$$
 
-**Euler’s formula** is a foundational concept within complex numbers. This concept appears throughout mathematics and provides the quantitative foundation for reasoning about hardware and software systems. The key is building intuition for orders of magnitude and the relationships between quantities. In practice, understanding Euler’s formula allows you to reason about system behavior rather than treating it as a black box.
+where $a = \text{Re}(z)$ and $b = \text{Im}(z)$. The symbol $j$ (engineering convention) or $i$ (mathematics convention) is defined by the single axiom $j^2 = -1$. This extends the real numbers into a **field**: every nonzero element has a multiplicative inverse, so division is always defined (except by zero), and all four arithmetic operations stay within the set.
+
+Geometrically, $z$ is a point in the **Argand plane**: real axis horizontal, imaginary axis vertical. The geometry is load-bearing, not decorative — multiplication of two complex numbers corresponds to rotation and scaling in that plane, which is exactly what happens to a sinusoidal signal as it passes through a linear system.
+
+### Polar Form and Magnitude
+
+The Cartesian form $a + jb$ and the polar form are two coordinate systems for the same point. The conversion is:
+
+$$|z| = \sqrt{a^2 + b^2}, \qquad \theta = \arg(z) = \operatorname{atan2}(b,\, a)$$
+
+Note $\operatorname{atan2}$ rather than $\arctan(b/a)$: the two-argument form preserves the correct quadrant when $a \leq 0$. In polar form:
+
+$$z = |z|\,(\cos\theta + j\sin\theta)$$
+
+The magnitude $|z|$ is the amplitude of the oscillation this number represents; the angle $\theta$ is its phase. Separating them into polar coordinates is what makes multiplication geometrically transparent.
+
+### Euler's Formula
+
+$$e^{j\theta} = \cos\theta + j\sin\theta$$
+
+This is a theorem, not a definition. It follows from substituting $x = j\theta$ into the real-valued Taylor series for $e^x$ and observing that the powers of $j$ cycle with period 4: $j^0=1,\; j^1=j,\; j^2=-1,\; j^3=-j,\; j^4=1,\ldots$ The even-indexed terms collect into the cosine series; the odd-indexed terms (each carrying a factor of $j$) collect into $j$ times the sine series. The derivation is in the next section.
+
+The consequence is that polar form becomes:
+
+$$z = |z|\,e^{j\theta}$$
+
+and multiplication reduces to:
+
+$$z_1 z_2 = |z_1||z_2|\,e^{j(\theta_1+\theta_2)}$$
+
+Magnitudes multiply; angles add. This is the algebraic reason complex exponentials are the natural basis functions for linear systems: a system that scales amplitude and shifts phase acts by multiplying its input by a single complex number.
 
 ### Phasors
 
-**Phasors** is a foundational concept within complex numbers. This concept appears throughout mathematics and provides the quantitative foundation for reasoning about hardware and software systems. The key is building intuition for orders of magnitude and the relationships between quantities. In practice, understanding phasors allows you to reason about system behavior rather than treating it as a black box.
+A **phasor** represents a steady-state sinusoid as a time-frozen complex amplitude. Given:
 
-### Impedance intuition
+$$v(t) = V_0\cos(\omega t + \phi)$$
 
-**Impedance intuition** is a foundational concept within complex numbers. This concept appears throughout mathematics and provides the quantitative foundation for reasoning about hardware and software systems. The key is building intuition for orders of magnitude and the relationships between quantities. In practice, understanding impedance intuition allows you to reason about system behavior rather than treating it as a black box.
+the phasor is:
 
-## Practical Example
+$$\tilde{V} = V_0\,e^{j\phi}$$
+
+The time-domain signal is recovered by:
+
+$$v(t) = \operatorname{Re}\!\left(\tilde{V}\,e^{j\omega t}\right)$$
+
+The $e^{j\omega t}$ factor is frozen out because, in a circuit or filter driven at a single frequency $\omega$, every voltage and current shares the same $e^{j\omega t}$. It appears on both sides of every equation and cancels. What remains is a system of complex algebraic equations — no differential equations, no trigonometric identities.
+
+This is the step that converts a circuit's integro-differential equations into Ohm's law applied to complex numbers.
+
+### Impedance
+
+Impedance $Z$ is the phasor-domain generalization of resistance. It is defined by $\tilde{V} = Z\tilde{I}$, exactly Ohm's law, where both $\tilde{V}$ and $\tilde{I}$ are phasors.
+
+| Component | Impedance | Physical meaning |
+|-----------|-----------|-----------------|
+| Resistor $R$ | $Z = R$ | Dissipates energy; no phase shift |
+| Inductor $L$ | $Z = j\omega L$ | Voltage leads current by $90°$; stores magnetic energy |
+| Capacitor $C$ | $Z = \dfrac{1}{j\omega C}$ | Current leads voltage by $90°$; stores electric energy |
+
+The imaginary part of $Z$ is called **reactance**. Pure reactance stores and returns energy each cycle rather than dissipating it — this is why inductors and capacitors act as frequency-selective elements. A purely real $Z$ would mean a purely resistive network: flat frequency response, no filtering.
+
+---
+
+## How It Works
+
+### Euler's Formula from the Taylor Series
+
+The Taylor series for $e^x$, $\cos x$, and $\sin x$ all converge absolutely for every complex $x$, so substitution is valid:
+
+$$e^{j\theta} = \sum_{n=0}^{\infty}\frac{(j\theta)^n}{n!} = 1 + j\theta + \frac{(j\theta)^2}{2!} + \frac{(j\theta)^3}{3!} + \frac{(j\theta)^4}{4!} + \cdots$$
+
+Apply the cycle $j^2=-1,\; j^3=-j,\; j^4=1$:
+
+$$e^{j\theta} = 1 + j\theta - \frac{\theta^2}{2!} - j\frac{\theta^3}{3!} + \frac{\theta^4}{4!} + j\frac{\theta^5}{5!} - \cdots$$
+
+Collect real and imaginary parts:
+
+$$e^{j\theta} = \underbrace{\left(1 - \frac{\theta^2}{2!} + \frac{\theta^4}{4!} - \cdots\right)}_{\cos\theta} \;+\; j\underbrace{\left(\theta - \frac{\theta^3}{3!} + \frac{\theta^5}{5!} - \cdots\right)}_{\sin\theta}$$
+
+The derivation requires no geometric intuition — it is pure algebraic manipulation of convergent series.
+
+### Complex Arithmetic in Python
+
+Python's `cmath` module operates on complex numbers natively. `1j` is Python's literal for $j$.
 
 ```python
-# Dimensional analysis example
-bandwidth_gbps = 10          # 10 Gbit/s link
-packet_size_bytes = 1500     # standard MTU
-bits_per_packet = packet_size_bytes * 8
-packets_per_sec = (bandwidth_gbps * 1e9) / bits_per_packet
-print(f"{packets_per_sec:,.0f} packets/sec at line rate")
+import cmath
+import math
+
+# Two phasors: V = 10∠30°, I = 2∠−45°
+V = 10 * cmath.exp(1j * math.radians(30))
+I =  2 * cmath.exp(1j * math.radians(-45))
+
+Z = V / I   # Impedance: Z = V/I
+
+print(f"V      = {V:.4f}")                              # (8.6603+5.0000j)
+print(f"I      = {I:.4f}")                              # (1.4142-1.4142j)
+print(f"Z      = {Z:.4f}")                              # complex impedance
+print(f"|Z|    = {abs(Z):.4f}")                         # magnitude = |V|/|I| = 5.0
+print(f"∠Z     = {math.degrees(cmath.phase(Z)):.2f}°") # phase = 30−(−45) = 75°
 ```
 
-## Key Insights
+```python
+# Verify Euler's formula numerically
+theta = math.pi / 3   # 60°
+lhs = cmath.exp(1j * theta)
+rhs = complex(math.cos(theta), math.sin(theta))
+print(f"e^(jπ/3)  = {lhs:.10f}")
+print(f"cos+j·sin = {rhs:.10f}")
+print(f"Residual  = {abs(lhs - rhs):.2e}")   # should be ~0 (floating-point noise only)
+```
 
-- **Real/imaginary parts** — understand this deeply and the rest of complex numbers follows naturally.
-- **Euler’s formula** — understand this deeply and the rest of complex numbers follows naturally.
-- **Phasors** — understand this deeply and the rest of complex numbers follows naturally.
-- **Impedance intuition** — understand this deeply and the rest of complex numbers follows naturally.
-- Think in terms of trade-offs: every design choice in mathematics sacrifices something to gain something else.
-- Build mental models, not memorized facts. The goal is to predict behavior from first principles.
+```python
+# Series RC transfer function H(jω) = 1 / (1 + jωRC)
+# As ω increases, |H| drops and phase shifts negative — this is a low-pass filter.
+R = 1e3        # 1 kΩ
+C = 1e-6       # 1 µF
+# Corner frequency: ω₀ = 1/RC
+omega_0 = 1 / (R * C)   # 1000 rad/s ≈ 159 Hz
 
-## What Comes Next
-
-The next module, **Calculus**, builds directly on these ideas. Limits and Derivatives extend what you've learned here into calculus.
+for omega in [omega_0 / 10, omega_0, omega_0 * 10]:
+    H = 1 / (1 + 1j * omega * R * C)
+    print(f"ω={omega:8.1f} rad/s | |H|={abs(H):.4f} | ∠H={math.degrees(cmath.phase(H)):7.2f}°")

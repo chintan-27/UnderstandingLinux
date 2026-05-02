@@ -1,0 +1,41 @@
+You are writing a lesson for a personal Linux learning platform. The student is building understanding from first principles — math through kernel internals.
+
+Module: {module_id}. {module_title}
+Topics: {topics}
+Primary source: {primary_book}
+
+SOURCE EXCERPTS:
+---
+{chunks}
+---
+
+Write a draft lesson in markdown. Use this structure exactly:
+
+## Why This Matters
+One paragraph. Explain why this topic exists and what breaks without it. Be concrete.
+
+## Core Concepts
+For each major topic: a short heading and a clear explanation. No padding. Explain causally — why does this work this way, not just what it is.
+
+## How It Works
+Go deeper on the mechanism. Use examples. Include code blocks and math equations where they genuinely clarify the concept.
+
+## Linux Connection
+How does this appear in Linux specifically? System calls, kernel subsystems, /proc entries, tools, source files. Be specific. Include real commands and code snippets the student can run.
+
+## Key Takeaways
+3–5 bullet points. The things that must stick.
+
+Formatting rules:
+- Use fenced code blocks with the correct language tag: ```c, ```bash, ```python, ```asm, etc.
+- Use LaTeX for any math: inline with $...$ and display equations with $$...$$
+  Examples: $O(n \log n)$, $V = IR$, $$E = \frac{1}{2}mv^2$$, $$\sum_{i=0}^{n} 2^i = 2^{n+1} - 1$$
+- Use math for: complexity analysis, formulas, signal equations, memory calculations, anything with Greek letters or subscripts
+- Use code for: system calls, shell commands, C structs, kernel source references, anything the student would type
+
+Content rules:
+- No fluff, no filler, no "in this lesson we will learn"
+- Every sentence must earn its place
+- Prefer concrete examples over abstract descriptions
+- If you are uncertain about a detail, omit it rather than guess
+- Write for someone who is intelligent but new to this topic

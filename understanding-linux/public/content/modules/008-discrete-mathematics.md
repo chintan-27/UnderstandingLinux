@@ -1,95 +1,130 @@
 ---
 id: 8
 title: "Discrete mathematics"
-part: "I"
 supermoduleId: 1
-estimatedMinutes: 60
+estimatedMinutes: 45
 resources:
   - type: book
-    title: "Art of Problem Solving"
-    url: "https://artofproblemsolving.com/"
-  - type: article
-    title: "Khan Academy"
-    url: "https://www.khanacademy.org/math"
-  - type: article
-    title: "Better Explained"
-    url: "https://betterexplained.com/"
+    title: "Concrete Mathematics (Knuth)"
+  - type: book
+    title: "Introduction to Linear Algebra (Strang)"
 ---
-# Discrete mathematics
 
 ## Why This Matters
 
-Every equation describing hardware — clock rates, memory bandwidth, power dissipation — is math. You need fluency with these tools before touching circuits.
+When you write a sorting algorithm or design a kernel data structure, the question is never "does this work?" but "does this scale?" A hash table lookup that takes $O(1)$ time handles ten million entries as easily as ten. A naive search taking $O(n^2)$ time grinds to a halt. Without a precise vocabulary for comparing growth rates, you cannot reason about whether your red-black tree insertion, your page fault handler, or your network packet classifier will hold up under load — you can only guess. Asymptotic notation gives that vocabulary mathematical teeth: it lets you *prove* that one approach dominates another, independent of hardware, constants, or compiler flags.
 
-**Discrete mathematics** sits within Math for Physical Computing (Supermodule 1). This module covers 10 interconnected topics: logic, proof, induction, sets, relations, functions, combinatorics, graphs, trees, recurrences. Each builds on the previous, forming a coherent picture of how mathematics works at this level.
+---
 
 ## Core Concepts
 
-### Logic
+### The ≺ Relation (Grows Slower Than)
 
-**Logic** is a foundational concept within discrete mathematics. This concept appears throughout mathematics and provides the quantitative foundation for reasoning about hardware and software systems. The key is building intuition for orders of magnitude and the relationships between quantities. In practice, understanding logic allows you to reason about system behavior rather than treating it as a black box.
+We write $f(n) \prec g(n)$ to mean $f$ grows strictly slower than $g$:
 
-### Proof
+$$f(n) \prec g(n) \iff \lim_{n \to \infty} \frac{f(n)}{g(n)} = 0$$
 
-**Proof** is a foundational concept within discrete mathematics. This concept appears throughout mathematics and provides the quantitative foundation for reasoning about hardware and software systems. The key is building intuition for orders of magnitude and the relationships between quantities. In practice, understanding proof allows you to reason about system behavior rather than treating it as a black box.
+This is an ordering on *function growth rates*, not on values at any particular $n$. It satisfies transitivity: if $f \prec g$ and $g \prec h$, then $f \prec h$. It is not symmetric — that asymmetry is the whole point.
 
-### Induction
+### The Growth Hierarchy
 
-**Induction** is a foundational concept within discrete mathematics. This concept appears throughout mathematics and provides the quantitative foundation for reasoning about hardware and software systems. The key is building intuition for orders of magnitude and the relationships between quantities. In practice, understanding induction allows you to reason about system behavior rather than treating it as a black box.
+From *Concrete Mathematics*, with $0 < \epsilon < 1 < c$:
 
-### Sets
+$$1 \prec \log \log n \prec \log n \prec n^\epsilon \prec n^c \prec n^{\log n} \prec c^n \prec n^n \prec c^{c^n}$$
 
-**Sets** is a foundational concept within discrete mathematics. This concept appears throughout mathematics and provides the quantitative foundation for reasoning about hardware and software systems. The key is building intuition for orders of magnitude and the relationships between quantities. In practice, understanding sets allows you to reason about system behavior rather than treating it as a black box.
+Each entry eventually dominates everything to its left. "Eventually" does real work in that sentence: for power functions,
 
-### Relations
+$$n^\alpha \prec n^\beta \iff \alpha < \beta$$
 
-**Relations** is a foundational concept within discrete mathematics. This concept appears throughout mathematics and provides the quantitative foundation for reasoning about hardware and software systems. The key is building intuition for orders of magnitude and the relationships between quantities. In practice, understanding relations allows you to reason about system behavior rather than treating it as a black box.
+so $n^{0.001} \prec n^{0.002}$, even though for any $n$ you can name this century, $n^{0.001}$ is barely distinguishable from 1. The hierarchy describes behavior as $n \to \infty$, and infinity is not a large integer — it is a different regime entirely. This is why you cannot settle hierarchy questions by benchmarking.
 
-### Functions
+### Big-O, Big-Θ, and Big-Ω
 
-**Functions** is a foundational concept within discrete mathematics. This concept appears throughout mathematics and provides the quantitative foundation for reasoning about hardware and software systems. The key is building intuition for orders of magnitude and the relationships between quantities. In practice, understanding functions allows you to reason about system behavior rather than treating it as a black box.
+The $\prec$ relation is the strict form. The full family:
 
-### Combinatorics
+| Notation | Formal definition | Corresponds to |
+|---|---|---|
+| $f = O(g)$ | $\exists\, c, n_0 : f(n) \leq c\, g(n)\ \forall n > n_0$ | $f \preceq g$ |
+| $f = \Omega(g)$ | $\exists\, c, n_0 : f(n) \geq c\, g(n)\ \forall n > n_0$ | $f \succeq g$ |
+| $f = \Theta(g)$ | $f = O(g)$ and $f = \Omega(g)$ | $f \asymp g$ |
+| $f = o(g)$ | $\lim_{n\to\infty} f(n)/g(n) = 0$ | $f \prec g$ |
 
-**Combinatorics** is a foundational concept within discrete mathematics. This concept appears throughout mathematics and provides the quantitative foundation for reasoning about hardware and software systems. The key is building intuition for orders of magnitude and the relationships between quantities. In practice, understanding combinatorics allows you to reason about system behavior rather than treating it as a black box.
+These are *set* memberships, not equations. Writing $f = O(g)$ is conventional shorthand for "$f$ belongs to the class of functions eventually bounded above by a constant multiple of $g$." The notation abuses the equals sign; you can write $n = O(n^2)$ and $2n = O(n^2)$ but you cannot conclude $n = 2n$.
 
-### Graphs
+### Why Logarithm Beats Any Fractional Power — But Nothing Beats Exponential
 
-**Graphs** is a foundational concept within discrete mathematics. This concept appears throughout mathematics and provides the quantitative foundation for reasoning about hardware and software systems. The key is building intuition for orders of magnitude and the relationships between quantities. In practice, understanding graphs allows you to reason about system behavior rather than treating it as a black box.
+$\log n \prec n^\epsilon$ for any $\epsilon > 0$, however small. This follows from L'Hôpital's rule:
 
-### Trees
+$$\lim_{n \to \infty} \frac{\log n}{n^\epsilon} = \lim_{n \to \infty} \frac{1/n}{\epsilon\, n^{\epsilon - 1}} = \lim_{n \to \infty} \frac{1}{\epsilon\, n^\epsilon} = 0$$
 
-**Trees** is a foundational concept within discrete mathematics. This concept appears throughout mathematics and provides the quantitative foundation for reasoning about hardware and software systems. The key is building intuition for orders of magnitude and the relationships between quantities. In practice, understanding trees allows you to reason about system behavior rather than treating it as a black box.
+The *reason* is that differentiation reduces the exponent of $n^\epsilon$ by 1 but kills $\log n$ outright — the polynomial always has "more room to grow." Conversely, $c^n \succ n^k$ for all fixed $k$ because exponentials compound multiplicatively at every step while polynomials add only a power.
 
-### Recurrences
+---
 
-**Recurrences** is a foundational concept within discrete mathematics. This concept appears throughout mathematics and provides the quantitative foundation for reasoning about hardware and software systems. The key is building intuition for orders of magnitude and the relationships between quantities. In practice, understanding recurrences allows you to reason about system behavior rather than treating it as a black box.
+## How It Works
 
-## Practical Example
+### Ranking by Taking Limits
+
+To compare $f$ and $g$, compute $\lim_{n\to\infty} f(n)/g(n)$:
+
+- Limit is $0$: $f \prec g$
+- Limit is $\infty$: $f \succ g$
+- Limit is a positive constant: $f \asymp g$
+
+**Example — $n \log n$ vs. $n^{1.5}$:**
+
+$$\lim_{n \to \infty} \frac{n \log n}{n^{1.5}} = \lim_{n \to \infty} \frac{\log n}{n^{0.5}} = 0$$
+
+So $n \log n \prec n^{1.5}$. The reason is that $\log n \prec n^{0.5}$ by the result above (set $\epsilon = 0.5$). This is why merge sort ($\Theta(n \log n)$) and an $O(n^{1.5})$ algorithm are not interchangeable at scale.
+
+**Example — locating $n^{\log n}$ in the hierarchy:**
+
+Rewrite using the identity $n = e^{\ln n}$:
+
+$$n^{\log n} = e^{(\ln n)^2}$$
+
+Compare against $c^n = e^{n \ln c}$:
+
+$$\lim_{n \to \infty} \frac{e^{(\ln n)^2}}{e^{n \ln c}} = \lim_{n \to \infty} e^{(\ln n)^2 - n \ln c} = 0$$
+
+because $(\ln n)^2 - n \ln c \to -\infty$. So $n^{\log n}$ is superpolynomial but subexponential — it sits between the polynomial regime and the true exponential regime, which is why it appears in the hierarchy between $n^c$ and $c^n$.
+
+### Recurrences and the Master Theorem
+
+Many recursive algorithms satisfy the recurrence
+
+$$T(n) = a \cdot T\!\left(\frac{n}{b}\right) + f(n)$$
+
+where $a \geq 1$ is the number of recursive calls, $b > 1$ is the factor by which the input shrinks, and $f(n)$ is the cost of the work done outside the recursive calls. The critical exponent is $\log_b a$ — the rate at which the number of subproblems grows relative to the shrinkage per level. Compare $f(n)$ against $n^{\log_b a}$:
+
+| Case | Condition | Result | Dominant factor |
+|---|---|---|---|
+| 1 | $f(n) \prec n^{\log_b a}$ | $T(n) = \Theta(n^{\log_b a})$ | Leaf count |
+| 2 | $f(n) \asymp n^{\log_b a}$ | $T(n) = \Theta(n^{\log_b a} \log n)$ | All levels equal |
+| 3 | $f(n) \succ n^{\log_b a}$ | $T(n) = \Theta(f(n))$ | Root work |
+
+The intuition: at each level of recursion, you have $a^k$ subproblems of size $n/b^k$. The total work at level $k$ is $a^k \cdot f(n/b^k)$. If this grows with depth (case 1), the leaves dominate; if it shrinks (case 3), the root dominates; if it stays constant (case 2), all $\log_b n$ levels contribute equally, producing the extra $\log n$ factor.
+
+**Merge sort:** $T(n) = 2T(n/2) + n$, so $a = 2$, $b = 2$, $n^{\log_2 2} = n$, $f(n) = n$. Case 2 applies:
+
+$$T(n) = \Theta(n \log n)$$
+
+**Binary search:** $T(n) = T(n/2) + 1$, so $a = 1$, $b = 2$, $n^{\log_2 1} = n^0 = 1$, $f(n) = 1$. Case 2 again:
+
+$$T(n) = \Theta(\log n)$$
+
+**Strassen matrix multiplication:** $T(n) = 7T(n/2) + n^2$. Here $n^{\log_2 7} \approx n^{2.807}$ and $f(n) = n^2 \prec n^{2.807}$, so case 1:
+
+$$T(n) = \Theta(n^{\log_2 7}) \approx \Theta(n^{2.807})$$
+
+This is why Strassen beats the naive $\Theta(n^3)$: reducing the number of recursive multiplications from 8 to 7 changes $\log_b a$ from 3 to $\approx 2.807$, and that difference in the exponent compounds over $\log n$ levels.
+
+### Empirical Verification
+
+Big-O discards constants, but the *ratio* $T(n) / g(n)$ converges to a constant when $T(n) = \Theta(g(n))$. You can check this directly:
 
 ```python
 import math
 
-# How many bits to represent N values?
-N = 1_000_000
-bits_needed = math.ceil(math.log2(N))  # 20 bits
-print(f"{N} values need {bits_needed} bits")
-
-# Powers of 2 vs powers of 10
-for k in [10, 20, 30, 40]:
-    print(f"2^{k} = {2**k:>15,}  ≈ 10^{k*0.301:.0f}")
-```
-
-## Key Insights
-
-- **Logic** — understand this deeply and the rest of discrete mathematics follows naturally.
-- **Proof** — understand this deeply and the rest of discrete mathematics follows naturally.
-- **Induction** — understand this deeply and the rest of discrete mathematics follows naturally.
-- **Sets** — understand this deeply and the rest of discrete mathematics follows naturally.
-- **Relations** — understand this deeply and the rest of discrete mathematics follows naturally.
-- Think in terms of trade-offs: every design choice in mathematics sacrifices something to gain something else.
-- Build mental models, not memorized facts. The goal is to predict behavior from first principles.
-
-## What Comes Next
-
-The next module, **Information theory**, builds directly on these ideas. Entropy and Coding extend what you've learned here into information theory.
+def count_steps(n):
+    """Simulate O(n log n) work: outer loop runs ceil(log2(n

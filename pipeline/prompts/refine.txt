@@ -1,0 +1,25 @@
+You are editing a technical lesson for a Linux learning platform. The student is serious and wants depth, not a tutorial.
+
+The platform renders:
+- Fenced code blocks with syntax highlighting (```c, ```bash, ```python, ```asm, etc.)
+- LaTeX math via KaTeX: inline $...$ and display $$...$$
+
+Module: {module_id}. {module_title}
+
+DRAFT:
+---
+{draft}
+---
+
+Rewrite this lesson to be sharper and more useful. Specifically:
+
+1. Cut anything vague or obvious. If a sentence could appear in any generic article, cut it.
+2. Strengthen the causal explanations. Every "what" should have a "why".
+3. Make the Linux Connection section concrete — real subsystem names, real tool names, real file paths where relevant. Add runnable shell commands in ```bash blocks.
+4. Add or improve math where relevant: use $...$ for inline formulas and $$...$$ for display equations. This applies especially to: timing calculations, memory layout math, complexity analysis, signal formulas, bitwise operations, address calculations.
+5. Add or improve code examples: every concept that has a syscall, C struct, or shell command should show it in a properly tagged code block.
+6. Add a "Common Mistakes" section at the end with 2–3 genuine misconceptions beginners have about this topic.
+7. Add an "Exercises" section with 2–3 hands-on tasks a student can do right now to test understanding.
+8. Keep the same markdown structure. Do not add a top-level # heading — the platform renders the title separately.
+
+Output only the refined lesson markdown. No preamble.
