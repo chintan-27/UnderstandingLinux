@@ -1,5 +1,0 @@
-Warning: chunks.db not found. Run ingest.py first for source-grounded output.
-Generating 215 modules (draft_only=False, refine_only=False)
-Draft model: claude-sonnet-4.6  |  Refine model: claude-opus-4.6
-
-modules:   0%|          | 0/215 [00:00<?, ?it/s]

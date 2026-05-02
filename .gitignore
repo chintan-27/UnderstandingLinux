@@ -2,5 +2,8 @@ CLAUDE.md
 .claude/
 pipeline/.env
 pipeline/books/
-pipeline/data/chunks.db
+pipeline/data/
+pipeline/__pycache__/
 .venv
+.DS_Store
+**/.DS_Store
