@@ -12,9 +12,7 @@ resources:
 
 ## Why This Matters
 
-Every process believes it owns the entire virtual address space. Your shell thinks `0x7fff...` is its stack; so does every other process running simultaneously. This works because the CPU never puts a virtual address on the memory bus — the MMU intercepts every load and store and rewrites the address before DRAM sees it. Without this hardware translation, process isolation is structurally impossible: there is no software trick that prevents one process from overwriting another's memory if they share a flat physical address space.
-
-Two other consequences follow directly. First, a process can reference addresses that have no physical backing yet — the OS allocates frames lazily, on first access, which is why `malloc(1GB)` returns instantly even on a machine with 512 MB free. Second, the kernel can revoke access to a page by clearing one bit in a PTE; the hardware enforces this on every subsequent access with no cooperation from userspace.
+Every process believes it owns a contiguous private address space — but this illusion is maintained by hardware on every single memory instruction. The MMU translates virtual to physical addresses in hardware; without it, processes would need link-time knowledge of their physical load address, one buggy pointer dereference could corrupt another process's heap, and swapping would require copying entire address spaces rather than individual pages. The page table plus TLB design makes translation cheap enough that the overhead is unmeasurable on most workloads — but understanding the mechanism explains why `mmap`, `fork`, context switches, and swap all behave the way they do.
 
 ---
 
@@ -22,116 +20,116 @@ Two other consequences follow directly. First, a process can reference addresses
 
 ### Virtual vs. Physical Addresses
 
-A **virtual address** is what the CPU's instruction stream produces. A **physical address** is what the memory controller consumes. The MMU sits between the two and performs the translation on every memory reference — instruction fetches included. Programs are compiled against virtual addresses; the OS decides where things land in physical memory at runtime, independently per process.
+A **virtual address** is the address encoded in a pointer or instruction operand. A **physical address** is what appears on the memory bus and selects a row in a DRAM chip. The MMU, sitting between the CPU pipeline and the L1 cache, translates one to the other on every load and store. The two numbering spaces are completely independent: virtual address `0x400000` in process A maps to a different physical frame than `0x400000` in process B, which is precisely what gives each process private memory.
+
+The kernel itself also uses virtual addresses — it runs with its own page table mappings, occupying the upper portion of every process's virtual address space (above `0xffff800000000000` on x86-64). This is why kernel code can access user memory only through explicit routines like `copy_from_user()`, not by dereferencing a raw user pointer: the user pointer is valid only in the user's address space context.
 
 ### Pages and Frames
 
-Virtual address space is divided into **pages**; physical RAM is divided into **frames**. They are always the same size. On x86-64 the default is 4 KB ($2^{12}$ bytes); 2 MB and 1 GB "huge pages" are also supported via the same PTE mechanism with a flag bit.
+Virtual and physical memory are divided into fixed-size chunks called **pages** (virtual) and **frames** (physical). The sizes match — always a power of two — so the low-order bits of an address are the **page offset** and pass through translation unchanged. Only the high-order **virtual page number** (VPN) needs translation to a **physical page number** (PPN).
 
-The fixed granularity serves two purposes. First, it bounds the mapping structure: tracking individual bytes in a 64-bit address space ($2^{64}$ bytes) is not feasible, but tracking 4 KB pages ($2^{52}$ entries maximum) is at least finite — and multi-level trees make it practical. Second, 4 KB matches the granularity of disk I/O well enough that a page fault (fetching a missing page from swap) reads exactly one unit of work.
+For the default 4 KB page size:
+
+$$\text{offset bits} = \log_2(4096) = 12$$
+
+A 64-bit virtual address is therefore split:
+
+$$\underbrace{[63 \;\ldots\; 12]}_{\text{VPN}} \quad \underbrace{[11 \;\ldots\; 0]}_{\text{offset (12 bits)}}$$
+
+And the physical address is assembled as:
+
+$$\text{PA} = (\text{PPN} \ll 12) \;\big|\; \text{offset}$$
+
+The offset-passthrough property is not an accident: it means the hardware only needs to translate one number (VPN → PPN), not recompute the entire address. It also means that a misaligned access that crosses a page boundary requires *two* translations — a genuine performance cliff that compilers try to avoid.
 
 ### Page Table Entries
 
-A **page table entry (PTE)** encodes one VPN→PFN mapping plus hardware-enforced metadata. On x86-64 each PTE is 8 bytes:
+A **page table** is an array in memory indexed by VPN. Each **page table entry** (PTE) stores the PPN for that virtual page plus status bits that the hardware reads and writes automatically:
 
-```
- 63      52 51       12 11  9  8  7  6  5  4  3  2  1  0
-┌──────────┬───────────┬────┬──┬──┬──┬──┬──┬──┬──┬──┬──┐
-│ ignored  │    PFN    │ ign│ G│ PS│ D│ A│PCD│PWT│U│ W│ P│
-└──────────┴───────────┴────┴──┴──┴──┴──┴──┴──┴──┴──┴──┘
-P   = Present (valid bit)
-W   = Writable
-U   = User-accessible (cleared = kernel only)
-A   = Accessed (set by hardware on any read)
-D   = Dirty (set by hardware on any write)
-PS  = Page size (set in PMD/PUD to map a 2 MB or 1 GB huge page)
-G   = Global (don't flush this TLB entry on CR3 reload)
-```
+| Bit | Hardware behavior |
+|-----|-------------------|
+| Present (P) | If 0, any access raises a page fault — the PPN field is meaningless |
+| Dirty (D) | Set by hardware on any write; cleared by the kernel after writeback |
+| Accessed (A) | Set by hardware on any access; used by the kernel's page reclaim (LRU) |
+| R/W | If 0, writes raise a protection fault — used to implement copy-on-write |
+| U/S | If 0, userspace access raises a fault — protects all kernel mappings |
+| NX | If set, instruction fetch raises a fault — enforces W^X |
 
-The kernel reads the Dirty and Accessed bits to implement page replacement and `msync()`. It clears them periodically; the hardware sets them again on access, allowing the kernel to detect which pages are actively used.
+The kernel does not set the Dirty or Accessed bits; the hardware sets them silently as part of the page table walk. The kernel only reads and clears them. This is how `kswapd` knows which pages are cold without intercepting every memory access.
 
-In the Linux kernel source, the C type for a PTE on x86-64 is:
+Each process has its own page table tree. The kernel stores the physical address of the top-level table in `CR3` on x86-64. Switching `CR3` is literally what a context switch means from the MMU's perspective.
 
-```c
-typedef struct { pteval_t pte; } pte_t;   // arch/x86/include/asm/pgtable_types.h
-typedef u64 pteval_t;
-```
+### The TLB: Why It Exists and What It Costs
 
-Helpers like `pte_present()`, `pte_dirty()`, and `pte_wrprotect()` manipulate specific bits without exposing the raw bit positions to architecture-independent code.
+A page table walk requires multiple memory reads (one per level). If every load/store instruction triggered a walk, each instruction would require 4–5 memory accesses. The **translation-lookaside buffer (TLB)** is a small fully-associative cache inside the MMU that stores recently used VPN→PPN translations.
 
-### The TLB
+The TLB works because of spatial and temporal locality: if a program accesses byte `0x401234`, the same 4 KB page will almost certainly be accessed again shortly. A typical L1 TLB has 64 entries for data and 64 for instructions; a unified L2 TLB has 1024–2048 entries. Hit rate for most workloads exceeds 99%, meaning the amortized translation cost per access approaches zero.
 
-A page table lookup requires a memory read before the data access itself. Without caching, every load or store would cost at minimum two memory accesses. The **TLB** (Translation-Lookaside Buffer) is a small, fully-associative on-chip cache of recent VPN→PFN translations. A hit costs roughly 1 clock cycle; a miss triggers a page table walk costing 4 memory reads on x86-64 (one per level).
+The critical asymmetry: a TLB **hit** costs ~1 cycle and is fully pipelined. A TLB **miss** on x86-64 triggers a hardware page table walk (the CPU microcode does it, no kernel involvement) costing ~10–30 cycles. A **page fault** (valid bit clear) traps to the kernel costing thousands of cycles before the handler even begins.
 
-The TLB works because programs exhibit spatial and temporal locality: a tight loop touches the same handful of pages repeatedly. TLB hit rates routinely exceed 99%. If a program's working set spans more pages than the TLB can hold simultaneously (typically 1,000–4,000 entries for L1 dTLB + L2 TLB on modern Intel), performance degrades sharply — this is **TLB thrashing**, and it shows up in `perf stat` as high `dTLB-load-misses`.
+On MIPS and RISC-V (without the Sv39/Sv48 hardware walker), a TLB miss traps to the kernel, which walks the page table in software. This makes TLB miss cost explicitly visible and forces kernel developers to keep TLB miss handlers brutally short.
 
 ---
 
 ## How It Works
 
-### Address Decomposition
+### Address Translation Step by Step
 
-With 4 KB pages the page offset is $\log_2(4096) = 12$ bits. On a 32-bit system:
+On x86-64 with 4-level paging and 4 KB pages, a 48-bit virtual address (bits 63–48 are sign-extended, not translated) is split into five fields:
 
-$$\underbrace{b_{31} \ldots b_{12}}_{\text{VPN (20 bits)}} \;\Big|\; \underbrace{b_{11} \ldots b_0}_{\text{offset (12 bits)}}$$
+$$\underbrace{[47..39]}_{\text{PGD index}\ 9\text{b}} \quad \underbrace{[38..30]}_{\text{PUD index}\ 9\text{b}} \quad \underbrace{[29..21]}_{\text{PMD index}\ 9\text{b}} \quad \underbrace{[20..12]}_{\text{PTE index}\ 9\text{b}} \quad \underbrace{[11..0]}_{\text{offset}\ 12\text{b}}$$
 
-The physical address concatenates the looked-up PFN with the original offset (unchanged because page and frame are the same size):
-
-$$\text{PA} = (\text{PFN} \ll 12) \;\Big|\; (\text{VA} \;\&\; \texttt{0xFFF})$$
-
-On x86-64 with a 48-bit virtual address space (bits 63:48 must be sign-extended copies of bit 47), a four-level walk uses:
-
-$$\underbrace{b_{47:39}}_{\text{PGD index (9 bits)}} \underbrace{b_{38:30}}_{\text{PUD index (9 bits)}} \underbrace{b_{29:21}}_{\text{PMD index (9 bits)}} \underbrace{b_{20:12}}_{\text{PTE index (9 bits)}} \underbrace{b_{11:0}}_{\text{offset (12 bits)}}$$
-
-Each 9-bit index selects one of $2^9 = 512$ entries in a 4 KB table (512 × 8 bytes = 4096 bytes exactly — one table fits in one frame). This is not a coincidence; it is why the four-level design was chosen.
-
-### Multi-Level Page Tables
-
-A flat page table for a 32-bit address space requires $2^{20}$ entries at 4 bytes each = **4 MB per process**. For a 64-bit space with 48-bit addressing and 4 KB pages, that would be $2^{36}$ entries — 512 GB of page table per process, which is obviously untenable.
-
-A four-level tree allocates only the nodes that correspond to mapped regions. A process that maps only its code, heap, and stack touches perhaps a few hundred PTEs total. The rest of the tree simply does not exist. Memory cost scales with mapped footprint, not with address space size.
-
-The hardware walks the tree autonomously on a TLB miss (x86-64's **hardware page table walker**). Each step reads a table entry that gives the physical base address of the next level's table, then adds the appropriate index:
+For a concrete address:
 
 ```
-PA_pgd  = CR3 & ~0xFFF                    # CR3 holds PGD physical base
-PA_pud  = (pgd_entry & ~0xFFF) + PUD_idx * 8
-PA_pmd  = (pud_entry & ~0xFFF) + PMD_idx * 8
-PA_pte  = (pmd_entry & ~0xFFF) + PTE_idx * 8
-PA_data = (pte_entry & ~0xFFF) + offset
+Virtual address: 0x00007fff_ab123456
+
+Bits [47..39] = 0x0ff  → PGD index 255
+Bits [38..30] = 0x1ea  → PUD index 490  (7fff >> 21 & 0x1ff, roughly)
+Bits [29..21] = 0x158  → PMD index 344
+Bits [20..12] = 0x123  → PTE index 291
+Bits [11..0]  = 0x456  → offset 1110
 ```
 
-All five of those values are physical addresses — the walker bypasses the TLB and reads from physical memory directly.
+Translation proceeds:
 
-### TLB Operation
+1. **TLB lookup**: MMU hashes the VPN. Hit → PPN extracted, physical address formed in ~1 cycle. Miss → hardware walker activates.
 
-```
-CPU issues virtual address VA
-    │
-    ▼
-TLB lookup (tag = ASID:VPN)
-    ├── HIT  → extract PFN, form PA, proceed (~1 cycle)
-    └── MISS
-          │
-          ▼
-        Hardware page table walk (x86) / software trap (MIPS)
-          │
-          ├── PTE.P = 1 → load PTE into TLB, retry original access
-          └── PTE.P = 0 → #PF exception → OS page fault handler
-                              ├── VA not in any VMA → SIGSEGV
-                              └── VA valid → allocate frame, fill page,
-                                            set PTE.P=1, iret, retry
-```
+2. **Page table walk**: Starting from `CR3` (physical address of PGD):
+   - Read `PGD[255]` → physical address of PUD
+   - Read `PUD[490]` → physical address of PMD
+   - Read `PMD[344]` → physical address of PTE page
+   - Read `PTE[291]` → PPN + status bits
 
-On MIPS, TLB misses trap to a kernel handler that reads the page table in software and writes the TLB entry with `tlbwr`. This gives the OS complete control over the TLB format at the cost of trap overhead on every miss. x86 avoids the trap but requires the hardware walker to understand the exact PTE format — which is why x86 PTEs have a fixed structure while MIPS PTEs can be whatever the kernel wants.
+   Each of these reads goes through the L1/L2 data cache, so in practice a full walk on a warm cache costs ~20–40 cycles, not 4× DRAM latency.
 
-### Page Fault Handling in the Linux Kernel
+3. **PTE check**: If Present=1, PPN is loaded into TLB and translation completes. If Present=0, the CPU raises exception vector 14 (page fault).
 
-The x86-64 page fault handler entry point is `exc_page_fault()` in `arch/x86/mm/fault.c`. The faulting virtual address is in `CR2`; the error code indicates whether the fault was caused by a protection violation or a missing page.
+4. **Page fault dispatch**: The CPU pushes `RIP`, `RFLAGS`, `CS`, `SS`, `RSP` onto the kernel stack and jumps to the page fault handler. The faulting virtual address is in `CR2`. Linux's handler is `exc_page_fault()` → `do_page_fault()` → `handle_mm_fault()`, which walks the kernel's VMA tree to decide the response.
 
-The handler calls into `handle_mm_fault()` (architecture-independent, in `mm/memory.c`), which:
+### Why Multi-Level Tables Are Necessary
 
-1. Walks the process's VMA tree (`find_vma()`) to verify the address is legitimately mapped.
-2. Dispatches to `do_anonymous_page()`, `do_fault()` (file-backed), or `do_swap_page()` depending on the VMA type and PTE state.
-3. Calls `alloc_zeroed_user_highpage_movable()` or `swapin_readahead()` to obtain a frame.
-4. Updates the PTE with `
+A flat single-level page table for a 48-bit address space with 8-byte PTEs requires:
+
+$$2^{48-12} \times 8 = 2^{36} \times 8 = 512\ \text{GB per process}$$
+
+Unworkable. The multi-level tree solves this because **absent subtrees are not allocated**. A process using 2 MB of stack near `0x7fff...` and 4 MB of code near `0x400000` allocates:
+
+- 1 PGD (always present, 4 KB)
+- 2 PUDs (one per region)
+- 2 PMDs
+- A few PTE pages
+
+Total: tens of kilobytes, not 512 GB. The tree is sparse; only paths to actually mapped virtual pages exist. This is also why the kernel can cheaply check "is this address mapped?" — an absent entry at any level immediately answers no.
+
+The tradeoff is that a full walk now touches 4 cache lines (one per level) instead of one. Huge pages (2 MB or 1 GB) cut this by terminating the walk at PMD or PUD level, improving both TLB reach and walk depth — at the cost of internal fragmentation.
+
+### Copy-on-Write via the R/W Bit
+
+`fork()` does not copy the parent's physical memory. Instead, the kernel:
+
+1. Duplicates the parent's page table tree (cheap — just copying pointers)
+2. Marks every PTE in both parent and child as **read-only** (R/W=0), regardless of the original permissions
+3. Returns from `fork()`
+
+When either process writes to a page, the hardware raises a protection fault (Present=1 but R/W=0, so it's not a page fault — it's a protection fault, same exception vector, different error code). The kernel's fault handler sees the VMA is writable and the PTE is CoW-marked, allocates a new physical frame, copies the page content, updates the PTE with R/

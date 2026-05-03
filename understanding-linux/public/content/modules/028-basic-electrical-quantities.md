@@ -12,7 +12,7 @@ resources:
 
 ## Why This Matters
 
-Every piece of hardware your Linux kernel drives obeys electrical laws before it obeys software abstractions. When a kernel driver misconfigures a GPIO pin's current limit, the pin burns out — not because the driver had a logic bug, but because $P = I^2 R$ exceeded the silicon's thermal rating. When a power supply can't deliver enough current under load, the system crashes mid-boot with no error message because the CPU itself browses out before it can log anything. When you read `/sys/class/power_supply/BAT0/voltage_now`, that number is a physical potential difference in microvolts — not a status code, not an abstraction. Without a working model of charge, current, voltage, resistance, power, and energy, you cannot reason about hardware behavior. You can only cargo-cult configurations and hope.
+Every piece of hardware your Linux kernel talks to operates by controlling the flow of electrons through engineered paths. When your kernel writes to a memory-mapped register to reset a peripheral, it is changing a voltage. When a GPIO pin asserts high, current flows through whatever load is attached. When `cpufreq` drops a core's operating frequency, it is reducing the $P = CV^2f$ dynamic power dissipation of millions of switching transistors. Without a working model of charge, current, voltage, resistance, power, and energy, hardware datasheets are unreadable, signal integrity problems are invisible, and power management code is cargo-culted. These quantities are the physical substrate every abstraction in your stack ultimately rests on.
 
 ---
 
@@ -20,150 +20,125 @@ Every piece of hardware your Linux kernel drives obeys electrical laws before it
 
 ### Charge
 
-Charge is a fundamental property of matter. The electron carries charge $q_e = -1.602 \times 10^{-19}$ C. One coulomb is the charge of approximately $6.24 \times 10^{18}$ electrons. Charge is conserved absolutely — it cannot be created or destroyed, only moved. This conservation law is the physical foundation of Kirchhoff's current law: whatever current flows into a node must flow out, because charge cannot accumulate there.
+Electric charge $Q$ is a fundamental property of matter. The SI unit is the **coulomb** (C). One electron carries $q_e = -1.602 \times 10^{-19}$ C. Charge is conserved — the total charge in a closed system cannot change. This conservation law is the physical basis of Kirchhoff's Current Law: what flows into a node must flow out, because charge cannot accumulate there indefinitely.
 
 ### Current
 
-Current is the rate of charge flow past a point:
+Current $I$ is the rate at which charge passes a cross-section of a conductor:
 
 $$I = \frac{dQ}{dt}$$
 
-One ampere = one coulomb per second. Current flows because voltage imposes a force on charge carriers. The direction convention — the direction positive charges would move — was fixed before electrons were discovered, so conventional current flows opposite to electron motion. This matters when reading datasheets: "current into pin" means electrons flowing out.
+The unit is the **ampere** (A): one coulomb per second. By convention, current flows from higher to lower potential — the direction a *positive* charge would move — which is opposite to actual electron drift. This historical convention is universal in circuit diagrams and datasheets. When a datasheet specifies that a GPIO sink can handle 8 mA, it means 8 mA of conventional current flowing *into* the pin from an external source.
 
 ### Voltage
 
-Voltage is electric potential difference: the work required to move one coulomb of charge between two points:
+Voltage $V$ is the energy required to move one unit of charge between two points:
 
-$$V = \frac{W}{Q}$$
+$$V = \frac{dW}{dQ}$$
 
-where $W$ is energy in joules. Voltage is always a difference between two points — "5 V" is meaningless without a reference. Ground is defined as 0 V by convention; everything is measured relative to it. A GPIO pin driven high on a 3.3 V system is 3.3 V above ground, not 3.3 V in any absolute sense. This is why floating inputs are dangerous: with no reference path, the pin's voltage is undefined and the input reads noise.
+The unit is the **volt** (V): one joule per coulomb. Voltage is always a *difference* — there is no such thing as absolute voltage, only potential relative to a reference. When a datasheet specifies a 3.3 V I/O standard, it means 3.3 V above the circuit's ground node. "Ground" is not zero volts in any absolute sense; it is the agreed reference point for the circuit.
 
 ### Resistance
 
-Resistance opposes current flow. Ohm's Law:
+Resistance $R$ quantifies how strongly a material opposes current flow. For ohmic materials, voltage and current are proportional:
 
-$$V = IR$$
+$$V = IR \quad \text{(Ohm's Law)}$$
 
-One ohm: one volt produces one ampere. Resistance arises from charge carriers colliding with the material's atomic lattice — those collisions convert electrical energy into heat, which is why resistors get warm and why wires have resistance ratings. Ohm's Law holds for resistors within their ratings; diodes and transistors have nonlinear $V$–$I$ relationships and do not obey it generally.
+The unit is the **ohm** (Ω). Resistance is the mechanism by which electrical energy is converted to heat — not optionally, but as a direct consequence of charge carriers scattering off the atomic lattice. A short circuit is $R \to 0$; an open circuit is $R \to \infty$. Real PCB traces have resistance on the order of milliohms per centimeter; at high currents this drop becomes significant and causes both voltage errors and heat.
 
 ### Power
 
-Power is the rate of energy transfer:
+Power $P$ is the rate of energy transfer:
 
-$$P = IV$$
+$$P = \frac{dW}{dt} = IV$$
 
-Substituting $V = IR$ and $I = V/R$ gives two forms that are exact rewrites, not approximations:
+The unit is the **watt** (W). Substituting Ohm's Law gives two forms that are used constantly:
 
 $$P = I^2 R = \frac{V^2}{R}$$
 
-The unit is the watt (W). $P = I^2 R$ tells you what a resistor dissipates as heat. $P = IV$ tells you what a supply delivers or a load consumes. They are the same equation — choose the form that matches what you know.
+$P = I^2 R$ is the form to reach for when you know the current through a component (e.g., a sense resistor, a PCB trace, a connector pin). $P = V^2/R$ applies when you know the voltage across it (e.g., the supply rail drooping across a decoupling resistor).
 
 ### Energy
 
-Energy is power integrated over time:
+Energy $E$ is power integrated over time:
 
-$$E = \int_0^t P \, dt'$$
+$$E = \int_0^t P(\tau)\, d\tau = Pt \quad \text{(constant } P\text{)}$$
 
-For constant power, $E = Pt$. The SI unit is the joule (J). Battery capacity is quoted in watt-hours: $1 \, \text{Wh} = 3600 \, \text{J}$. Milliampere-hours (mAh) are also common but require a voltage to convert to energy:
-
-$$E \, [\text{Wh}] = \frac{C \, [\text{mAh}]}{1000} \times V \, [\text{V}]$$
-
-Without the voltage, mAh is a charge quantity, not an energy quantity — a 4000 mAh cell at 3.85 V holds more energy than a 4000 mAh cell at 3.2 V.
+The unit is the **joule** (J). Watt-hours (Wh) and kilowatt-hours (kWh) are the same unit scaled: $1\text{ Wh} = 3600\text{ J}$. A battery's capacity in milliamp-hours (mAh) requires a voltage to convert to energy: $E = V \cdot Q = V \cdot (I \cdot t)$, which is why a 3000 mAh cell at 3.7 V stores a different amount of energy than a 3000 mAh cell at 1.2 V.
 
 ---
 
 ## How It Works
 
-### Voltage Dividers
+### Ohm's Law Is a Linear Approximation
 
-Two resistors in series with a voltage applied across both produce an output proportional to the input:
+Ohm's Law holds for resistors within their rated operating range. It fails for diodes, transistors, and LEDs, which have exponential or threshold-governed $I$–$V$ relationships. It also fails for a resistor whose temperature changes significantly under load: a tungsten filament has roughly 10× higher resistance when incandescent than when cold. Before applying $V = IR$, verify the device is actually ohmic in the operating region.
+
+### Voltage Dividers and Loading Error
+
+Two resistors in series divide an input voltage:
 
 $$V_{out} = V_{in} \cdot \frac{R_2}{R_1 + R_2}$$
 
-Why: the same current flows through both resistors because there is only one path. That current is $I = V_{in} / (R_1 + R_2)$. The voltage across $R_2$ is $IR_2$, which gives the formula above. The output is always $\leq V_{in}$ — passive dividers cannot amplify. Voltage dividers appear in ADC resistor ladders, transistor bias networks, and the feedback networks that set CPU core voltage on a motherboard.
+This equation is exact only when zero current is drawn from $V_{out}$. Any load $R_L$ placed at $V_{out}$ appears in parallel with $R_2$, reducing the effective lower resistance:
 
-### Loading Effect
+$$R_{2,\text{eff}} = \frac{R_2 \cdot R_L}{R_2 + R_L}$$
 
-A voltage divider's Thévenin output resistance is $R_1 \| R_2$:
+A 10 kΩ–10 kΩ divider loaded by a 20 kΩ ADC input has $R_{2,\text{eff}} = 10k \| 20k = 6.67\text{ k}\Omega$, shifting $V_{out}$ from $0.5\, V_{in}$ to $0.4\, V_{in}$ — an 20% error from a "high-impedance" input. This is why high-impedance buffers precede ADC inputs in precision designs, and why oscilloscope probes use a 10 MΩ input impedance: the probe must not change the circuit it is measuring.
 
-$$R_{out} = \frac{R_1 R_2}{R_1 + R_2}$$
+### Power Dissipation Is Mandatory
 
-Connecting a load $R_L$ across the output forms a new divider with $R_1$, dropping the output voltage:
+A 100 Ω resistor carrying 100 mA dissipates:
 
-$$V_{out,loaded} = V_{in} \cdot \frac{R_2 \| R_L}{R_1 + R_2 \| R_L}$$
+$$P = I^2 R = (0.1\text{ A})^2 \times 100\text{ Ω} = 1\text{ W}$$
 
-Concrete example: a 10 kΩ–10 kΩ divider driven by 1 V, measured with a 20 kΩ meter input (a 20,000 Ω/V meter on its 1 V range):
+A 1/4 W rated resistor in this circuit will overheat, shift in value, and eventually fail open. Power ratings on components are thermal limits set by how quickly the package can shed heat to the surrounding air. Exceeding them does not cause immediate failure; it causes gradual drift followed by sudden failure, which is harder to debug than an immediate short.
 
-$$V_{out} = 1 \cdot \frac{10k \| 20k}{10k + 10k \| 20k} = 1 \cdot \frac{6.67k}{16.67k} \approx 0.400 \, \text{V}$$
+### Internal Resistance and Source Loading
 
-The ideal output is 0.500 V. The meter introduces a 20% error by existing. This is why oscilloscope probes are 10 MΩ and why ADC input buffers are high-impedance: measuring must not load the circuit being measured.
+All real voltage sources have an internal series resistance $R_s$. Under load current $I$, the terminal voltage drops:
 
-### Maximum Power Transfer
+$$V_\text{terminal} = V_\text{oc} - I \cdot R_s = V_\text{oc} \cdot \frac{R_L}{R_L + R_s}$$
 
-A source with internal resistance $R_S$ drives load $R_L$. Power delivered to the load:
-
-$$P_L = \left(\frac{V_S}{R_S + R_L}\right)^2 R_L$$
-
-Differentiating with respect to $R_L$ and setting to zero:
-
-$$\frac{dP_L}{dR_L} = 0 \implies R_L = R_S$$
-
-At matched impedance:
-
-$$P_{L,\max} = \frac{V_S^2}{4 R_S}$$
-
-Half the source power is wasted in $R_S$. Audio amplifiers and RF antenna feeds are designed for impedance matching to maximize power transfer. Digital logic drivers are not — you want $R_L \gg R_S$ there to maximize voltage transfer and minimize the energy wasted in the driver's own resistance.
-
-### Heat Dissipation
-
-From $P = I^2 R$: a 100 Ω resistor carrying 100 mA:
-
-$$P = (0.1 \, \text{A})^2 \times 100 \, \Omega = 1 \, \text{W}$$
-
-A standard 1/4 W resistor fails at this load — not degrades, fails, often with smoke or flame. Power ratings on resistors are thermal limits, not suggestions. The same math applies to PCB traces, connector pins, and MOSFETs — exceeding the thermal limit destroys the component regardless of the software running on the system.
+where $V_\text{oc}$ is the open-circuit voltage. A phone battery with $R_s = 150\text{ mΩ}$ supplying 3 A to a processor loses $0.15 \times 3 = 0.45\text{ V}$ at the terminals, which is why battery management ICs separately report open-circuit voltage (state of charge) and operating voltage (affected by load). Maximum power transfers to a load when $R_L = R_s$, but for signal measurement you want $R_L \gg R_s$ to avoid disturbing the source.
 
 ### Battery Energy and Runtime
 
-A cell rated 4000 mAh at 3.85 V nominal:
+A 3000 mAh battery at 3.7 V nominal stores:
 
-$$E = \frac{4000 \, \text{mAh}}{1000} \times 3.85 \, \text{V} = 15.4 \, \text{Wh} = 55{,}440 \, \text{J}$$
+$$E = 3.7\text{ V} \times 3.0\text{ Ah} = 11.1\text{ Wh} = 11.1 \times 3600\text{ J} \approx 40\text{ kJ}$$
 
-Runtime at constant 500 mW draw:
+If the system draws a constant 1 W:
 
-$$t = \frac{E}{P} = \frac{15.4 \, \text{Wh}}{0.5 \, \text{W}} = 30.8 \, \text{hours}$$
+$$t = \frac{E}{P} = \frac{11.1\text{ Wh}}{1\text{ W}} = 11.1\text{ h}$$
 
-The kernel's power management subsystem — `drivers/power/supply/` and the `pm_qos` infrastructure — performs variants of this arithmetic continuously, trading off performance states against projected runtime.
+Real runtimes are shorter because: (1) battery capacity is rated at a slow discharge rate and drops at high current due to internal resistance losses ($I^2 R_s$); (2) the capacity curve is not flat — the nominal 3.7 V drops as charge depletes; (3) the system power draw is not constant.
 
 ---
 
 ## Linux Connection
 
-### Reading Electrical Quantities from sysfs
+### Battery and Charger State: `power_supply` Subsystem
 
-The kernel's power supply class (`drivers/power/supply/power_supply_core.c`) exposes battery and charger measurements through sysfs. Units follow a consistent convention: voltages in microvolts (µV), currents in microamps (µA), energy in microwatt-hours (µWh), charge in microampere-hours (µAh).
+The kernel's `power_supply` subsystem abstracts fuel gauge ICs, charger controllers, and USB power delivery negotiation. Drivers expose attributes as sysfs files under `/sys/class/power_supply/`. A fuel gauge IC measures current by sampling the voltage drop across a precision shunt resistor (typically 10–100 mΩ) — Ohm's Law in silicon, resolved to microamp precision.
 
 ```bash
-# Voltage across the battery terminals, in µV
+# List available power supply nodes (battery, AC adapter, USB, etc.)
+ls /sys/class/power_supply/
+
+# Terminal voltage in microvolts (divide by 1e6 for volts)
 cat /sys/class/power_supply/BAT0/voltage_now
 
-# Current: negative = discharging, positive = charging, in µA
+# Instantaneous current in microamps; negative = discharging
 cat /sys/class/power_supply/BAT0/current_now
 
-# Remaining energy and design capacity, in µWh
+# Remaining energy in microwatt-hours (some drivers report microamp-hours
+# in charge_now instead; check energy_full_design vs charge_full_design)
 cat /sys/class/power_supply/BAT0/energy_now
 cat /sys/class/power_supply/BAT0/energy_full
-cat /sys/class/power_supply/BAT0/energy_full_design
 
-# Instantaneous power in µW (not always present — compute it if absent)
-cat /sys/class/power_supply/BAT0/power_now
-
-# Charger status: "Charging", "Discharging", "Full", "Not charging"
-cat /sys/class/power_supply/BAT0/status
-```
-
-Compute instantaneous power and estimated runtime in a shell one-liner when `power_now` is absent:
-
-```bash
-V=$(cat /sys/class/power_supply/BAT0/voltage_now)   # µV
-I=$(cat /sys/class/power_supply/BAT0/current_now)   # µA (may be negative)
-E=$(cat /sys
+# Compute instantaneous power in watts from the raw sysfs values:
+V=$(cat /sys/class/power_supply/BAT0/voltage_now)
+I=$(cat /sys/class/power_supply/BAT0/current_now)
+# P = V * I, scaled from micro-units: (µV * µA) / 1e12 = W
+awk "BEGIN { printf \"%.3f W\n\", ($V * $I) / 1e

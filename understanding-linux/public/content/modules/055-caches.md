@@ -12,118 +12,113 @@ resources:
 
 ## Why This Matters
 
-Every modern processor can execute instructions roughly 100–1000× faster than DRAM can supply data. Without caching, the CPU would stall waiting for memory on nearly every instruction. Caches work because real programs are not random in their memory access patterns — they exhibit two measurable regularities: **temporal locality** (a recently accessed address will likely be accessed again soon) and **spatial locality** (accessing address $A$ makes nearby addresses $A+\delta$ likely to be needed soon). These are empirical observations about how humans write code, not laws. Random-access workloads — hash tables with poor locality, pointer-chasing linked lists — break them badly, and understanding *when* locality fails is as important as knowing *why* caches exploit it.
-
-Get cache behavior wrong in your own code and performance collapses. Get it wrong in a multiprocessor context and you also get *correctness* failures — stale reads that no amount of careful locking will fix if the hardware coherence protocol is misunderstood.
+Every modern CPU can execute instructions in nanoseconds, but DRAM takes 50–100 ns to respond to a random read. At a 3 GHz clock, that 100 ns penalty is **300 wasted cycles per miss**. Caches exist because programs are not random: they exhibit *locality*, and the cache hierarchy is the hardware mechanism that converts that statistical regularity into performance. Misconfigure your data structures to fight the cache and you can easily see 10× slowdowns — not from an algorithmic complexity change, but from the memory subsystem refusing to cooperate.
 
 ---
 
 ## Core Concepts
 
-### Cache Lines (Blocks)
+### Locality: Why Caches Work at All
 
-Caches don't store individual bytes — they store *blocks* (cache lines), typically 64 bytes on x86. When you access any byte within a block, the hardware fetches the entire 64-byte block from memory. This is the mechanism by which spatial locality becomes performance: neighboring bytes arrive "for free" on the first miss.
+Two properties of real programs make caches effective:
 
-Block size $B$ is a tradeoff. Larger blocks amortize per-miss overhead and exploit dense spatial locality, but they waste memory bandwidth when locality is poor (you fetch 64 bytes, use 4, then miss on the next line) and increase *miss penalty* because more bytes must cross the memory bus to fill a line.
+**Temporal locality**: a recently-accessed location will likely be accessed again soon. A loop counter read and written on every iteration is the canonical example. The cache keeps it hot so subsequent accesses cost ~4 cycles (L1 latency) instead of ~300.
 
-On Linux, you can read the L1 data cache line size directly:
+**Spatial locality**: accessing address $A$ predicts that addresses near $A$ will be accessed soon. The cache exploits this by fetching a full *cache line* — 64 bytes on all modern x86 processors — on every miss, not just the word that was requested. If your program then touches the next word in sequence, it's already in cache.
 
-```bash
-cat /sys/devices/system/cpu/cpu0/cache/index0/coherency_line_size
-# 64
-```
+These two properties hold because programs contain loops (temporal) and operate on contiguous data structures like arrays and structs (spatial). A program that accessed memory in a truly random order — say, pointer-chasing through a shuffled linked list spanning gigabytes — would derive almost no benefit from a cache, and its performance would reflect raw DRAM latency at every step. This is why linked list traversal is genuinely slower than array traversal at scale, even when both are $O(n)$.
 
-### Mapping: Where Does a Block Live in the Cache?
+### Cache Mapping: Where Can a Block Live?
 
-A cache must answer two questions in nanoseconds: (1) is this address currently cached? and (2) if so, where? The answer depends on the *mapping policy*.
+A cache holds far fewer blocks than DRAM. The hardware must determine which cache location a given memory block *can* occupy, and then whether it currently *does* occupy it. There are three strategies:
 
-**Direct-mapped**: each memory block maps to exactly one cache slot, determined by $(\text{block address}) \bmod (\text{number of blocks in cache})$. Lookup is $O(1)$ — one tag comparison — but two frequently-used addresses that map to the same slot will evict each other on every access (*conflict misses*), even if the rest of the cache is empty.
+**Direct-mapped**: each memory block maps to exactly one cache slot, determined by `block_address mod num_slots`. A lookup requires checking exactly one slot — fast, simple hardware. The cost: two frequently-used blocks can map to the same slot and evict each other on alternating accesses (*thrashing*). There is no way to keep both resident simultaneously.
 
-**Fully associative**: a block can occupy any slot. No conflict misses, but requires comparing every tag simultaneously — hardware-expensive. Practical only for small structures like TLBs.
+**Fully associative**: a block can go in any slot. This eliminates conflict misses entirely, but finding a block requires comparing every tag in parallel. The hardware cost scales badly with size; in practice, fully associative structures are limited to small tables like TLBs (32–1024 entries).
 
-**Set-associative** (the standard): the cache is divided into $S$ sets, each holding $W$ *ways* (slots). A memory address maps to exactly one set, but can occupy any of the $W$ ways within that set. This bounds tag comparison cost to $W$ comparisons while largely eliminating conflict misses.
+**Set-associative** ($n$-way): the cache is partitioned into $S$ sets, each holding $n$ ways. A block maps to exactly one set (via `block_address mod S`) but can occupy any of the $n$ ways within that set. Modern L1 caches are typically 4–8-way; L3 caches are often 16-way. Increasing $n$ reduces conflict misses with diminishing returns: going from 1-way (direct-mapped) to 2-way captures most of the gain; going from 8-way to 16-way provides very little additional benefit for typical workloads.
 
-Total cache capacity: $C = S \times W \times B$.
+For a cache with $S$ sets and 64-byte blocks ($2^6$ bytes), the set index for a block at byte address $a$ is:
 
-Address decomposition for a set-associative cache with block size $B = 2^b$ bytes and $S = 2^s$ sets:
+$$\text{set} = \left\lfloor \frac{a}{64} \right\rfloor \bmod S$$
 
-$$\underbrace{\text{tag}}_{(A - s - b) \text{ bits}} \;\Big|\; \underbrace{\text{set index}}_{s \text{ bits}} \;\Big|\; \underbrace{\text{block offset}}_{b \text{ bits}}$$
+Within that set, all $n$ tags are compared in parallel — the width of the set is the hardware cost you pay.
 
-where $A$ is the address width. The hardware extracts index bits to select a set, then compares the incoming tag against all $W$ ways *in parallel*. A match on a valid tag is a hit; the offset bits then select the requested byte within the block.
+### Replacement Policy: What Gets Evicted?
 
-### Replacement: Which Block Gets Evicted?
+When a set is full and a new block arrives, the hardware must choose a victim. The oracle policy would evict whichever block will be reused furthest in the future (Bélády's algorithm), but that requires knowledge of future accesses. Hardware must approximate it:
 
-When a miss occurs in a full set, something must go. The choice affects miss rate materially:
+**LRU (Least Recently Used)**: evict the block accessed longest ago. Performs well for workloads with clear temporal reuse. Exact LRU requires $\log_2(n!)$ bits of ordering state per set — at $n = 16$, that is $\lceil \log_2(16!) \rceil = 44$ bits per set, plus update logic on every access. Most hardware implements *pseudo-LRU*: a binary tree of bits that approximates LRU with $n - 1$ bits per set, accepting occasional wrong evictions in exchange for simpler update logic.
 
-- **LRU (Least Recently Used)**: evict the way untouched longest. Optimal for many workloads but requires tracking access order per set — expensive at high associativity ($W \geq 8$). Cost of exact LRU state: $W!$ states per set.
-- **Pseudo-LRU**: a tree of bits approximating LRU. Used in many real L1/L2 caches (e.g., x86 L1). Much cheaper, miss rate nearly identical in practice.
-- **Random**: pick a victim uniformly at random. Surprisingly competitive with LRU, immune to adversarial access patterns that thrash LRU, and trivially cheap in hardware.
-- **FIFO**: evict the oldest-fetched block regardless of recency. Suffers Bélády's anomaly — adding cache capacity can *increase* miss rate.
+**Random**: select a victim uniformly at random. Counterintuitively competitive with LRU at $n \geq 4$, because conflict patterns that would systematically defeat LRU don't systematically defeat random. Simpler hardware, no pathological cases.
 
-The OS page replacement problem is structurally identical but the cost of a miss (a page fault) is thousands of cycles — OS software can afford more sophisticated approximations. The Linux kernel's page reclaim uses an *active/inactive list* two-pass approximation to LRU, modified by recency hints from `madvise(2)` and accessed/dirty bits in page table entries.
+**RRIP (Re-Reference Interval Prediction)**: each line is tagged with a predicted re-reference distance (2 bits in the basic form). New lines are inserted with a "distant" prediction; lines that hit have their prediction promoted to "near". Eviction targets the line with the most distant prediction. Intel uses a variant (SRRIP/DRRIP) in L3 caches to resist cache-unfriendly scan patterns that would pollute an LRU cache.
 
-### Coherence: Correctness Across Multiple Caches
+### Cache Coherence: The Multiprocessor Problem
 
-Each core has private L1/L2 caches. If core 0 and core 1 both hold a cached copy of address $X$ and core 1 writes to $X$, core 0's copy is stale. Without a coherence protocol, core 0 will read the old value indefinitely — no mutex will fix this because the stale read happens *below* the locking abstraction.
+Each core in a modern CPU has a private L1 and L2 cache. This means multiple cores can simultaneously hold a copy of the same cache line. Without a coherence mechanism, a write by one core would be invisible to others, causing silent data corruption: two cores both reading a "current" value that disagree.
 
-A coherent memory system guarantees three properties:
+A coherent memory system enforces two invariants:
 
-1. A read by processor $P$ of address $X$ returns the value of the most recent write to $X$ by $P$, if no other processor has written $X$ since.
-2. A read by $P$ of address $X$ returns the value written by processor $Q$ if that write is *sufficiently separated* in time from the read (and no intervening write exists).
-3. **Write serialization**: all processors observe writes to the same address in the same total order.
+1. **Single-writer / multiple-reader**: at any instant, a line is either writable by exactly one core, or readable by any number of cores — not both.
+2. **Write serialization**: if two cores write to the same location, all other cores observe those writes in the same order.
 
-The standard hardware mechanism is a **snooping protocol** such as MESI. Each cache line is in one of four states: **M**odified (dirty, exclusive), **E**xclusive (clean, exclusive), **S**hared (clean, potentially multiple holders), or **I**nvalid. Transitions are triggered by snooping the interconnect:
+The standard mechanism is **MESI** (a state machine per cache line):
 
-- A write by core 1 to a line in state S broadcasts an *invalidate* message; all other caches move their copy to state I.
-- A subsequent read by core 0 misses (state I), fetches from core 1's cache (which holds the Modified line) or from memory after writeback.
+| State | Meaning |
+|---|---|
+| **M**odified | Line is dirty; only this cache has it; memory is stale |
+| **E**xclusive | Line is clean; only this cache has it; memory matches |
+| **S**hared | Line is clean; multiple caches may have it; memory matches |
+| **I**nvalid | Line is not present or has been invalidated |
 
-This is invisible to software in the correctness sense — but its *performance* side effects are not invisible, which leads directly to false sharing.
+When a core in state S or I wants to *write*, it issues an **invalidate** transaction on the interconnect. Every other cache holding that line transitions to I before the requesting core's write proceeds. This serializes writes through the interconnect and prevents two cores from believing they have write authority simultaneously.
+
+**False sharing** is the coherence tax on adjacent data. Two cores writing to different variables $x$ and $y$ — independent, no logical sharing — but $x$ and $y$ happen to sit in the same 64-byte line. The coherence protocol sees one unit: that line. It bounces ownership between cores on every write, serializing what should be parallel updates. The program is correct; it is simply paying the full coherence round-trip (~40–100 ns on a NUMA system) for every write to either variable.
 
 ---
 
 ## How It Works
 
-### Address Decomposition: A Worked Example
+### Address Decomposition
 
-Suppose a 32 KB, 4-way set-associative L1 cache with 64-byte blocks and 64-bit addresses:
+For a physically-addressed cache with $2^s$ sets and $2^b$-byte blocks, a physical address is decomposed into three fields:
 
-$$b = \log_2(64) = 6 \text{ offset bits}$$
-$$S = \frac{32768}{4 \times 64} = 128 \text{ sets} \implies s = \log_2(128) = 7 \text{ index bits}$$
-$$\text{tag bits} = 64 - 7 - 6 = 51 \text{ bits}$$
+$$\underbrace{\text{tag}}_{(w - s - b) \text{ bits}} \;\|\; \underbrace{\text{set index}}_{s \text{ bits}} \;\|\; \underbrace{\text{block offset}}_{b \text{ bits}}$$
 
-For address `0x00007FFF_DEAD1234`:
+For a concrete 32-bit address with a 4-way set-associative cache of 256 sets ($s = 8$) and 64-byte lines ($b = 6$):
+
+$$\underbrace{[31:14]}_{\text{tag, }18\text{ bits}} \;\|\; \underbrace{[13:6]}_{\text{set index, }8\text{ bits}} \;\|\; \underbrace{[5:0]}_{\text{block offset, }6\text{ bits}}$$
 
 ```
-Address (low 20 bits): 0xEAD1234
-Binary:   ... 1110 1010 1101 0001 0010 0011 0100
-
-Bits 5:0  (offset)     = 0b11_0100 = 0x34 = 52   → byte 52 within the block
-Bits 12:6 (set index)  = 0b000_1001 = 9           → look in set 9
-Bits 63:13 (tag)       = remaining upper bits      → compared against 4 ways
+Physical address (32 bits):
+ 31             14 | 13          6 | 5           0
+ [    tag        ] [ set index   ] [   offset    ]
+      18 bits            8 bits          6 bits
 ```
 
-The hardware checks all 4 way-tags in set 9 simultaneously. If one matches and its valid bit is set: hit, deliver byte 52. Otherwise: miss, fetch the 64-byte block containing `0x...1200`–`0x...123F` from L2 or memory.
+The total cache capacity is:
 
-### The Cost of a Miss: AMAT
+$$\text{capacity} = 2^s \times n \times 2^b = 256 \times 4 \times 64 = 65536 \text{ bytes} = 64 \text{ KiB}$$
 
-Miss penalty dominates. Average Memory Access Time:
+This matches a typical L1 data cache size. On a lookup, hardware uses the 8-bit set index to address the set's tag array, reads all 4 tags simultaneously, and XORs each with the address's tag field — a hit is a zero result combined with a valid bit.
 
-$$\text{AMAT} = t_{\text{hit}} + m \cdot t_{\text{miss}}$$
+The reason the block offset occupies the *low* bits and the tag the *high* bits is not arbitrary: it ensures that spatially adjacent addresses (differing only in low bits) map to the *same* set, maximizing spatial prefetch utility. If the set index used high bits, sequential addresses would spray across the whole cache.
 
-where $m$ is the miss rate and $t_{\text{miss}}$ is the miss penalty in cycles. For a real hierarchy (L1 → L2 → L3 → DRAM):
+### Conflict Miss Demonstration
 
-$$\text{AMAT} = t_{L1} + m_{L1}(t_{L2} + m_{L2}(t_{L3} + m_{L3} \cdot t_{\text{DRAM}}))$$
-
-With representative numbers — $t_{L1}=4$, $t_{L2}=12$, $t_{L3}=40$, $t_{\text{DRAM}}=200$ cycles, and miss rates $m_{L1}=0.05$, $m_{L2}=0.20$, $m_{L3}=0.50$:
-
-$$\text{AMAT} = 4 + 0.05\bigl(12 + 0.20(40 + 0.50 \times 200)\bigr)$$
-$$= 4 + 0.05(12 + 0.20 \times 140) = 4 + 0.05(12 + 28) = 4 + 2 = 6 \text{ cycles}$$
-
-Raising $m_{L1}$ to $0.20$ gives $\text{AMAT} = 4 + 0.20 \times 40 = 12$ cycles — a 2× slowdown from one parameter change. This is why cache miss rate is often more important than raw instruction throughput when optimizing hot loops.
-
-### Cache-Friendly vs. Cache-Hostile Access
-
-Row-major traversal of a row-major array accesses memory sequentially — each 64-byte cache line is loaded once and fully consumed:
+A direct-mapped cache with $2^k$ sets maps address $a$ to set $\lfloor a/64 \rfloor \bmod 2^k$. Two arrays whose base addresses differ by a multiple of the cache size will have every corresponding element map to the *same* set — guaranteed thrashing:
 
 ```c
-// A[N][N] stored row-major: A[i][j] at offset (i*N +
+// Assume L1 data cache: direct-mapped, 32 KiB, 64-byte lines
+// = 512 sets. Two arrays 32 KiB apart alias to the same sets.
+#define N 4096
+double A[N], B[N];   // sizeof(double) * 4096 = 32 KiB each
+                     // If &A[0] and &B[0] differ by 32 KiB,
+                     // A[i] and B[i] map to the same cache set.
+
+for (int i = 0; i < N; i++) {
+    A[i] = A[i] * B[i];
+    // Access A[i]: load A[i]'s line into set k, evicting B[i]'s line
+    // Access B[i]: miss — load B[i]'s line into set k, evicting A[i]'s line
+    //

@@ -12,101 +12,99 @@ resources:
 
 ## Why This Matters
 
-Every program you write is a string of characters. Whether the kernel accepts it, a compiler transforms it, or a shell executes it depends entirely on whether that string belongs to a particular *language* — a set defined by precise mathematical rules. Without formal language theory, you cannot build a parser, write a regex engine, design a protocol grammar, or reason about what problems are fundamentally unsolvable.
+Every time Linux boots, the kernel's ELF loader validates binary headers by walking a state machine — if the magic bytes, class field, and section offsets don't satisfy specific structural constraints, `execve` returns `ENOEXEC`. Every time bash parses `foo | bar > out`, it builds an AST from a context-free grammar. Every time `gcc` runs, its lexer (`libcpp`) converts a byte stream into tokens by simulating a DFA compiled from regular expressions. Every time `iptables` matches a packet, the `xt_string` extension runs a pattern automaton over payload bytes.
 
-This is not abstract: when `flex` tokenizes C source, it compiles regular expressions into a DFA transition table and emits it as a C array. When the kernel's `ftrace` subsystem parses filter expressions in `/sys/kernel/debug/tracing/set_ftrace_filter`, it runs a hand-written recursive descent parser for a context-free grammar. When `iptables` matches packet strings with `-m string --algo bm`, it uses the Boyer-Moore finite automaton. The theory tells you not just *how* these tools work, but *which classes of tools are possible to build at all* — and where the hard mathematical ceiling is.
+The mathematical theory underneath all of this is not decorative. It tells you *which* problems a given class of tool can solve, *why* regex cannot enforce balanced brackets, and *where* the hard boundary lies between decidable and undecidable problems — a boundary that determines whether a static analyzer can, even in principle, catch a given class of bug.
 
 ---
 
 ## Core Concepts
 
-### Alphabets, Strings, and Languages
+### Alphabet, String, Language
 
-An **alphabet** $\Sigma$ is a finite nonempty set of symbols. A **string** over $\Sigma$ is a finite sequence of symbols. The **length** of string $w$ is written $|w|$. The empty string is $\varepsilon$, with $|\varepsilon| = 0$. The set of all strings over $\Sigma$ is $\Sigma^*$; the set excluding $\varepsilon$ is $\Sigma^+$.
+An **alphabet** $\Sigma$ is a finite nonempty set of symbols. A **string** over $\Sigma$ is a finite sequence of symbols from $\Sigma$; the **empty string** is $\varepsilon$. The **Kleene closure** $\Sigma^*$ is the set of all finite strings over $\Sigma$, including $\varepsilon$. A **language** $L \subseteq \Sigma^*$ is any subset of that set.
 
-A **language** $L \subseteq \Sigma^*$ is any set of strings — finite or infinite. Every decision problem is a language membership question: "does input $x$ have property $P$?" is exactly "does $x \in L_P$ where $L_P = \{x \in \Sigma^* \mid P(x)\}$?" This reduction is what connects automata theory to computability theory: asking whether a language is decidable is asking whether the corresponding decision problem has an algorithm.
+The alphabet $\{0,1\}$ generates every bitstring; the 256-symbol byte alphabet generates every file your filesystem can hold. A language over ASCII is a set of strings — and "the set of all syntactically valid C translation units" is a language in the precise technical sense. This framing matters because it converts the question "can my tool handle this format?" into "does this tool's computational model recognize this language?"
 
-### Grammars
+### Grammars and the Chomsky Hierarchy
 
-A **formal grammar** $G = (V, \Sigma, R, S)$ consists of:
-- $V$: finite set of **non-terminal** symbols (syntactic categories, never in the final string)
-- $\Sigma$: finite set of **terminal** symbols, with $V \cap \Sigma = \emptyset$
+A **formal grammar** is a 4-tuple $G = (V, \Sigma, R, S)$:
+- $V$: finite set of **nonterminal** symbols (syntactic variables)
+- $\Sigma$: terminal alphabet, $V \cap \Sigma = \emptyset$
 - $R$: finite set of **production rules** $\alpha \to \beta$ where $\alpha, \beta \in (V \cup \Sigma)^*$
-- $S \in V$: the **start symbol**
+- $S \in V$: start symbol
 
-A derivation step $uAv \Rightarrow u\gamma v$ applies rule $A \to \gamma$ in context $u, v$. The language generated is:
+A derivation applies rules to rewrite $S$ until no nonterminals remain. The language $L(G)$ is the set of all terminal strings derivable from $S$. The rules you allow determine how powerful the grammar is:
 
-$$L(G) = \{w \in \Sigma^* \mid S \xRightarrow{*} w\}$$
+| Type | Name | Rule constraint | Recognizer | Memory model |
+|------|------|-----------------|------------|--------------|
+| 3 | Regular | $A \to aB$ or $A \to a$ | DFA / NFA | $O(1)$, fixed states |
+| 2 | Context-free | $A \to \gamma$, single nonterminal left | Pushdown automaton | Stack |
+| 1 | Context-sensitive | $\vert\alpha A\beta\vert \leq \vert\alpha\gamma\beta\vert$ | Linear-bounded automaton | $O(n)$ tape |
+| 0 | Unrestricted | $\alpha \to \beta$ | Turing machine | Unbounded tape |
 
-The form of the rules is what determines expressive power. Restrict the rules more tightly, and the class of languages shrinks — but so does the complexity of the recognizer you need.
+Each class is a *strict* superset of the one above it: every regular language is context-free, but $\{a^n b^n \mid n \geq 0\}$ is context-free and not regular. The containments are proper and provable.
 
-### The Chomsky Hierarchy
+### Regular Languages and Why Their Memory Model Matters
 
-| Type | Constraint on rules | Recognizer | Canonical example |
-|------|--------------------|-----------|--------------------|
-| 3 | $A \to aB$ or $A \to a$ (right-linear) | Finite automaton (DFA/NFA) | `[a-z]+[0-9]*` |
-| 2 | $A \to \gamma$ (single non-terminal LHS) | Pushdown automaton | Balanced parentheses, C expressions |
-| 1 | $|\alpha| \leq |\beta|$ (non-contracting) | Linear-bounded automaton | Some cross-serial dependencies |
-| 0 | Unrestricted | Turing machine | Arbitrary computation |
+A **regular language** is any language recognized by a finite automaton, equivalently described by a regular expression, equivalently generated by a Type-3 grammar. The critical constraint: the recognizer's memory is exactly the current state. If $|Q| = k$, the machine has $\log_2 k$ bits of working memory regardless of input length.
 
-The containment is strict: Regular $\subsetneq$ Context-free $\subsetneq$ Context-sensitive $\subsetneq$ Recursively enumerable. Each boundary marks a concrete capability jump: finite memory → stack → bounded tape → unbounded tape.
+This is why `grep`'s basic regex engine runs in $O(n)$ time and $O(1)$ extra memory on input length $n$: it is literally executing a DFA. It is also why you cannot write a POSIX ERE that matches only strings with balanced parentheses — doing so would require the automaton to count nesting depth, which demands unbounded memory.
 
-### Regular Languages and Finite Automata
+Regular languages are closed under:
+- **Union**: $L_1 \cup L_2$ (combine automata with a product construction)
+- **Concatenation**: $L_1 \cdot L_2$
+- **Kleene star**: $L^* = \{\varepsilon\} \cup L \cup LL \cup \cdots$
+- **Complement**: $\overline{L}$ (swap accepting and non-accepting states in a complete DFA)
+- **Intersection**: $L_1 \cap L_2$ (product construction, accept when both components accept)
 
-A **deterministic finite automaton (DFA)** is a 5-tuple $(Q, \Sigma, \delta, q_0, F)$:
+Closure under complement and intersection is *not* shared by context-free languages — a fact with practical consequences for parser design.
+
+### Context-Free Languages
+
+A **context-free grammar** (CFG) has rules of the form $A \to \gamma$ where $A$ is a single nonterminal and $\gamma \in (V \cup \Sigma)^*$. The recognizer is a **pushdown automaton** (PDA): a finite automaton plus a stack. The stack is what makes nesting tractable. To match `((()))`, the PDA pushes on `(` and pops on `)`; the stack depth encodes the current nesting level.
+
+C's grammar is approximately context-free. `gcc`'s parser handles the `if/else` nesting, expression trees, and block structure with a pushdown mechanism (in practice, a shift-reduce parser driven by tables derived from the CFG). What CFGs *cannot* enforce: that every identifier is declared before use. That cross-reference requires comparing two different parts of the input string, which exceeds what a single stack can express — it is handled by a separate symbol-table pass, not by the grammar itself.
+
+Context-free languages are closed under union, concatenation, and Kleene star, but **not** under complement or intersection. The intersection of two CFLs can be non-context-free: $\{a^n b^n c^n \mid n \geq 0\}$ is the intersection of $\{a^n b^n c^m\}$ and $\{a^m b^n c^n\}$, neither of which is context-free in this specific construction, and the result is not context-free either.
+
+### Deterministic Finite Automata
+
+A **DFA** is a 5-tuple $M = (Q, \Sigma, \delta, q_0, F)$:
 - $Q$: finite set of states
+- $\Sigma$: input alphabet
 - $\delta: Q \times \Sigma \to Q$: total transition function
 - $q_0 \in Q$: start state
-- $F \subseteq Q$: accepting states
+- $F \subseteq Q$: set of accepting states
 
-The DFA processes input left-to-right, one symbol at a time. On string $w = a_1 a_2 \cdots a_n$, it computes the state sequence:
+$M$ accepts $w = a_1 a_2 \cdots a_n$ if the unique computation path
 
-$$q_0, \; \delta(q_0, a_1), \; \delta(\delta(q_0, a_1), a_2), \; \ldots$$
+$$q_0 \xrightarrow{a_1} q_1 \xrightarrow{a_2} q_2 \cdots \xrightarrow{a_n} q_n$$
 
-and accepts iff the final state is in $F$. The extended transition function $\hat{\delta}: Q \times \Sigma^* \to Q$ is defined recursively:
+satisfies $q_n \in F$. The language recognized is $L(M) = \{w \in \Sigma^* \mid \hat{\delta}(q_0, w) \in F\}$, where $\hat{\delta}$ is the extension of $\delta$ to strings.
 
-$$\hat{\delta}(q, \varepsilon) = q \qquad \hat{\delta}(q, wa) = \delta(\hat{\delta}(q, w), a)$$
+Because $\delta$ is a total function, every input character causes exactly one state transition. No lookahead, no backtracking. This is why DFA-based matchers are linear time with no worst-case blowup — something that backtracking NFA engines (like PCRE in certain modes) do *not* guarantee.
 
-A language is **regular** if and only if some DFA recognizes it. The three formalisms — DFA, NFA, regular expression — describe exactly the same class.
+### Nondeterministic Finite Automata and the Subset Construction
 
-**Why the equivalence?**
-- NFA → DFA: the **subset construction**. States of the DFA are elements of $2^Q$ (subsets of NFA states). If the NFA has $n$ states, the DFA has at most $2^n$ states — this bound is tight in the worst case, which is why some regex engines that simulate NFAs directly avoid the exponential blowup.
-- Regex → NFA: **Thompson's construction**. Build NFA fragments for base cases ($\varepsilon$, single symbol), then compose them for union, concatenation, and Kleene star. The result is always an NFA with at most $2|r|$ states for regex $r$.
-- DFA → regex: state elimination on the transition graph, treating each edge label as a regex.
+An **NFA** relaxes the transition function to $\delta: Q \times (\Sigma \cup \{\varepsilon\}) \to \mathcal{P}(Q)$: each state-symbol pair maps to a *set* of next states, and $\varepsilon$-transitions consume no input. The NFA accepts $w$ if *any* computation path reaches an accepting state.
 
-These constructions matter in practice: `re2c` (used in PHP, Nginx) applies subset construction to generate minimal DFAs from regex; GNU `grep` with `-E` uses NFA simulation to avoid backtracking.
+NFAs are exponentially more concise for certain languages, but they do not recognize more languages. The **subset construction** converts an NFA with $n$ states to a DFA with at most $2^n$ states: each DFA state is a *subset* of NFA states representing all states the NFA *could* be in simultaneously.
 
-### Context-Free Languages and Pushdown Automata
+$$Q_{DFA} \subseteq \mathcal{P}(Q_{NFA}), \quad |\mathcal Q_{DFA}| \leq 2^{|Q_{NFA}|}$$
 
-A **context-free grammar (CFG)** restricts all rules to $A \to \gamma$ where $A \in V$ is a single non-terminal. The "context-free" name is precise: the rule applies to $A$ regardless of the symbols surrounding it in any sentential form. This is what makes CFGs tractable — you can parse a non-terminal's subtree independently.
+The exponential is tight — there exist NFA families where the minimal equivalent DFA requires exactly $2^n$ states. This is the cost paid when compiling a regex to a DFA: space blows up, but matching becomes $O(n)$ with no backtracking.
 
-A **pushdown automaton (PDA)** is an NFA plus a stack. The transition reads the current input symbol and top-of-stack symbol, then writes a new stack string and moves to a new state. The stack gives unbounded memory with LIFO discipline. This is exactly enough to match nested structures because nesting is inherently a last-in-first-out phenomenon: the innermost delimiter must close before the outer one.
+### The Pumping Lemma
 
-The canonical non-regular, context-free language:
+**Theorem (Pumping Lemma for Regular Languages):** For any regular language $L$, there exists $p \geq 1$ (the *pumping length*) such that every $w \in L$ with $|w| \geq p$ can be written $w = xyz$ satisfying:
 
-$$L = \{a^n b^n \mid n \geq 1\}$$
-
-No DFA recognizes this because any DFA has a fixed finite number of states $|Q|$, so by the time it reads $|Q|+1$ copies of $a$, it must have revisited some state — it has lost count. The PDA strategy: push one stack symbol per $a$, pop one per $b$, accept on empty stack.
-
-**The Pumping Lemma for regular languages**: if $L$ is regular with pumping length $p$, then any $w \in L$ with $|w| \geq p$ can be written $w = xyz$ where:
 1. $|xy| \leq p$
 2. $|y| \geq 1$
-3. $xy^iz \in L$ for all $i \geq 0$
+3. $\forall i \geq 0,\ xy^iz \in L$
 
-To prove $\{a^n b^n\}$ is not regular: choose $w = a^p b^p$. Any split $xyz$ with $|xy| \leq p$ forces $y = a^k$ for some $k \geq 1$, so $xy^2z = a^{p+k}b^p \notin L$. Contradiction.
+The intuition: if a DFA has $p$ states and reads a string of length $\geq p$, some state repeats. The input consumed between two visits to that state (the $y$ segment) can be pumped any number of times without leaving the language — the automaton loops.
 
-There is an analogous pumping lemma for CFLs (Ogden's lemma), which establishes that $\{a^n b^n c^n\}$ is not context-free.
+**Using it to prove $L = \{a^n b^n \mid n \geq 0\}$ is not regular:**
 
-### Computability: Turing Machines and Limits
-
-A **Turing machine** has a finite-state control, a two-way infinite tape of cells, and a head that reads, writes, and moves left or right. A transition is a function:
-
-$$\delta: Q \times \Gamma \to Q \times \Gamma \times \{L, R\}$$
-
-where $\Gamma \supseteq \Sigma$ is the tape alphabet. Unlike a DFA, a TM can loop forever.
-
-A language is **decidable** (recursive) if some TM halts on every input and accepts iff the input is in $L$. It is **recognizable** (recursively enumerable) if some TM halts and accepts all strings in $L$ but may loop on strings not in $L$.
-
-The **Halting Problem** $H = \{\langle M, w \rangle \mid M \text{ halts on } w\}$ is recognizable but not decidable. The proof by **diagonalization**: assume decider $H$ exists. Construct TM $D$: on input $\langle M \rangle$, run $H(\langle M, \langle M \rangle \rangle)$; if $H$ accepts, loop; if $H$ rejects, accept. Now ask: what does $D$ do on input $\langle D \rangle$? $D$ halts iff $D$ loops — contradiction. No engineering resolves this. It is a property of the mathematical structure of computation itself.
-
-**Reductions** extend undecidability: if you can transform instances of $H$ into instances of problem $P$ in a computable way, then $P$ is also undecidable. This is how Rice's theorem is proved: every non
+Assume $L$ is regular with pumping length $p$. Choose $w = a^p b^p \in L$, so $|w| = 2p \geq p$. Any split $w = xyz$

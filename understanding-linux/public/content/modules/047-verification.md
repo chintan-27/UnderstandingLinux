@@ -12,142 +12,149 @@ resources:
 
 ## Why This Matters
 
-Hardware that ships broken stays broken. You cannot patch a CPU the way you patch an OS — a timing violation baked into silicon will corrupt every computation that processor ever performs, silently, at a rate that varies with temperature and supply voltage. Verification is the discipline that prevents this. Testbenches exercise logic against known-good outputs. Assertions encode invariants that must hold at every clock cycle. Formal verification mathematically proves correctness over all possible inputs, not just the ones you thought to test. Static timing analysis proves signals settle before registers sample them. Each layer catches a different class of failure; omitting any one of them leaves a gap that will eventually manifest as a field return or a silent data corruption bug.
+A digital design that simulates correctly can still fail in silicon. Timing violations cause flip-flops to capture metastable values. Logic errors that no test exercised remain hidden until a rare input combination triggers them in production. Formal verification exists because exhaustive simulation is computationally intractable — a 64-bit adder has $2^{128}$ possible input combinations, and at $10^9$ tests per second that requires $\approx 1.08 \times 10^{19}$ years, roughly $8 \times 10^8$ times the age of the universe. Each verification technique closes a distinct gap: testbenches find bugs on exercised paths, assertions catch invariant violations the instant they occur, formal methods prove properties over all reachable states, and static timing analysis guarantees your pipeline closes at the target frequency. Omit any one of these and you are shipping a circuit that is merely untested, not correct.
 
 ## Core Concepts
 
 ### Testbenches
 
-A testbench is a simulation wrapper around your design-under-test (DUT). It is never synthesized — it exists only to drive signals and check outputs. The critical discipline is **coverage**: which input states and transitions have actually been exercised? A testbench that only tests the happy path is not a testbench; it is documentation that happens to run. Useful testbenches exercise reset behavior (is state actually cleared?), back-to-back transactions (does the pipeline stall correctly?), maximum-value inputs (do carry bits propagate?), and constrained-random inputs (does the design survive sequences you didn't anticipate?).
-
-```systemverilog
-module adder_tb;
-    logic [3:0] a, b;
-    logic [4:0] sum;
-
-    // Instantiate DUT — ports connected by name to avoid positional errors
-    adder dut(.a(a), .b(b), .sum(sum));
-
-    initial begin
-        // Zero + zero: verify reset state doesn't corrupt output
-        a = 4'b0000; b = 4'b0000; #10;
-        assert(sum == 5'd0) else $fatal(1, "0+0 = %0d, expected 0", sum);
-
-        // Max + 1: forces carry into bit 4 — the most common overflow bug
-        a = 4'b1111; b = 4'b0001; #10;
-        assert(sum == 5'd16) else $fatal(1, "15+1 = %0d, expected 16", sum);
-
-        // Max + max: sum must be 30, not 14 (truncation bug)
-        a = 4'b1111; b = 4'b1111; #10;
-        assert(sum == 5'd30) else $fatal(1, "15+15 = %0d, expected 30", sum);
-
-        $display("All tests passed");
-        $finish;
-    end
-endmodule
-```
-
-The `$fatal(1, ...)` form (SystemVerilog 2012) terminates simulation immediately with exit code 1, which lets CI pipelines detect failures automatically.
+A testbench is non-synthesizable HDL that wraps the design under test (DUT), drives inputs, and checks outputs. Its power is limited by its coverage: every input you never generate is a bug you cannot find. A **self-checking testbench** computes expected outputs by an independent reference model and compares automatically — it does not ask a human to interpret waveforms. The reference model is the verification oracle; if it has the same bug as the DUT, the testbench proves nothing.
 
 ### Assertions
 
-An assertion states a condition that *must* hold. The distinction between a testbench check and an assertion is semantic: the testbench says "did this output match this expected value on this run?"; the assertion says "this invariant must never be violated, for any input, ever." That distinction matters because a buggy circuit that consistently produces wrong outputs will pass a weak testbench and fail every assertion that encodes what correct behavior actually means.
+An assertion is a Boolean property that must hold at a specific point in time. When it fails in simulation, the tool flags the exact cycle where the invariant broke, rather than letting a corrupted value propagate silently for hundreds of cycles before a downstream error surfaces. Assertions also serve as the logical backbone of formal verification: the same `assert property` statement a simulator evaluates sample-by-sample is what a formal tool attempts to prove holds for every reachable state.
 
-**Immediate assertions** are procedural — they fire at one instant in simulation time:
+### Formal Verification
 
-```systemverilog
-assert(sum < 32) else $error("Sum overflowed 5-bit result");
-```
-
-**Concurrent assertions** are sampled on a clock edge and can express temporal properties — relationships between signals across multiple cycles. This is where most of the expressive power lives:
-
-```systemverilog
-// If req rises, ack must be asserted within 1 to 4 clock cycles.
-// ##[1:4] means "between 1 and 4 steps later" in SVA sequence syntax.
-property req_ack_within_4;
-    @(posedge clk) disable iff (!rst_n)
-    req |-> ##[1:4] ack;
-endproperty
-
-REQ_ACK: assert property (req_ack_within_4)
-    else $error("ACK not received within 4 cycles after REQ at time %0t", $time);
-```
-
-The `disable iff (!rst_n)` clause suppresses the assertion during reset — without it, the checker fires spuriously every reset cycle, creating noise that causes engineers to disable assertions entirely. Label the assertion (`REQ_ACK:`) so the waveform viewer and log files identify it unambiguously.
-
-### Formal Verification Basics
-
-Simulation tests a finite set of input sequences. Formal verification proves properties over *all* possible input sequences by treating the circuit as a mathematical object rather than something to execute. The underlying engine is typically a SAT solver (for bounded model checking) or a BDD-based model checker (for full reachability). The trade-off is fundamental: formal methods are exhaustive but their cost scales exponentially with state-space size — the **state explosion problem**.
-
-The formal model of a sequential circuit is a state machine defined by:
-- A state space $S$ (all possible flip-flop assignments)
-- An initial state $s_0$ (the reset state)
-- A transition function $\delta: S \times I \to S$ where $I$ is the input space
-- A property $P: S \to \{0,1\}$
-
-Formal verification asks: does $P(s) = 1$ for every $s$ reachable from $s_0$ under any finite input sequence? If the tool finds a state where $P(s) = 0$, it returns a **counterexample** — a concrete input sequence that reaches the failing state. This is more useful than a failing simulation because the counterexample is the *shortest possible* path to failure.
-
-**Bounded model checking (BMC)** limits the search to paths of length $\leq k$. This is tractable for large designs but only proves absence of bugs reachable within $k$ steps — it is not a full proof unless $k$ exceeds the diameter of the reachability graph.
-
-In practice: run formal tools on individual blocks (arbiters, FIFOs, protocol checkers) where the state space is small enough to be exhaustive, and use simulation for system-level integration.
+Formal verification replaces sampling with proof. A **model checker** builds a state transition graph of the circuit and either proves an assertion holds in every reachable state, or produces a concrete **counterexample trace** — a sequence of inputs that drives the design into the violating state. This is categorically stronger than simulation because it covers states no human would think to exercise. The limitation is state space explosion: a circuit with $n$ flip-flops has up to $2^n$ reachable states. **Bounded model checking (BMC)** sidesteps this by proving properties hold for all input sequences of length $\leq k$ clock cycles — complete for bugs that manifest quickly, incomplete for liveness properties.
 
 ### Timing Analysis
 
-Every flip-flop has an **aperture window** around the clock edge during which its input must be stable. Specifically:
-- **Setup time** $t_{su}$: input must be stable at least $t_{su}$ before the clock edge
-- **Hold time** $t_h$: input must remain stable at least $t_h$ after the clock edge
-
-If the input changes inside this window, the flip-flop may enter a **metastable state** — an analog condition where the output is neither a valid 0 nor a valid 1, and the time to resolve is unbounded (exponentially distributed). This is not a design defect you can simulate away; it is a physical consequence of violating the aperture.
-
-The **setup constraint** bounds the minimum clock period $T_c$. For a register-to-register path through combinational logic:
-
-$$T_c \geq t_{pcq} + t_{pd} + t_{su}$$
-
-Where:
-- $t_{pcq}$ = clock-to-Q propagation delay of the source register (time from clock edge until output is valid)
-- $t_{pd}$ = worst-case propagation delay through the combinational logic on this path
-- $t_{su}$ = setup time of the destination register
-
-The **hold constraint** is independent of clock period — it constrains the *minimum* delay through the combinational path:
-
-$$t_{ccq} + t_{cd} \geq t_h$$
-
-Where $t_{ccq}$ is the clock-to-Q contamination delay (the *earliest* the output can change after the clock edge) and $t_{cd}$ is the contamination delay of the combinational path (the earliest the output can change after the input changes). Violating hold time means the new cycle's data propagates through combinational logic and corrupts the flip-flop's input *before* it has safely captured the previous cycle's value — the register samples a mixture of two values. Hold violations cannot be fixed by slowing the clock; they require adding intentional delay (buffer insertion) on the short path.
+Static timing analysis (STA) determines whether every path in a synchronous circuit satisfies setup and hold constraints at every flip-flop, at every process/voltage/temperature (PVT) corner, without running simulation. It operates on the timing netlist produced after synthesis and place-and-route. STA cannot lie to you the way simulation can — there is no test vector to miss. What it cannot check is functional correctness; it only checks that the correct value, whatever it is, arrives on time.
 
 ## How It Works
 
-### Propagation vs. Contamination Delay
+### Setup and Hold Time Analysis
 
-Every gate has two delay figures, not one. The **propagation delay** $t_{pd}$ is the time until the output is *guaranteed* to have reached its final value — it is the worst-case bound used for setup analysis. The **contamination delay** $t_{cd}$ is the time until the output *might first change* from its previous value — it is the best-case bound used for hold analysis.
+Consider the standard pipeline stage: register R1 drives combinational logic feeding register R2, both clocked by the same clock.
 
-For gates in series on the critical path:
+```
+CLK ──┬─────────────────────┐
+      │                     │
+    [R1] ──[combo logic]── [R2]
+```
 
-$$t_{pd,\text{total}} = \sum_{i \in \text{critical path}} t_{pd,i}$$
+The clock period $T_c$ must be long enough for data to propagate from R1's output to R2's input and settle before R2's setup window closes:
 
-For gates in series on the shortest path:
+$$T_c \geq t_{pcq} + t_{pd} + t_{setup}$$
 
-$$t_{cd,\text{total}} = \sum_{i \in \text{short path}} t_{cd,i}$$
+where:
+- $t_{pcq}$ — clock-to-Q **propagation** delay of R1: how long after the clock edge before R1's output is guaranteed valid
+- $t_{pd}$ — worst-case propagation delay through the combinational logic (the critical path)
+- $t_{setup}$ — setup time of R2: how long before the clock edge that R2's input must be stable
 
-The two analyses are independent and must both pass. A path can satisfy setup and violate hold. It can satisfy hold and violate setup. Both must hold simultaneously.
+Rearranging to expose the timing budget for combinational logic:
 
-### Worked Timing Example
+$$t_{pd} \leq T_c - t_{pcq} - t_{setup}$$
 
-Consider a pipeline register on a Cyclone IV FPGA. The timing parameters below come from the Cyclone IV Device Handbook (Altera/Intel, Table 1-8):
+**Worked example** (Harris & Harris, *Digital Design and Computer Architecture*, §3.5): $t_{pcq} = 80\,\text{ps}$, three gate stages at $40\,\text{ps}$ each, $t_{setup} = 50\,\text{ps}$:
 
-| Parameter | Value |
-|-----------|-------|
-| $t_{pcq}$ | 199 ps |
-| $t_{su}$ | 76 ps |
-| $t_h$ | 0 ps |
-| $t_{pd}$ per logic element (LE) | 381 ps |
-| $t_{wire}$ per inter-LE routing segment | 246 ps |
+$$T_c \geq 80 + (3 \times 40) + 50 = 250\,\text{ps}$$
 
-If the critical path traverses 3 LEs and 2 routing segments:
+$$f_{max} = \frac{1}{T_c} = \frac{1}{250 \times 10^{-12}} = 4\,\text{GHz}$$
 
-$$t_{pd,\text{total}} = 3 \times 381\,\text{ps} + 2 \times 246\,\text{ps} = 1143 + 492 = 1635\,\text{ps}$$
+The **hold constraint** governs the fastest path. Data must not arrive at R2 before R2's hold window closes — otherwise the new value races in and overwrites what R2 was still sampling:
 
-$$T_c \geq 199 + 1635 + 76 = 1910\,\text{ps}$$
+$$t_{ccq} + t_{cd} \geq t_{hold}$$
 
-$$f_{max} = \frac{1}{1910 \times 10^{-12}} \approx 523\,\text{MHz}$$
+where $t_{ccq}$ is the clock-to-Q **contamination** (earliest) delay of R1 and $t_{cd}$ is the contamination delay through the fastest combinational path. This inequality has a critical asymmetry with the setup constraint: **slowing the clock does not help**. Lowering $f_c$ increases $T_c$ but does not change $t_{ccq}$ or $t_{cd}$. The fix is to slow down the fast path by inserting buffer gates, which increases $t_{cd}$.
 
-Adding one LE to the critical path increases $t_{pd,\text{total}}
+### Critical Path vs. Short Path
+
+The critical path is the longest combinational path — it determines $f_{max}$. The short path is the fastest — it determines hold safety.
+
+```
+Input A ──[AND]──[AND]──[OR]── R2   ← critical path: 2t_AND + t_OR
+Input B ──[AND]────────────── R2    ← short path:    t_AND
+```
+
+For the critical path: $t_{pd} = 2t_{pd,AND} + t_{pd,OR}$
+
+For the short path: $t_{cd} = t_{cd,AND}$
+
+If the hold constraint is violated on the short path, inserting a buffer ($t_{buf}$) on that path increases $t_{cd}$ to $t_{cd,AND} + t_{buf}$, resolving the violation without touching the clock frequency.
+
+### Self-Checking Testbench in SystemVerilog
+
+The `!==` operator performs a four-state exact comparison: `X` and `Z` are distinct from `0` and `1`. Using `!=` instead allows an uninitialized output `X` to compare equal to an expected value when the expression evaluates using two-state logic reduction — a silent false pass.
+
+```systemverilog
+module testbench;
+  logic a, b, y;
+  integer errors = 0;
+
+  and_gate dut(.a(a), .b(b), .y(y));
+
+  // Reference model: pure function, independent of DUT implementation
+  function automatic logic ref_and(logic p, logic q);
+    return p & q;
+  endfunction
+
+  initial begin
+    for (int i = 0; i < 4; i++) begin
+      {a, b} = i[1:0];
+      #10;
+      if (y !== ref_and(a, b)) begin
+        $display("FAIL @%0t: a=%b b=%b expected %b got %b",
+                 $time, a, b, ref_and(a, b), y);
+        errors++;
+      end
+    end
+
+    $display(errors ? "%0d FAILURES" : "ALL TESTS PASSED", errors);
+    $finish;
+  end
+endmodule
+```
+
+The reference model (`ref_and`) is independently written. For a real DUT this would be a C model, a golden RTL, or a transaction-accurate model. The loop over `i` generates all $2^2 = 4$ input combinations exhaustively — affordable for 2 inputs, impractical beyond $\approx 20$ inputs without constrained random generation.
+
+### Concurrent Assertions in SystemVerilog
+
+An **immediate assertion** fires once at a specific simulation time. A **concurrent assertion** is sampled on every clock edge throughout the simulation and describes a temporal sequence — something no stimulus loop can express compactly.
+
+```systemverilog
+// Immediate assertion: checked once in procedural context
+assert (output_valid || !input_ready)
+  else $fatal(1, "Protocol violation: ready asserted without valid");
+
+// Concurrent assertion: evaluated on every posedge of clk
+// "if req is high, grant must arrive within 1 to 3 cycles"
+property req_grant_p;
+  @(posedge clk) disable iff (rst)
+    req |-> ##[1:3] grant;
+endproperty
+
+assert property (req_grant_p)
+  else $error("Grant latency violation at %0t", $time);
+
+// "grant never asserted without a preceding req"
+property no_spurious_grant_p;
+  @(posedge clk) disable iff (rst)
+    grant |-> $past(req, 1) || $past(req, 2) || $past(req, 3);
+endproperty
+
+assert property (no_spurious_grant_p)
+  else $error("Spurious grant at %0t", $time);
+```
+
+`|->` is the **overlapping implication**: if the antecedent holds on cycle $n$, the consequent must hold starting from cycle $n$. `|=>` shifts the consequent to cycle $n+1$. `##[1:3]` matches a delay of 1, 2, or 3 clock cycles. `disable iff (rst)` suppresses the assertion during reset so reset itself does not generate false violations.
+
+### Formal Verification: Bounded Model Checking
+
+BMC unrolls the circuit $k$ times and encodes the reachability question as a Boolean satisfiability (SAT) problem. If the SAT solver finds a satisfying assignment, that assignment is a counterexample. If it finds none, no bug exists within $k$ cycles.
+
+```
+State 0 ──Transition──► State 1 ──Transition──► ... ──► State k
+                                                              │
+                                                     ¬P holds here?

@@ -12,114 +12,152 @@ resources:
 
 ## Why This Matters
 
-Every system that allocates scarce resources must solve an optimization problem, whether or not it calls it that. The Linux kernel's CPU scheduler must maximize throughput while keeping latency bounded. A compiler's register allocator must minimize memory spills subject to a fixed number of registers. A TCP congestion controller must maximize bandwidth while keeping packet loss below a threshold. When these systems fail — when the scheduler causes jitter, when the allocator thrashes, when TCP oscillates — the failure is usually an optimization gone wrong: the objective function didn't capture the real goal, the algorithm got stuck in a local minimum, or constraints were violated silently. Understanding optimization from first principles means you can read these systems and reason about why they make the choices they do.
+The Linux kernel's CFS scheduler maintains a red-black tree of runnable tasks ordered by virtual runtime. Its objective is to minimize the maximum deviation from perfectly fair CPU sharing — a precise mathematical goal. When it selects the next task, it picks the leftmost node: the process with the smallest accumulated $v_{runtime}$. That selection policy *is* an optimization algorithm, running thousands of times per second, on every core, without ever calling it that.
+
+Every non-trivial kernel policy is an optimization problem in disguise: page replacement minimizes future fault rate given a fixed memory budget; the TCP congestion window maximizes throughput subject to a loss-rate constraint; the I/O scheduler minimizes seek distance subject to deadline constraints. The math below is not background reading — it is a description of what the kernel is already doing.
+
+---
 
 ## Core Concepts
 
 ### Objective Functions
 
-An objective function $f(x)$ is the quantity you are trying to minimize or maximize. The choice of what to optimize *is* the design decision — everything else follows from it.
+An **objective function** $f(\mathbf{x})$ maps a configuration vector to a scalar score. The discipline is naming it precisely before writing any code, because the choice of objective determines everything downstream.
 
-The Linux CFS scheduler minimizes the spread of virtual runtimes across runnable tasks:
+$$f(\mathbf{x}) : \mathbb{R}^n \to \mathbb{R}$$
 
-$$\Delta_{\text{vrt}} = \max_i(\text{vruntime}_i) - \min_i(\text{vruntime}_i)$$
+CFS uses virtual runtime as its objective. For a process $i$ with weight $w_i$ derived from its nice value, the virtual runtime accumulates as:
 
-That single choice encodes fairness: a task with the smallest `vruntime` always runs next, so no task can accumulate a CPU advantage. The scheduler doesn't directly minimize latency or maximize throughput — those are consequences. It minimizes $\Delta_{\text{vrt}}$ because that quantity is *computable at decision time* from data already in the red-black tree of runnable tasks. Latency is not observable until after the fact.
+$$v_i = \frac{\Delta t_i}{w_i}$$
 
-This constraint — the objective must be measurable at decision time — explains many seemingly indirect design choices throughout the kernel. The OOM killer scores processes via `/proc/$pid/oom_score` using a formula that weights RSS and ancestry rather than "actual harm to the user" because the latter is unmeasurable.
+where $\Delta t_i$ is wall-clock CPU time consumed. Scheduling picks $\arg\min_i v_i$ — literally gradient descent on a priority queue. The weight mapping from nice value $n$ is:
 
-```bash
-# See what the OOM killer knows about a running process
-cat /proc/$(pgrep firefox | head -1)/oom_score
-cat /proc/$(pgrep firefox | head -1)/oom_score_adj
-```
+$$w(n) = \frac{1024}{1.25^n}$$
+
+so each nice-level step changes weight by 25%, meaning a one-unit nice increase doubles the virtual runtime increment for equal wall time. That factor of 1.25 is not arbitrary — it produces approximately equal perceived latency across the nice range.
+
+---
 
 ### Constraints
 
-A constraint is a condition that every valid solution must satisfy. Constraints come in two forms:
+A **constrained optimization** problem has the form:
 
-- **Equality constraints**: $g(x) = 0$ — the solution must lie on a surface. Example: the total weight of tasks assigned to CPUs must equal the total number of runnable tasks.
-- **Inequality constraints**: $h(x) \leq 0$ — the solution must lie on one side of a boundary. Example: a cgroup's memory usage must not exceed its configured limit.
+$$\min_{\mathbf{x}} f(\mathbf{x}) \quad \text{subject to} \quad g_i(\mathbf{x}) \leq 0, \quad h_j(\mathbf{x}) = 0$$
 
-The **feasible set** is the intersection of all constraints. When the feasible set is empty, the problem is *infeasible* — no solution exists satisfying all constraints simultaneously. The kernel OOM killer is the response to infeasibility: when no allocation strategy can satisfy all memory requests without exceeding physical limits, the kernel resolves infeasibility by forcibly shrinking the constraint set — it kills a process to free memory, making the problem feasible again.
+Inequality constraints ($g_i \leq 0$) bound the feasible region. Equality constraints ($h_j = 0$) pin the solution to a lower-dimensional surface.
 
-```bash
-# Inspect cgroup memory constraints (cgroup v2)
-cat /sys/fs/cgroup/system.slice/memory.max
-cat /sys/fs/cgroup/system.slice/memory.current
+In the memory allocator, the hard constraint is:
 
-# Trigger a controlled OOM in a memory-limited scope
-systemd-run --scope -p MemoryMax=50M stress --vm 1 --vm-bytes 200M
-```
+$$\sum_{i} \text{allocated}_i \leq \text{MemTotal}$$
+
+This is enforced in the kernel via the `vm.overcommit_memory` sysctl. With `overcommit_memory=2`, the constraint becomes:
+
+$$\text{committed} \leq \text{MemTotal} + \text{SwapTotal} \times \text{overcommit\_ratio}$$
+
+Violating this constraint does not produce a mathematical error — it produces an OOM kill. The optimizer (the allocator) fails when it ignores the constraint boundary.
+
+---
 
 ### Convexity
 
-A function $f$ is convex if for any two points $x, y$ and any $\lambda \in [0,1]$:
+A function $f$ is **convex** if for all $x, y$ in its domain and all $\lambda \in [0,1]$:
 
 $$f(\lambda x + (1-\lambda)y) \leq \lambda f(x) + (1-\lambda)f(y)$$
 
-The chord between any two points on the graph lies *above or on* the graph. Equivalently, for twice-differentiable $f$, convexity requires $\nabla^2 f(x) \succeq 0$ — the Hessian is positive semidefinite everywhere.
+The operationally important consequence: **on a convex function over a convex feasible region, every local minimum is a global minimum**. Any descent algorithm is therefore *correct*, not merely heuristic. This is why convexity matters — it is the condition under which you can trust your optimizer.
 
-Convexity matters because of one structural consequence: **every local minimum of a convex function is a global minimum**. Gradient descent on a convex function converges to the answer. Greedy algorithms work. You never need to ask "is there something better elsewhere?" because convexity guarantees there isn't.
+Non-convex problems have no such guarantee. Cache eviction policy optimization is non-convex because the hit rate as a function of eviction decisions has multiple local optima depending on the access pattern. Kernel developers work around this with heuristics (LRU, CLOCK, ARC) precisely because the true optimum is intractable.
 
-Non-convexity breaks this guarantee. Compiler register allocation is a graph coloring problem — NP-hard and deeply non-convex. The allocator uses heuristics precisely because the optimization landscape has many local minima and no tractable path to the global one. When you see a system using simulated annealing, genetic algorithms, or random restarts, you're seeing the system acknowledge that its objective is non-convex and local search is unreliable.
+---
 
 ### Local vs. Global Minima
 
-A point $x^*$ is a **local minimum** if $f(x^*) \leq f(x)$ for all $x$ in some neighborhood $\|x - x^*\| < \epsilon$. It is a **global minimum** if $f(x^*) \leq f(x)$ for all $x$ in the feasible set.
+A **local minimum** $\mathbf{x}^*$ satisfies $f(\mathbf{x}^*) \leq f(\mathbf{x})$ for all $\mathbf{x}$ in some open ball $B(\mathbf{x}^*, \epsilon)$. A **global minimum** satisfies it over the entire feasible region.
 
-For convex functions these coincide by definition. For non-convex functions they diverge. The first-order necessary condition for a local minimum is $\nabla f(x^*) = 0$ — a stationary point. But stationary points include saddle points and local maxima, not just minima. Gradient descent stopping at $\nabla f = 0$ doesn't tell you which kind you found.
+The implication for systems code: if your tuning algorithm converges, you need to know which kind of minimum it found. A TCP congestion control algorithm that hill-climbs on throughput may converge to a local optimum that is stable but suboptimal — CUBIC and BBR differ precisely in their assumptions about the shape of the throughput landscape and where descent will terminate.
 
-The practical consequence: a greedy algorithm on a non-convex landscape stops at the first valley it reaches, which may be far from the deepest one. The kernel's `blk-mq` I/O scheduler uses heuristics to batch and reorder requests because the optimal global ordering is NP-hard to find; it accepts a locally good solution fast rather than searching for the global optimum.
+For convex $f$: local minimum $\Rightarrow$ global minimum.
+For non-convex $f$: convergence $\not\Rightarrow$ correctness.
+
+---
 
 ## How It Works
 
-### Unconstrained Minimization: Gradient Descent
+### Gradient Descent
 
-For a differentiable $f: \mathbb{R}^n \to \mathbb{R}$, the gradient $\nabla f(x)$ points in the direction of steepest increase. Gradient descent steps opposite to it:
+For differentiable $f$, the gradient $\nabla f(\mathbf{x})$ points in the direction of steepest *increase* in $f$. The update rule steps opposite to it:
 
-$$x_{k+1} = x_k - \alpha \nabla f(x_k)$$
+$$\mathbf{x}_{k+1} = \mathbf{x}_k - \alpha \nabla f(\mathbf{x}_k)$$
 
-where $\alpha > 0$ is the step size. At convergence, $\nabla f(x^*) = 0$.
+The learning rate $\alpha$ determines step size. For a quadratic $f(x) = x^2$, the update becomes:
 
-The step size $\alpha$ matters precisely. If $\alpha$ is too large relative to the curvature of $f$, the iterate overshoots the minimum and diverges. For a quadratic $f(x) = \frac{1}{2}x^T A x - b^T x$ with $A$ positive definite, convergence is guaranteed when $\alpha < \frac{2}{\lambda_{\max}(A)}$, where $\lambda_{\max}$ is the largest eigenvalue of $A$. High curvature requires small steps; flat regions permit larger ones. Adaptive step sizes (line search, Adam, Adagrad) exist because a single fixed $\alpha$ is rarely optimal across the whole landscape.
+$$x_{k+1} = x_k - \alpha \cdot 2x_k = x_k(1 - 2\alpha)$$
 
-**Example**: Minimize $f(x) = x^2 - 4x + 5$. Completing the square: $f(x) = (x-2)^2 + 1$, so the global minimum is $f(2) = 1$.
+This is a geometric series. It converges to $x^* = 0$ exactly when $|1 - 2\alpha| < 1$, i.e., $\alpha \in (0, 1)$. The convergence rate per step is $|1 - 2\alpha|$ — minimized at $\alpha = 0.5$, where the series collapses in one step. For $\alpha > 1$, the iterates diverge. This is not tuning intuition; it follows directly from the recurrence.
 
-$$\nabla f(x) = 2x - 4, \qquad x_{k+1} = x_k - \alpha(2x_k - 4) = (1 - 2\alpha)x_k + 4\alpha$$
+After $k$ steps starting at $x_0$:
 
-The update is a linear contraction toward $x = 2$ with rate $(1 - 2\alpha)$. Convergence requires $|1 - 2\alpha| < 1$, i.e., $\alpha \in (0, 1)$. At $\alpha = 0.5$ the method converges in one step; at $\alpha = 1$ it diverges.
+$$x_k = x_0 (1 - 2\alpha)^k$$
+
+The number of steps to reach $|x_k| < \epsilon$ is:
+
+$$k > \frac{\ln(\epsilon / |x_0|)}{\ln|1 - 2\alpha|}$$
 
 ```python
-def gradient_descent(f_prime, x0, alpha=0.1, steps=50, tol=1e-9):
+def gradient_descent(grad, x0, alpha=0.1, tol=1e-9, max_iter=10000):
     x = x0
-    for k in range(steps):
-        grad = f_prime(x)
-        x_new = x - alpha * grad
+    for k in range(max_iter):
+        g = grad(x)
+        x_new = x - alpha * g
         if abs(x_new - x) < tol:
-            print(f"Converged at step {k}")
-            break
+            return x_new, k
         x = x_new
-    return x
+    return x, max_iter
 
-f_prime = lambda x: 2*x - 4  # gradient of (x-2)^2 + 1
-
-for alpha in [0.1, 0.49, 0.5, 0.99, 1.01]:
-    result = gradient_descent(f_prime, x0=10.0, alpha=alpha)
-    print(f"alpha={alpha:.2f}  ->  x ≈ {result:.6f}")
+# f(x) = x^2, grad = 2x. Optimal alpha = 0.5 converges in 1 step.
+for alpha in [0.1, 0.5, 0.9, 1.1]:
+    result, steps = gradient_descent(lambda x: 2*x, x0=10.0, alpha=alpha)
+    print(f"alpha={alpha}: converged to {result:.2e} in {steps} steps")
 ```
 
-Run this and observe: at $\alpha = 0.5$ convergence is immediate; at $\alpha = 0.99$ convergence is slow and oscillatory; at $\alpha = 1.01$ it diverges. This is the same instability that makes poorly-tuned control loops in hardware drivers oscillate.
+The `alpha=1.1` case diverges — the loop hits `max_iter`. This is the overshoot condition made concrete.
+
+---
 
 ### Constrained Optimization: Lagrange Multipliers
 
-For equality constraints $g(x) = 0$, Lagrange multipliers convert a constrained problem into an unconstrained one. To minimize $f(x)$ subject to $g(x) = 0$, form the Lagrangian:
+For an equality constraint $g(\mathbf{x}) = 0$, form the **Lagrangian**:
 
-$$\mathcal{L}(x, \lambda) = f(x) + \lambda g(x)$$
+$$\mathcal{L}(\mathbf{x}, \lambda) = f(\mathbf{x}) + \lambda \cdot g(\mathbf{x})$$
 
-Setting both partial derivatives to zero:
+The necessary condition $\nabla \mathcal{L} = 0$ gives:
 
-$$\nabla_x \mathcal{L} = \nabla f(x) + \lambda \nabla g(x) = 0$$
-$$\nabla_\lambda \mathcal{L} = g(x) = 0$$
+$$\nabla f(\mathbf{x}^*) = -\lambda \nabla g(\mathbf{x}^*)$$
 
-The first equation says: at the constrained optimum, $\nabla f$ and $\nabla g$ are parallel — there is no feasible direction that improves $f$. The multiplier $\lambda$ is not just a bookkeeping variable; it equals $-\frac{df^*}{db}$ where $b$ is the right-hand side of the constraint $g(x) = b$. It measures the *sensitivity* of the optimal objective to relaxing the constraint. In resource allocation, $\lambda$ is the shadow
+This says the gradients are parallel at the optimum: any infinitesimal move that reduces $f$ also violates $g$. You are at the boundary, and the constraint is active.
+
+Concrete example: allocate CPU time $x_i \geq 0$ to $n$ processes to minimize total weighted latency $\sum w_i / x_i$ subject to $\sum x_i = C$ (total CPU capacity). The Lagrangian is:
+
+$$\mathcal{L} = \sum_{i=1}^n \frac{w_i}{x_i} + \lambda\left(\sum_{i=1}^n x_i - C\right)$$
+
+Setting $\partial \mathcal{L}/\partial x_i = 0$:
+
+$$-\frac{w_i}{x_i^2} + \lambda = 0 \implies x_i^* = \sqrt{\frac{w_i}{\lambda}}$$
+
+Using the constraint $\sum x_i^* = C$:
+
+$$x_i^* = C \cdot \frac{\sqrt{w_i}}{\sum_j \sqrt{w_j}}$$
+
+Higher-weight processes get more CPU, but the allocation scales as $\sqrt{w_i}$, not $w_i$. This is a quantitatively different policy than proportional allocation — and it is optimal under the stated objective.
+
+---
+
+### Convexity Verification: The Hessian
+
+For a scalar function, $f''(x) \geq 0$ everywhere confirms convexity. For multivariate $f$, the **Hessian** must be positive semi-definite (all eigenvalues $\geq 0$):
+
+$$H_{ij} = \frac{\partial^2 f}{\partial x_i \partial x_j}$$
+
+Numerically, approximate the Hessian using the four-point finite difference formula:
+
+$$H_{ij} \approx \frac{f(\mathbf{x}+\mathbf{e}_i+\mathbf{e}_j) - f(\mathbf{x}+\mathbf{e}_i-\mathbf{e}_j) - f(\mathbf{x}-\mathbf{e}_i+\mathbf{e}_j) + f(\mathbf{x

@@ -1,76 +1,138 @@
 ---
 id: 102
 title: "Boot path"
-part: "IX"
 supermoduleId: 9
-estimatedMinutes: 60
+estimatedMinutes: 45
 resources:
   - type: book
-    title: "Linux Kernel Development (Robert Love)"
-    url: "https://www.oreilly.com/library/view/linux-kernel-development/9780768696974/"
-  - type: article
-    title: "Kernel Newbies"
-    url: "https://kernelnewbies.org/"
-  - type: article
-    title: "LWN.net — Linux Weekly News"
-    url: "https://lwn.net/"
+    title: "Linux Kernel Development (Love)"
+  - type: book
+    title: "Understanding the Linux Kernel (Bovet)"
 ---
-# Boot path
 
 ## Why This Matters
 
-The kernel is the core of Linux. Understanding its internals lets you debug, optimize, and reason about system behavior from first principles.
+When you press the power button, nothing about Linux exists yet — no scheduler, no memory allocator, no filesystem, no processes. The boot path is a sequence of constrained handoffs, each stage doing exactly enough work to make the next stage possible. Firmware finds a bootloader because it cannot read filesystems. The bootloader finds a compressed kernel because firmware has no concept of an OS. The kernel mounts a temporary root filesystem because it cannot initialize complex storage without drivers, but cannot load drivers without a filesystem. Each constraint explains the layer above it. When something breaks — wrong boot parameters, missing initramfs, corrupted kernel image — the machine either silently hangs, panics, or drops into a recovery shell. Understanding the sequence is what separates debugging from staring at a black screen.
 
-**Boot path** sits within Linux Kernel Internals (Supermodule 9). This module covers 6 interconnected topics: firmware handoff, bootloader, kernel decompression, early init, initramfs, userspace init. Each builds on the previous, forming a coherent picture of how the Linux kernel works at this level.
+---
 
 ## Core Concepts
 
-### Firmware handoff
+### Firmware: The First Code That Runs
 
-**Firmware handoff** is a foundational concept within boot path. Inside the kernel and driver subsystems, this concept directly affects system stability, performance, and correctness. Getting it wrong can mean kernel panics, data corruption, or security vulnerabilities. In practice, understanding firmware handoff allows you to reason about system behavior rather than treating it as a black box.
+On x86-64, the CPU starts executing at physical address `0xFFFFFFF0` — 16 bytes below the top of the 32-bit address space. This is hardwired in silicon. The firmware ROM is mapped there. The CPU starts in 16-bit real mode, so the address space is effectively a 20-bit window: $2^{20} = 1{,}048{,}576$ bytes (1 MiB), with the top 64 KiB containing firmware. Everything below is RAM, except for a handful of reserved regions.
 
-### Bootloader
+**BIOS** (legacy) uses INT 13h disk services to load the first 512-byte sector of the boot device into physical address `0x7C00` and jumps to it. That sector is the Master Boot Record (MBR). Of its 512 bytes, 446 are available for stage-1 bootloader code; the remaining 66 bytes are the partition table (4 × 16-byte entries) and the 2-byte `0x55AA` signature. This is why GRUB needs a multi-stage design: 446 bytes is enough to locate and load a more capable image, but not to read a filesystem or render a menu.
 
-**Bootloader** is a foundational concept within boot path. Inside the kernel and driver subsystems, this concept directly affects system stability, performance, and correctness. Getting it wrong can mean kernel panics, data corruption, or security vulnerabilities. In practice, understanding bootloader allows you to reason about system behavior rather than treating it as a black box.
+**UEFI** reads a FAT32 EFI System Partition (ESP) — mounted at `/boot/efi` on a running system — and executes a PE-format binary directly. The 512-byte constraint disappears entirely. More importantly, UEFI exposes callable APIs: `GetMemoryMap()`, `LoadFile()`, filesystem protocols, GOP for graphics. These remain callable until the bootloader explicitly releases them by calling `ExitBootServices()`. After that call, UEFI firmware is no longer available — the kernel owns the machine. The kernel must call `ExitBootServices()` with the correct memory map key; if the map changed since it was last queried, the call fails and must be retried.
 
-### Kernel decompression
+The architectural difference: BIOS is a jump to a fixed address with no runtime; UEFI is a handoff from a service environment that the bootloader terminates when it no longer needs it.
 
-**Kernel decompression** is a foundational concept within boot path. Inside the kernel and driver subsystems, this concept directly affects system stability, performance, and correctness. Getting it wrong can mean kernel panics, data corruption, or security vulnerabilities. In practice, understanding kernel decompression allows you to reason about system behavior rather than treating it as a black box.
+### The Bootloader
 
-### Early init
+The bootloader's contract is precisely defined: load the kernel image and optional initramfs into physical memory, fill in the boot parameters structure, and jump to the kernel entry point. Everything else — menus, rescue modes, network booting — is convenience built on top of that contract.
 
-**Early init** is a foundational concept within boot path. Inside the kernel and driver subsystems, this concept directly affects system stability, performance, and correctness. Getting it wrong can mean kernel panics, data corruption, or security vulnerabilities. In practice, understanding early init allows you to reason about system behavior rather than treating it as a black box.
+GRUB2's stage structure exists because of the constraints above:
 
-### Initramfs
+- **Stage 1** (446-byte MBR code or UEFI PE binary): its only job is to locate and load stage 2 from a known disk offset or filesystem path.
+- **Stage 2** (`/boot/grub/grub.cfg`, core image, modules): reads its configuration, presents a menu, loads the kernel and initramfs from a real filesystem (ext4, XFS, Btrfs — via GRUB's own filesystem drivers), fills in boot parameters, and transfers control.
 
-**Initramfs** is a foundational concept within boot path. Inside the kernel and driver subsystems, this concept directly affects system stability, performance, and correctness. Getting it wrong can mean kernel panics, data corruption, or security vulnerabilities. In practice, understanding initramfs allows you to reason about system behavior rather than treating it as a black box.
-
-### Userspace init
-
-**Userspace init** is a foundational concept within boot path. Inside the kernel and driver subsystems, this concept directly affects system stability, performance, and correctness. Getting it wrong can mean kernel panics, data corruption, or security vulnerabilities. In practice, understanding userspace init allows you to reason about system behavior rather than treating it as a black box.
-
-## Practical Example
+GRUB's configuration lives at `/boot/grub/grub.cfg` (generated by `grub-mkconfig`, not hand-edited). A typical stanza looks like:
 
 ```bash
-# Kernel introspection commands
-$ uname -r                         # kernel version
-$ cat /proc/version                # build info
-$ zcat /proc/config.gz | grep SMP  # kernel config
-$ dmesg | tail -20                 # kernel log
-$ cat /proc/kallsyms | head        # kernel symbol table
-$ ls /sys/module/                  # loaded modules
+menuentry 'Linux' {
+    linux   /boot/vmlinuz-6.8.0 root=/dev/sda2 ro quiet
+    initrd  /boot/initramfs-6.8.0.img
+}
 ```
 
-## Key Insights
+The `linux` directive tells GRUB where to load the kernel and what command line to pass. The `initrd` directive tells GRUB what to load as initramfs and where to put it in memory — GRUB writes the physical address and size into the boot parameters struct so the kernel can find it.
 
-- **Firmware handoff** — understand this deeply and the rest of boot path follows naturally.
-- **Bootloader** — understand this deeply and the rest of boot path follows naturally.
-- **Kernel decompression** — understand this deeply and the rest of boot path follows naturally.
-- **Early init** — understand this deeply and the rest of boot path follows naturally.
-- **Initramfs** — understand this deeply and the rest of boot path follows naturally.
-- Think in terms of trade-offs: every design choice in the Linux kernel sacrifices something to gain something else.
-- Build mental models, not memorized facts. The goal is to predict behavior from first principles.
+On ARM and RISC-V there is no x86 boot protocol. Instead, the bootloader (U-Boot, EDK2) passes a **Device Tree Blob (DTB)** in a CPU register (register `x0` on AArch64, `a1` on RISC-V) before jumping to the kernel entry point. The DTB is a binary description of hardware that has no self-enumerating bus — peripherals, interrupt controllers, clock domains. On x86, PCI enumeration handles this; on embedded hardware, the DTB is the equivalent.
 
-## What Comes Next
+### Kernel Decompression
 
-The next module, **System call path**, builds directly on these ideas. Entry and Dispatch extend what you've learned here into system call path.
+The kernel image shipped on most systems is not raw machine code. On x86 it is called `bzImage` (big zImage — the `bz` has nothing to do with bzip2; it just means "big"). Its layout:
+
+```
+bzImage on disk
+┌──────────────────────────────┐
+│  Real-mode setup code        │  ← up to 32 KiB, 16-bit code
+│  (arch/x86/boot/setup.bin)   │
+├──────────────────────────────┤
+│  Protected-mode stub         │  ← switches CPU modes
+├──────────────────────────────┤
+│  Compressed vmlinux          │  ← gzip / lz4 / lzma / zstd
+│  + decompressor              │  ← statically linked, runs before kernel
+└──────────────────────────────┘
+```
+
+The mode transition sequence on x86-64 is:
+
+$$\text{16-bit real mode} \xrightarrow{\text{set PE bit in CR0}} \text{32-bit protected mode} \xrightarrow{\text{set LME bit in EFER, enable paging}} \text{64-bit long mode}$$
+
+Each transition requires specific register manipulation. The setup code enables the A20 line (a legacy ISA quirk that, if unset, causes address bit 20 to be forced to zero — corrupting any access above 1 MiB), builds a minimal GDT, sets the PE bit in `CR0`, performs a far jump to flush the instruction pipeline, then sets up 64-bit paging and jumps to `startup_64`.
+
+The decompressor runs in the early protected/long-mode environment, before `start_kernel`. It decompresses `vmlinux` to a chosen physical address and jumps to `startup_64` inside it. The compressed size of the kernel matters for boot time: lz4 decompresses faster than gzip at roughly the cost of 10–20% larger compressed size, which is why embedded and latency-sensitive systems often choose lz4.
+
+Check what compression your kernel uses:
+
+```bash
+file /boot/vmlinuz-$(uname -r)
+# vmlinuz-6.8.0: Linux kernel x86 boot executable bzImage, ...
+# The compression type appears in the output, e.g. "compressed data (gzip)"
+```
+
+Or inspect the magic bytes directly:
+
+```bash
+# gzip magic = 0x1f 0x8b; lz4 magic = 0x04 0x22 0x4d 0x18
+od -A x -t x1z /boot/vmlinuz-$(uname -r) | grep -m1 '1f 8b\|04 22 4d'
+```
+
+### Early Kernel Init: `start_kernel`
+
+The entry point after decompression is `arch/x86/kernel/head_64.S:startup_64`, which does the minimum assembly-level setup (stack pointer, early page tables, BSS zeroing) and calls `start_kernel()` in `init/main.c`. At this point there is one CPU running, interrupts are disabled, and there is no dynamic memory allocator. The initialization order is a strict dependency graph: you cannot initialize the slab allocator before the page allocator, cannot set up the page allocator before the memory map is parsed, cannot parse the memory map before e820 data is read from the boot params.
+
+The critical ordering inside `start_kernel()`:
+
+```c
+/* init/main.c (simplified, real function is ~200 lines) */
+asmlinkage __visible void __init start_kernel(void)
+{
+    /* 1. Architecture-specific setup: parse boot_params, set up CPU */
+    setup_arch(&command_line);          /* reads e820, sets up page tables */
+
+    /* 2. Memory allocator bootstrap */
+    mm_init();                          /* page allocator, then slab */
+
+    /* 3. Interrupt infrastructure */
+    trap_init();                        /* IDT: exceptions, system calls */
+    init_IRQ();                         /* hardware interrupt controllers */
+
+    /* 4. Scheduler */
+    sched_init();                       /* runqueues, CFS, idle task */
+
+    /* 5. Enable interrupts — not before IDT and scheduler exist */
+    local_irq_enable();
+
+    /* 6. Rest of subsystems */
+    timekeeping_init();
+    rcu_init();
+    init_workqueues();
+    /* ... ~50 more subsystem inits ... */
+
+    /* 7. Spawn kernel threads, become idle */
+    rest_init();
+}
+```
+
+`rest_init()` does something subtle: it calls `kernel_thread(kernel_init, ...)` to create PID 1 (which will exec `/init` in userspace) and `kernel_thread(kthreadd, ...)` to create PID 2 (the kernel thread daemon). Then the bootstrap thread — which has been running as a kernel thread with no PID in userspace terms — becomes the idle task (`cpu_idle_loop()`). The idle task runs when no other task is runnable; it typically executes `hlt` to let the CPU sleep until the next interrupt.
+
+Inspect the result on a running system:
+
+```bash
+# PID 1 = init/systemd, PID 2 = kthreadd
+ps -p 1,2 -o pid,ppid,comm
+
+# Kernel threads (spawned by kthreadd) show PPID=2

@@ -12,83 +12,99 @@ resources:
 
 ## Why This Matters
 
-Every abstraction you have studied — system calls, virtual memory, the scheduler, file descriptors — ultimately executes on a physical substrate made of sand. When manufacturing fails to hold tolerances at the nanometer scale, transistors leak current, clock speeds must be reduced, and caches become unreliable. More fundamentally: the physics of how silicon is processed sets hard ceilings that no kernel patch can raise. Dennard scaling collapsed because leakage current grows faster than active power shrinks below roughly 65 nm — a direct consequence of gate oxide thickness hitting quantum tunneling limits. That collapse forced multicore designs, which is why Linux's SMP scheduler, NUMA memory topology, and CPU frequency governors exist at all. The manufacturing process is not background knowledge; it is the reason the software stack is shaped the way it is.
+Every Linux system call, every memory access, every clock cycle depends on transistors switching reliably at nanosecond timescales. Those transistors exist because chemistry and physics were reduced to a reproducible industrial process. The characteristics you observe through Linux tooling — CPU frequency scaling, thermal throttling, cache hierarchy sizes, memory latency — are direct consequences of manufacturing decisions made at the fab. When `lscpu` reports a 3.6 GHz base clock, that number is bounded by how fast a transistor can switch given its gate length, oxide capacitance, and supply voltage — all process-determined quantities. Understanding the manufacturing chain explains *why* those numbers are what they are, not just what they are.
 
 ---
 
 ## Core Concepts
 
-### Silicon Purification: From Sand to Nine Nines
+### Silicon Purification: From Quartz to Electronic Grade
 
-Raw silicon dioxide (SiO₂) is reduced with carbon in an arc furnace to yield metallurgical-grade silicon at roughly 99% purity. That sounds acceptable until you understand the constraint: a single boron or phosphorus atom per billion silicon atoms measurably shifts a transistor's threshold voltage. The Siemens process closes the gap — silicon is converted to trichlorosilane (SiHCl₃), fractionally distilled (exploiting the large vapor-pressure difference between SiHCl₃ and metal-chloride contaminants), then thermally decomposed back to solid silicon on a heated rod. The result is electronic-grade silicon at better than 99.9999999% purity (nine nines, or $< 1$ ppb metallic contamination).
+Quartz ($\text{SiO}_2$) is reduced with carbon in an electric arc furnace:
 
-Purity matters for a precise reason: any atom whose valence differs from silicon's four bonds either donates a free electron (phosphorus, arsenic — n-type) or creates a hole (boron — p-type). Uncontrolled dopants are defects; controlled dopants are transistors. The same chemistry that destroys yield when accidental is the mechanism exploited deliberately in every step that follows.
+$$\text{SiO}_2 + 2\text{C} \rightarrow \text{Si} + 2\text{CO}$$
 
-### Ingot Growth: Czochralski and Crystal Orientation
+This yields metallurgical-grade silicon (~98% pure). That 2% contamination is catastrophic: dopant atoms like boron and phosphorus at $10^{15}$ atoms/cm³ would swamp any deliberate doping signal. The Siemens process converts Si to trichlorosilane ($\text{SiHCl}_3$), fractionally distills it — exploiting the fact that boron and phosphorus trichlorides have different boiling points from $\text{SiHCl}_3$ — then reduces it back:
 
-A seed crystal of known crystallographic orientation is dipped into molten silicon (melting point 1414 °C) and pulled upward while rotating. Silicon atoms attach epitaxially to the seed, propagating its lattice order. The result is a single-crystal boule up to 300 mm in diameter.
+$$\text{SiHCl}_3 + \text{H}_2 \rightarrow \text{Si} + 3\text{HCl}$$
 
-*Single-crystal* is the operative constraint. A polycrystalline ingot would contain grain boundaries — planar defects where two misoriented lattice regions meet. At a grain boundary, periodic potential is broken, carrier mobility drops, and leakage paths form. No amount of process optimization recovers a transistor built across a grain boundary, which is why the Czochralski process is non-negotiable rather than merely conventional.
+Electronic-grade silicon reaches 99.9999999% purity (nine nines). Why does purity matter this precisely? Because semiconductor behavior depends on *controlled* impurities at $10^{14}$–$10^{18}$ atoms/cm³ against a background of $5 \times 10^{22}$ Si atoms/cm³. The doping signal-to-noise ratio requires background contamination to be orders of magnitude below the intended doping level. A boron contamination of $10^{13}$ atoms/cm³ from impure feedstock is invisible at threshold; $10^{15}$ makes a lightly-doped p-well undopable by design.
 
-Orientation is chosen for electrical reasons. The (100) surface:
-- Cleaves along {110} planes, giving controlled die singulation
-- Has lower interface trap density ($D_{it}$) at the Si/SiO₂ boundary than (111) — meaning fewer states that capture charge and degrade MOSFET threshold stability
-- Yields higher electron and hole mobility in the channel due to effective mass anisotropy in the diamond-cubic band structure
+### Czochralski Ingot Growth: Making a Single Crystal
 
-Bulk resistivity is set at this stage by adding controlled dopant quantities to the melt, establishing the starting substrate type and doping level that all subsequent implants will modify locally.
+Polycrystalline silicon cannot be used for devices. Grain boundaries create potential barriers that scatter carriers and act as recombination centers, destroying minority carrier lifetime and degrading transistor gain. Every device on a wafer must sit in a continuous, defect-free diamond cubic lattice.
 
-### Wafering: Surface Preparation Sets Process Latitude
+The Czochralski process melts purified silicon in a quartz crucible at 1415°C (just above the 1414°C melting point — tight thermal control matters because solidification and melting are both occurring at the crystal-melt interface). A seed crystal is touched to the melt and slowly pulled upward while rotating:
 
-The boule is sliced into wafers roughly 775 μm thick with a wire saw. This introduces subsurface lattice damage that would cause unacceptable leakage and hinder subsequent epitaxy. The damage is removed in sequence: mechanical lapping flattens the gross bow, chemical etching dissolves the damaged crystalline layer, and chemical-mechanical planarization (CMP) achieves the final surface. CMP combines a slurry of abrasive particles (SiO₂ or CeO₂) with a chemical oxidant; the mechanical action removes softened material while the chemistry re-oxidizes the surface, producing sub-nanometer RMS roughness.
+- **Rotation** (typically 10–20 RPM) homogenizes the thermal field, preventing asymmetric heat flow from creating dopant striations in the grown crystal
+- **Pull rate** sets the axial temperature gradient at the interface, which controls ingot diameter: faster pull narrows the ingot because less time is available for lateral solidification
+- **Deliberate bulk doping** (e.g., boron for p-type substrates) is added to the melt now; this is the only practical point at which uniform bulk doping can be achieved
 
-Why does roughness matter at this scale? A 1 nm surface step is comparable to a few silicon lattice spacings (0.543 nm lattice constant). Any step that survives into the active region becomes a local variation in gate oxide thickness, which shifts the threshold voltage of the transistor sitting above it. CMP recurs throughout the process — not just on bare wafers — precisely because planarity is a prerequisite for the focus depth of the photolithography system.
+Modern fabs use 300mm diameter ingots, up to 2m long. The crystallographic quality established here — dislocation density, oxygen incorporation from the quartz crucible, vacancy concentration — sets a defect floor that no subsequent process step can improve, only degrade.
 
-### Oxidation: Growing the Gate Dielectric
+### Wafering: Slicing and Surface Preparation
 
-Exposing silicon to oxygen or steam at 800–1200 °C grows a thermal oxide:
+Diamond wire saws cut the ingot into wafers ~775μm thick (300mm wafers). The extra thickness beyond the ~100μm active device layer exists purely for mechanical rigidity during handling. Crystal orientation is not arbitrary:
 
-$$\text{Si} + \text{O}_2 \rightarrow \text{SiO}_2 \qquad \text{(dry)}$$
+- **(100) orientation** is standard for CMOS logic because Si–SiO₂ interface state density is lowest on this plane, minimizing threshold voltage scatter across a wafer
+- **KOH wet etching** is anisotropic: the etch rate ratio between (100) and (111) planes is approximately 100:1, enabling precise V-groove microstructures used in MEMS and fiber alignment
+- **Channel mobility** differs by orientation: (110) surface with ⟨110⟩ channel direction maximizes hole mobility for pMOS, which is why strained silicon and FinFET geometries exploit this
 
-$$\text{Si} + 2\text{H}_2\text{O} \rightarrow \text{SiO}_2 + 2\text{H}_2 \qquad \text{(wet)}$$
+After slicing, wafers undergo lapping (removes wire saw damage), chemical etching (removes lapping-induced sub-surface cracks), and CMP (chemical mechanical polishing) to achieve surface roughness below 0.1nm RMS. This flatness is not cosmetic — photolithography depth of focus at EUV wavelengths is on the order of tens of nanometers, so wafer bow or surface roughness directly causes out-of-focus exposure and feature size variation.
 
-The oxide grows *into* the silicon, consuming it at a ratio of approximately 0.44 nm of Si per 1 nm of SiO₂ grown. This is not incidental — it means the Si/SiO₂ interface forms inside previously undamaged crystal rather than at an exposed surface, producing the electrically clean interface that makes MOSFETs possible.
+### Oxidation: Growing $\text{SiO}_2$
 
-The Deal–Grove model describes oxidation kinetics. For thick oxides the growth rate is diffusion-limited and parabolic; for thin oxides it is reaction-rate-limited and linear:
+Silicon oxidizes in oxygen or steam:
 
-$$x_{ox}^2 + A\, x_{ox} = B(t + \tau)$$
+$$\text{Si} + \text{O}_2 \rightarrow \text{SiO}_2 \quad \text{(dry oxidation, slower, denser oxide)}$$
+$$\text{Si} + 2\text{H}_2\text{O} \rightarrow \text{SiO}_2 + 2\text{H}_2 \quad \text{(wet oxidation, faster, used for thick field oxide)}$$
 
-where $x_{ox}$ is oxide thickness, $B$ is the parabolic rate constant, $B/A$ is the linear rate constant, and $\tau$ accounts for any initial oxide. In practice, gate oxides are grown in the thin, linear regime with precise time control.
+A critical geometric fact: because oxygen must incorporate silicon atoms into the oxide, 46% of the final oxide thickness comes from consumed silicon and 54% grows above the original surface. A 10nm gate oxide physically etches 4.6nm into the substrate. This matters for planarity calculations across a wafer with regions of different oxide thickness.
 
-The physical limit of SiO₂ as a gate dielectric is set by quantum mechanics. For an oxide thinner than approximately 1.2 nm, the electron wavefunction tunnels directly from channel to gate, producing gate leakage current that grows roughly as:
+The Deal-Grove model describes growth kinetics. Growth transitions from linear (surface-reaction-limited, thin oxide regime) to parabolic (diffusion-limited, thick oxide regime):
 
-$$J_g \propto \exp\!\left(-2\kappa\, t_{ox}\right), \qquad \kappa = \frac{\sqrt{2m^* \phi_B}}{\hbar}$$
+$$x_{ox}^2 + A \cdot x_{ox} = B(t + \tau)$$
 
-where $t_{ox}$ is oxide thickness, $m^*$ is the electron effective mass in SiO₂, and $\phi_B \approx 3.1\,\text{eV}$ is the Si/SiO₂ tunnel barrier. At 45 nm node geometries, $t_{ox}$ reached this limit. The solution was high-κ dielectrics (hafnium oxide, HfO₂, κ ≈ 25 vs. SiO₂'s κ ≈ 3.9): a physically thicker film with the same capacitance per unit area as a thin SiO₂ layer, but an exponentially lower tunnel current because $t_{ox}$ in the exponent above refers to physical, not equivalent, thickness.
+where $\tau$ accounts for any oxide present before $t=0$. In the two limiting cases:
 
-The equivalent oxide thickness (EOT) quantifies this trade-off:
+$$x_{ox} = \frac{B}{A}(t + \tau) \quad \text{(linear, thin oxide)}$$
+$$x_{ox} = \sqrt{B \cdot t} \quad \text{(parabolic, thick oxide)}$$
 
-$$\text{EOT} = t_{high-\kappa} \cdot \frac{\kappa_{SiO_2}}{\kappa_{high-\kappa}}$$
+$B$ (the parabolic rate constant) is diffusion-limited and depends on oxidant diffusivity through the existing oxide. $B/A$ (the linear rate constant) is surface-reaction-limited and is higher for wet oxidation because $\text{H}_2\text{O}$ has a higher solubility in $\text{SiO}_2$ than $\text{O}_2$.
 
-A 3 nm HfO₂ layer has EOT ≈ $3 \times (3.9/25) \approx 0.47\,\text{nm}$ — capacitively equivalent to an SiO₂ film that would be far into the direct-tunneling regime.
+For modern gate dielectrics below ~2nm, thermally grown $\text{SiO}_2$ is replaced by high-$\kappa$ dielectrics (HfO₂, $\kappa \approx 25$ vs. $\kappa = 3.9$ for SiO₂). The motivation is purely electrical: gate capacitance per unit area is:
 
-### Deposition: Adding Material Without Consuming Silicon
+$$C_{ox} = \frac{\kappa \varepsilon_0}{t_{ox}}$$
 
-**Chemical Vapor Deposition (CVD)** brings precursor gases to the hot wafer surface where they react and leave a solid film. Polysilicon for gate electrodes is deposited by silane pyrolysis:
+A 2nm HfO₂ layer delivers the same $C_{ox}$ as a 0.31nm SiO₂ layer — physically impossible to grow — while being thick enough to block quantum mechanical tunneling leakage. This is why Intel's high-k/metal gate process starting at 45nm was not an incremental improvement but a materials substitution forced by physics.
 
-$$\text{SiH}_4 \xrightarrow{625\,°\text{C}} \text{Si} + 2\text{H}_2$$
+### Deposition: Adding Material Without Consuming Substrate
 
-Plasma-Enhanced CVD (PECVD) uses a glow discharge to dissociate precursors, driving reactions at 300–400 °C rather than 600+ °C. This matters because by the time metal interconnects are present, any temperature above roughly 400 °C causes aluminum to spike into silicon or copper to diffuse through barriers — destroying structures deposited in previous steps. The thermal budget is a cumulative constraint: every high-temperature step reshapes every dopant profile laid down earlier, so process integration is a multi-variable optimization, not a sequence of independent steps.
+**CVD (Chemical Vapor Deposition):** Gas-phase precursors decompose or react at the heated wafer surface. Polysilicon deposition for gate electrodes:
 
-**Atomic Layer Deposition (ALD)** achieves angstrom-level control by exploiting surface saturation. Each cycle exposes the surface to precursor A (which chemisorbs in a self-limiting monolayer), purges the chamber, then exposes to precursor B (which reacts only with the adsorbed A layer), and purges again. One cycle deposits one monolayer regardless of precursor partial pressure or exposure time variations. HfO₂ gate dielectrics and TiN barrier/electrode layers are deposited by ALD. At 2 nm nodes, where total film thicknesses are measured in a handful of atomic layers, ALD is not a premium option — it is the only method with sufficient thickness control.
+$$\text{SiH}_4 \xrightarrow{620\text{–}650°\text{C}} \text{Si} + 2\text{H}_2$$
 
-**Physical Vapor Deposition (PVD) / Sputtering** uses argon ion bombardment to knock atoms off a target material; they deposit on the wafer. PVD is used for bulk metal layers (tungsten plugs, copper seed layers, TiN liners) where conformality requirements are less stringent than for gate dielectrics.
+The deposition temperature determines whether the result is amorphous (below ~580°C) or polycrystalline (above). Gate polysilicon is deposited polycrystalline and subsequently doped; amorphous silicon is used where recrystallization will be driven later (e.g., thin-film transistors).
 
-### Photolithography: Wavelength, Numerical Aperture, and the Resolution Limit
+**ALD (Atomic Layer Deposition):** Two self-limiting half-reactions are cycled alternately. For HfO₂:
 
-Photolithography transfers a geometric pattern from a mask to the wafer surface. The sequence: spin-coat photoresist, expose through a mask via a projection lens system, develop the exposed resist, then etch or implant through the openings.
+1. Pulse HfCl₄ — surface hydroxyl groups react, depositing one monolayer of Hf, reaction halts when all surface sites are consumed
+2. Purge excess HfCl₄
+3. Pulse H₂O — oxidizes the Hf monolayer to HfO₂, reaction halts
+4. Purge
 
-The minimum resolvable half-pitch $L$ follows the Rayleigh criterion:
+Each cycle deposits ~0.1nm. ALD's value is conformality: because growth is self-limiting to surface chemistry rather than flux-dependent, film thickness is uniform over arbitrarily complex 3D geometries — essential for FinFETs and gate-all-around nanosheet devices where the gate must wrap around a thin silicon fin.
 
-$$L = k_1 \frac{\lambda}{\text{NA}}$$
+**PVD/Sputtering:** Argon plasma ions bombard a metal target (W, Cu, Co, TiN), ejecting atoms by momentum transfer. Used for barrier layers (TiN prevents Cu diffusion into dielectric) and seed layers for subsequent electroplating. PVD is line-of-sight and non-conformal, which limits its use as interconnect geometries shrink.
 
-where $\lambda$ is the exposure wavelength, NA is the numerical aperture of the projection lens ($\text{NA} = n \sin\theta$, where $n$ is the refractive index of the immersion medium), and $k_1$ is a process factor bounded below
+### Photolithography: Pattern Transfer and the Resolution Limit
+
+Photolithography transfers a mask pattern to a resist-coated wafer. Sequence:
+
+1. **Spin-coat** photoresist (a photoactive polymer, typically 50–200nm thick at leading nodes)
+2. **Expose** through a chrome-on-quartz mask using a lens that demagnifies the pattern 4× onto the wafer
+3. **Develop** — aqueous base developer dissolves exposed positive resist or unexposed negative resist
+4. **Etch or implant** through the opened resist window
+5. **Strip** resist (O₂ plasma + wet chemistry)
+
+Minimum printable feature size is diff

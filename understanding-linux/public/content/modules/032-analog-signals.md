@@ -12,125 +12,103 @@ resources:
 
 ## Why This Matters
 
-Digital systems live inside an analog world. Every clock signal has rise times governed by bandwidth. Every ADC samples a continuous voltage. Every USB cable is a transmission line with frequency-dependent loss. If you don't understand how signals behave in the frequency domain — what bandwidth means, why filters exist, what happens when you violate sampling constraints — you will misread oscilloscope traces, misinterpret noise floors, and write kernel drivers that silently corrupt data.
-
-The Linux kernel's ALSA audio subsystem, the IIO (Industrial I/O) ADC framework, and `libsigrok`-backed software-defined radio all rely on these concepts for correctness. This module gives you the substrate to reason about them precisely.
+Digital systems live inside analog physics. Every wire has capacitance, every trace has inductance, and every signal you care about — audio, RF, sensor data, clock edges — is a voltage varying continuously in time. When you read from `/dev/snd` or `/dev/i2c-0`, the kernel hands you integers that were carved out of a continuous waveform by a sampling process. If you don't understand frequency content, bandwidth, and filtering, you cannot reason about why a microphone sounds muffled after a misconfigured ALSA period size, why a high-speed serial link fails at 1 GHz but works at 100 MHz, why ADC readings are noisy, or how a PLL stabilizes a CPU clock. The math here is not decoration — it is the actual mechanism by which hardware works or fails.
 
 ---
 
 ## Core Concepts
 
-### Waveforms: Signals as Functions of Time
+### Waveforms and the Time Domain
 
-A waveform is a voltage expressed as a function of time: $v(t)$. The sinusoid is fundamental because it is the eigenfunction of linear time-invariant (LTI) systems — pass a sine through any linear circuit and the output is a sine at the same frequency, only scaled and phase-shifted. No other waveform shape has this property, which is exactly why frequency-domain analysis is so powerful.
+A waveform is a function $v(t)$ — voltage as a function of time. A pure sine wave at frequency $f_0$ is:
 
-$$v(t) = A \sin(2\pi f t + \phi)$$
+$$v(t) = A \sin(2\pi f_0 t + \phi)$$
 
-where $A$ is amplitude (V), $f$ is frequency (Hz), $\phi$ is phase (radians).
+where $A$ is amplitude in volts, $f_0$ is frequency in Hz, and $\phi$ is phase in radians. This is the fundamental building block because Fourier's theorem guarantees that *any* periodic waveform decomposes into a sum of sinusoids. Circuits respond linearly to each sinusoidal component independently, so decomposing a signal into sinusoids lets you predict what any linear circuit does to it.
 
-Every periodic waveform is a sum of sinusoids — not an approximation, but an exact decomposition. A square wave with fundamental $f_0$ and amplitude $A$:
+The waveforms that fall naturally out of RC charging curves and digital comparator output — square waves, triangle waves, sawtooth waves — are not single tones. They contain many simultaneous frequency components. Sine waves require deliberate circuit design (oscillators with feedback and amplitude control) but are essential for clean frequency synthesis, audio, and RF work precisely because they contain only one frequency component.
 
-$$v(t) = \frac{4A}{\pi} \sum_{k=0}^{\infty} \frac{1}{2k+1} \sin\!\bigl(2\pi (2k+1) f_0 t\bigr)$$
+### The Frequency Domain
 
-The series never terminates. A perfect square wave requires infinite bandwidth. The square waves on your SPI bus are rounded precisely because harmonics above the system bandwidth are attenuated — the higher the bit rate relative to bandwidth, the worse the distortion. A $10\ \text{MHz}$ SPI clock needs clean content up through at least the 5th harmonic ($50\ \text{MHz}$) to preserve acceptable edge timing.
-
-### Frequency Domain: The Spectrum of a Signal
-
-The Fourier Transform answers a different question than the time domain. Rather than "what is the voltage at time $t$?", it asks "what amplitude and phase does each frequency component carry?"
+Instead of asking "what is the voltage at time $t$?", the frequency domain asks "how much energy exists at frequency $f$?". The Fourier transform converts between these views:
 
 $$V(f) = \int_{-\infty}^{\infty} v(t)\, e^{-j2\pi f t}\, dt$$
 
-$V(f)$ is complex. Its magnitude $|V(f)|$ is the **amplitude spectrum**. Key examples:
+The complex exponential $e^{-j2\pi ft} = \cos(2\pi ft) - j\sin(2\pi ft)$ acts as a correlation kernel: $V(f)$ is large when $v(t)$ oscillates coherently at frequency $f$, and small when it does not. For a pure sine wave, $V(f)$ is zero everywhere except at $\pm f_0$. For a square wave with fundamental $f_0$, the Fourier series is:
 
-- A pure $1\ \text{kHz}$ sine: a single spike at $1\ \text{kHz}$.
-- A square wave at $f_0$: spikes at $f_0, 3f_0, 5f_0, \ldots$ (odd harmonics), each decaying as $1/(2k+1)$.
-- A narrow pulse of width $\tau$: a $\text{sinc}$ spectrum with first null at $1/\tau$, spreading energy across a bandwidth $\sim 1/\tau$. This is why fast digital edges cause EMI — a $1\ \text{ns}$ edge has spectral content out to $\sim 1\ \text{GHz}$.
+$$v(t) = \frac{4A}{\pi} \sum_{n=1,3,5,...} \frac{1}{n} \sin(2\pi n f_0 t)$$
 
-For sampled data, the Discrete Fourier Transform (DFT) — computed via the FFT algorithm in $O(N \log N)$ rather than $O(N^2)$ — performs the same decomposition. ALSA's period/buffer management, the IIO subsystem's sample rate configuration, and every DSP filter in `PipeWire` operate in this framework.
+Components exist at $f_0$, $3f_0$, $5f_0$, ... with amplitudes falling as $1/n$. This is why a square-wave clock signal radiates EMI across a wide spectrum: a 100 MHz clock contains significant energy at 300 MHz, 500 MHz, 700 MHz, and beyond. Faster edges (shorter rise times) push that energy to even higher harmonics — this is the direct causal link between edge rate and EMI.
 
-### Bandwidth: The Frequency Range a System Passes
+The **power spectral density** (PSD) describes how noise or signal power is distributed across frequency, in units of $\text{V}^2/\text{Hz}$ or equivalently $\text{V}/\sqrt{\text{Hz}}$. White noise has a flat PSD: equal power per hertz at all frequencies, because its autocorrelation is a delta function. Pink noise ($1/f$ noise) has PSD that rises as frequency decreases — this is dominant in semiconductor devices at low frequencies and is why op-amp noise floors rise below a few hundred Hz.
 
-Bandwidth ($BW$) is the range of frequencies a system transmits without unacceptable attenuation. The standard definition is the **−3 dB bandwidth**: the frequency at which output power drops to half its passband value, equivalently where amplitude drops to $1/\sqrt{2} \approx 0.707$.
+### Bandwidth
 
-$$f_c = \frac{1}{2\pi RC} \qquad \text{(first-order RC)}$$
+Bandwidth is the range of frequencies a system passes, processes, or represents. For a simple RC low-pass filter, the $-3\,\text{dB}$ bandwidth is:
 
-Bandwidth has three distinct meanings that must not be conflated:
+$$f_{3\text{dB}} = \frac{1}{2\pi RC}$$
 
-| Context | Meaning |
-|---|---|
-| **Signal bandwidth** | Frequency span occupied by the signal |
-| **Channel bandwidth** | Maximum frequency range the medium passes without distortion |
-| **Noise bandwidth** | Frequency range over which noise power is integrated |
+At this frequency, output amplitude is $1/\sqrt{2} \approx 0.707$ of the input amplitude, and output *power* is half the input power. The $-3\,\text{dB}$ figure comes from:
 
-If signal bandwidth exceeds channel bandwidth, high-frequency components are lost — the signal is distorted in shape, not just amplitude. If noise bandwidth is unnecessarily wide (e.g., an ADC input with no anti-aliasing filter), excess noise power aliases into the signal band and degrades SNR irrecoverably.
+$$20 \log_{10}\!\left(\frac{1}{\sqrt{2}}\right) = -10 \log_{10}(2) \approx -3.01\,\text{dB}$$
 
-### Filtering: Shaping the Spectrum Deliberately
+Bandwidth constrains noise: since thermal noise power is proportional to bandwidth, **halving bandwidth halves noise power**, or equivalently reduces RMS noise voltage by $1/\sqrt{2}$. This is a hard physical bound — no amount of amplification recovers a signal already buried by in-band noise.
 
-A filter passes some frequencies and attenuates others. The four types:
+### Filtering
 
-| Type | Passes | Attenuates |
-|------|--------|------------|
-| Lowpass | Below $f_c$ | Above $f_c$ |
-| Highpass | Above $f_c$ | Below $f_c$ |
-| Bandpass | Near $f_0$ | Far from $f_0$ |
-| Notch (band-reject) | Far from $f_0$ | Near $f_0$ |
+A filter is a frequency-selective network characterized by its transfer function $H(f) = V_{\text{out}}(f) / V_{\text{in}}(f)$. The four canonical types:
 
-Filters exist because noise is broadband and signals are not. A lowpass filter before an ADC is not optional decoration — it prevents frequencies above the Nyquist limit ($f_s/2$) from aliasing into the signal band. Once aliased, those frequency components are indistinguishable from legitimate signal; no amount of digital post-processing can remove them. This is the function of the **anti-aliasing filter** (AAF), and its cutoff must satisfy $f_c \leq f_s/2$.
+| Type | Passes | Blocks |
+|---|---|---|
+| Low-pass | $f < f_c$ | $f > f_c$ |
+| High-pass | $f > f_c$ | $f < f_c$ |
+| Band-pass | $\|f - f_0\| < B/2$ | Everything outside the band |
+| Band-stop (notch) | Everything outside the band | $\|f - f_0\| < B/2$ |
 
-A sharper filter (steeper rolloff past $f_c$) requires higher order — more poles — which introduces increasing group delay and phase nonlinearity. Pulses passed through a high-order filter arrive distorted in time even when their frequency-domain amplitudes are preserved. This matters in data acquisition, audio, and any system where pulse shape carries information.
+A single RC stage gives a $-20\,\text{dB/decade}$ rolloff above $f_{3\text{dB}}$. Cascading $n$ identical buffered RC stages increases rolloff to $-20n\,\text{dB/decade}$, but the actual $-3\,\text{dB}$ frequency shifts downward. The corrected cutoff is:
+
+$$f_{3\text{dB}}(n) = f_{3\text{dB}}(1) \cdot \sqrt{2^{1/n} - 1}$$
+
+For $n = 4$ stages, $\sqrt{2^{1/4}-1} \approx 0.435$, so the actual cutoff is less than half what each individual stage provides. This is why active filter topologies (Butterworth, Chebyshev, Bessel) are designed as a unit rather than stacked identical stages — they place poles at specific locations in the complex plane to achieve a target response while compensating for this frequency shift.
 
 ---
 
 ## How It Works
 
-### The RC Lowpass Filter in Detail
+### The RC Low-Pass Filter in Detail
 
-The capacitor's impedance is frequency-dependent:
+Resistor $R$ in series, capacitor $C$ to ground, output taken across $C$. The capacitor's impedance is $Z_C = 1/(j2\pi f C)$. The circuit is a voltage divider:
 
-$$Z_C = \frac{1}{j2\pi f C}$$
+$$H(f) = \frac{Z_C}{R + Z_C} = \frac{1}{1 + j2\pi f RC} = \frac{1}{1 + j(f/f_{3\text{dB}})}$$
 
-Because impedance decreases with frequency, the capacitor shunts higher frequencies to ground more effectively. The transfer function (output/input ratio as a function of frequency) is a voltage divider:
+The magnitude and phase are:
 
-$$H(f) = \frac{Z_C}{R + Z_C} = \frac{1}{1 + j(f/f_c)}, \qquad f_c = \frac{1}{2\pi RC}$$
+$$|H(f)| = \frac{1}{\sqrt{1 + (f/f_{3\text{dB}})^2}}, \qquad \angle H(f) = -\arctan\!\left(\frac{f}{f_{3\text{dB}}}\right)$$
 
-The magnitude and phase responses:
+The causal mechanism: at high $f$, $Z_C \to 0$, shorting the output node to ground. At low $f$, $Z_C \to \infty$, making the capacitor an open circuit through which no current flows across $R$, so $V_{\text{out}} = V_{\text{in}}$. The $-45°$ phase at exactly $f_{3\text{dB}}$ is a direct consequence of $R$ and $Z_C$ having equal magnitude there.
 
-$$|H(f)| = \frac{1}{\sqrt{1 + (f/f_c)^2}}, \qquad \angle H(f) = -\arctan(f/f_c)$$
+The time-domain view: the same circuit is characterized by its time constant $\tau = RC$. A step input charges the capacitor as:
 
-Checkpoints:
+$$v_{\text{out}}(t) = V_{\text{step}} \left(1 - e^{-t/\tau}\right)$$
 
-| $f/f_c$ | $|H|$ | dB |
-|---|---|---|
-| 0.1 | 0.995 | −0.04 |
-| 1.0 | 0.707 | −3.01 |
-| 10 | 0.0995 | −20.0 |
-| 100 | 0.00999 | −40.0 |
+The $10\%$–$90\%$ rise time is $t_r \approx 2.2\tau = 2.2RC$. This is directly linked to bandwidth:
 
-Above $f_c$, attenuation increases at exactly **−20 dB/decade** (equivalently −6 dB/octave). This is first-order rolloff. To compute the attenuation at any frequency:
+$$t_r \approx \frac{0.35}{f_{3\text{dB}}}$$
 
-$$\text{Attenuation (dB)} = -20 \log_{10}\!\sqrt{1 + (f/f_c)^2} \approx -20\log_{10}(f/f_c) \quad \text{for } f \gg f_c$$
+This $0.35 / f_{3\text{dB}}$ relationship (specific to a single-pole system) is used constantly in oscilloscope measurements: an oscilloscope with $f_{3\text{dB}} = 100\,\text{MHz}$ cannot accurately display rise times faster than $\approx 3.5\,\text{ns}$.
 
-For $n$ buffered identical RC sections, the composite −3 dB frequency is not $f_c$ but:
+### Thermal Noise and Bandwidth — A Concrete Example
 
-$$f_{3\text{dB}}(n) = f_c \cdot \sqrt{2^{1/n} - 1}$$
+Thermal (Johnson–Nyquist) noise arises from random electron motion in any resistor. The noise voltage spectral density is:
 
-For $n=2$: $f_{3\text{dB}} \approx 0.644\, f_c$. Each stage must be designed to a *higher* individual cutoff to hit the target composite cutoff. The rolloff steepens to $-20n\ \text{dB/decade}$, but phase shift grows — each pole contributes up to $-90°$ at high frequencies, so a 4-pole filter can produce $-360°$ of phase shift, which is relevant for stability in feedback systems.
+$$e_n = \sqrt{4 k_B T R} \quad [\text{V}/\sqrt{\text{Hz}}]$$
 
-### Decibels: The Unit of Attenuation
+where $k_B = 1.38 \times 10^{-23}\,\text{J/K}$ and $T$ is temperature in kelvin. This is white noise — flat across all frequencies. The total RMS noise over bandwidth $B$ is:
 
-Power and voltage ratios span many orders of magnitude; dB collapses them to a manageable scale.
+$$v_{n,\text{rms}} = e_n \sqrt{B} = \sqrt{4 k_B T R B}$$
 
-$$\text{dB (power)} = 10 \log_{10}\!\left(\frac{P_2}{P_1}\right), \qquad \text{dB (voltage)} = 20 \log_{10}\!\left(\frac{V_2}{V_1}\right)$$
+At $T = 300\,\text{K}$, $R = 1\,\text{k}\Omega$, $B = 10\,\text{kHz}$:
 
-The factor of 20 for voltage follows directly from $P \propto V^2$: $10\log_{10}(V^2) = 20\log_{10}(V)$. Using 10 for a voltage ratio is a common and consequential error.
+$$v_{n,\text{rms}} = \sqrt{4 \times 1.38\times10^{-23} \times 300 \times 10^3 \times 10^4} = \sqrt{1.656\times10^{-13}} \approx 12.9\,\text{nV}_{\text{rms}}$$
 
-| dB | Voltage ratio | Power ratio | Meaning |
-|----|---------------|-------------|---------|
-| 0 | 1.000 | 1.000 | No change |
-| −3 | 0.707 | 0.500 | Half power |
-| −6 | 0.501 | 0.251 | ~Half voltage |
-| −20 | 0.100 | 0.010 | Tenth of voltage |
-| −40 | 0.010 | 0.0001 | Hundredth of voltage |
-| −60 | 0.001 | $10^{-6}$ | Thousandth of voltage |
-
-dBV and dBu are absolute references (0 dBV = 1 V RMS; 0 d
+That is 12.9 nV over a 10

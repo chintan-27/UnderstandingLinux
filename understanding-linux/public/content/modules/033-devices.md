@@ -12,122 +12,116 @@ resources:
 
 ## Why This Matters
 
-Every kernel driver that configures a GPIO pin, sets a clock frequency, or manages a power rail is commanding circuits built from a handful of primitive components. When a peripheral fails to enumerate on USB because a decoupling capacitor was omitted from the board, or a system crashes under load because of voltage droop on a power rail, the failure has a direct physical cause traceable to component behavior. Reading a datasheet, interpreting a driver's register writes, or diagnosing a hardware fault requires understanding what these components actually do — not just their symbols.
+Every piece of hardware your Linux kernel talks to is built from a small set of primitive electronic components. When a kernel driver writes to a memory-mapped register to configure a GPIO pin, it is ultimately controlling a gate voltage on a MOSFET. When an ADC driver reads a conversion result, that result encodes the ratio of a sensor's output voltage to a reference — set by a resistor divider. When a USB controller misbehaves only at high data rates, the cause is often parasitic inductance on a PCB trace, not a software bug.
+
+Driver code manipulates abstractions. This module explains what those abstractions sit on top of — so when hardware misbehaves, you can reason about the physics instead of guessing.
 
 ---
 
 ## Core Concepts
 
-### Resistors: Constraining the Voltage-Current Relationship
+### Resistors
+
+A resistor enforces a linear relationship between voltage and current:
 
 $$V = IR$$
 
-A resistor enforces a linear, instantaneous relationship between voltage and current. It dissipates energy as heat — it stores nothing. The two directions of application are identical mathematically: given a supply voltage and a desired current, choose $R = V/I$; given a current source and a desired voltage, the same equation applies. Resistors in series add; in parallel:
+Resistance is measured in ohms (Ω). In series, resistances add:
+
+$$R_{\text{series}} = R_1 + R_2 + \cdots + R_n$$
+
+In parallel, conductances add (conductance $G = 1/R$), giving:
 
 $$R_{\text{parallel}} = \frac{R_1 R_2}{R_1 + R_2}$$
 
-Real resistors deviate from ideal behavior in three ways that matter to hardware debugging: parasitic inductance (a wire-wound resistor looks like an inductor at high frequency), temperature coefficient (resistance drifts with heat, which matters for precision analog circuits), and excess noise in carbon-composition types (which matters for low-noise amplifier design). Metal-film resistors are preferred in precision circuits for their low tempco and low noise.
+**Voltage divider:** Two resistors in series from $V_{DD}$ to GND produce an output at the midpoint:
 
-### Capacitors: Opposing Voltage Change
+$$V_{\text{out}} = V_{DD} \cdot \frac{R_2}{R_1 + R_2}$$
 
-A capacitor stores charge on two conductors separated by a dielectric. The governing relationship is not $Q = CV$ but its time derivative:
+This is how a pull-up resistor works: $R_1$ connects the signal line to $V_{DD}$; when no device is driving the line, $R_2$ is the device's input impedance (very large), so $V_{\text{out}} \approx V_{DD}$. When a device pulls the line to GND, $R_2 \to 0$ and $V_{\text{out}} \to 0$. The pull-up resistor value is a trade-off: smaller values pull the line high faster (lower $RC$ time constant) but waste more power when driven low.
+
+**Non-ideal behavior:** Above roughly 100 MHz, even a small resistor body acts as a series inductor ($\sim 1\text{–}5\text{ nH}$ for a surface-mount component). The impedance becomes $Z = \sqrt{R^2 + (\omega L)^2}$ rather than just $R$. This is why a 100 Ω termination resistor on a 1 GHz signal line may not actually present 100 Ω to the signal.
+
+Resistors also generate **Johnson-Nyquist noise** — thermal noise with spectral density:
+
+$$S_V = 4 k_B T R \quad [\text{V}^2/\text{Hz}]$$
+
+A 1 kΩ resistor at room temperature generates $\approx 4\text{ nV}/\sqrt{\text{Hz}}$. Irrelevant for digital logic; critical when a kernel driver reads a low-level ADC channel from a high-impedance sensor.
+
+### Capacitors
+
+A capacitor stores energy in the electric field between two conductors separated by a dielectric. Charge and voltage are related by:
+
+$$Q = CV$$
+
+Taking the time derivative gives the defining circuit relationship:
 
 $$I = C \frac{dV}{dt}$$
 
-This is the operative equation. Current flows through a capacitor only when voltage is changing. Zero $dV/dt$ means zero current — DC is blocked. Large $dV/dt$ means large current. The practical consequences:
+This equation explains every important capacitor behavior: **current flows only when voltage is changing**. At DC steady state, $dV/dt = 0$, so no current flows — the capacitor is an open circuit. At high frequency, $dV/dt$ is large, so large current flows — the capacitor is nearly a short circuit. The impedance of a capacitor is:
 
-- **Decoupling**: A logic gate switching state demands a sudden current pulse. The PCB power trace has real inductance; from $V = L\,dI/dt$, a fast current step induces a voltage spike. A capacitor placed physically close to the supply pin supplies that pulse locally, from stored charge, before the trace inductance can generate a spike. The key word is *locally* — a capacitor on the far side of the board cannot respond fast enough.
-- **Filtering**: High-frequency noise on a power rail sees a low-impedance path to ground through the capacitor; DC sees an open circuit.
-- **Timing**: Charging at a known rate (constant $I$, linear $V$ rise) or through a resistor (exponential rise) creates a predictable delay.
+$$Z_C = \frac{1}{j\omega C}$$
 
-Practical values span many decades:
+At $f = 1\text{ MHz}$, a 100 nF capacitor has $|Z_C| = \frac{1}{2\pi \times 10^6 \times 10^{-7}} \approx 1.6\text{ Ω}$. At 1 kHz, the same capacitor has $|Z_C| \approx 1.6\text{ kΩ}$. This frequency-dependent impedance is the mechanism behind every filtering application.
 
-| Unit | Symbol | Value |
-|------|--------|-------|
-| Microfarad | $\mu\text{F}$ | $10^{-6}\ \text{F}$ |
-| Nanofarad | $\text{nF}$ | $10^{-9}\ \text{F}$ |
-| Picofarad | $\text{pF}$ | $10^{-12}\ \text{F}$ |
+**Bypass (decoupling) capacitors** placed physically adjacent to a chip's power pin supply instantaneous current during switching transients. The reason for proximity is that every millimeter of PCB trace has inductance ($\approx 0.7\text{–}1\text{ nH/mm}$); a remote capacitor is isolated from the chip by that inductance during the transient, so it cannot respond fast enough. See the quantitative example in the "How It Works" section.
 
-**Worked example.** If $1\ \text{mA}$ is forced into a $1\ \mu\text{F}$ capacitor:
+Capacitors combine as the inverse of resistors:
 
-$$\frac{dV}{dt} = \frac{I}{C} = \frac{10^{-3}}{10^{-6}} = 1000\ \text{V/s}$$
+$$C_{\text{series}} = \frac{C_1 C_2}{C_1 + C_2}, \qquad C_{\text{parallel}} = C_1 + C_2$$
 
-A $10\ \text{ms}$ current pulse raises the voltage by $10\ \text{V}$. This calculation reappears constantly — in oscilloscope probing, in power supply design, in estimating how long a hold-up capacitor sustains a circuit during a brown-out.
+Parallel capacitors add because you are effectively increasing the plate area; that is why you see multiple bypass capacitors of different values (100 nF, 10 μF) in parallel on a power rail — each handles a different frequency decade.
 
-### Inductors: Opposing Current Change
+### Inductors
+
+An inductor stores energy in the magnetic field surrounding a current-carrying conductor. The defining relationship is dual to the capacitor:
 
 $$V = L \frac{dI}{dt}$$
 
-The dual of the capacitor equation. An inductor resists changes in current: it passes steady DC with only resistive loss, but opposes any rapid change. This is why you cannot abruptly disconnect an inductor from its drive circuit — the collapsing magnetic field demands current continuity and generates a large voltage spike ($V = L\,dI/dt$ with a very large $dI/dt$). This spike destroys unprotected switching transistors; a freewheeling diode across the inductor provides a current path to absorb it.
+Voltage appears across an inductor only when current is changing. An inductor is a short circuit at DC and an open circuit at very high frequency. Impedance:
 
-Inductors appear in buck/boost converters (where the inductor is the energy transfer element), in EMI filters (series inductor blocks high-frequency noise from escaping a power supply), and in RF circuits.
+$$Z_L = j\omega L$$
 
-### Diodes: Asymmetric Conduction and Protection
+At $f = 100\text{ MHz}$, a 10 nH inductor has $|Z_L| = 2\pi \times 10^8 \times 10^{-8} \approx 6.3\text{ Ω}$. This is the parasitic inductance of a few centimeters of PCB trace — large enough to cause a substantial voltage transient during fast switching.
 
-A silicon diode conducts forward (anode to cathode) with a voltage drop of roughly $0.6$–$0.7\ \text{V}$ and blocks reverse. The forward drop is not a fixed value — it decreases with temperature (approximately $-2\ \text{mV/°C}$) and increases with current. Schottky diodes have a lower forward drop ($\approx 0.2$–$0.3\ \text{V}$) and faster switching; they appear in high-frequency power converters and as protection diodes on logic inputs.
+**In power supplies:** Switching regulators (buck, boost) use an inductor to transfer energy efficiently. During the "on" phase, current ramps up through the inductor storing energy; during the "off" phase, the inductor releases that energy to the output. The average output voltage is set by the duty cycle $D$:
 
-Zener diodes conduct in reverse at a precise breakdown voltage. Placed gate-to-source on a MOSFET, a Zener clamps $V_{GS}$ and protects the gate oxide from overvoltage transients, which otherwise destroy it irreversibly. Placed on an input pin, a Zener clamps electrostatic discharge (ESD) spikes.
+$$V_{\text{out}} = D \cdot V_{\text{in}} \quad \text{(buck converter)}$$
 
-### BJTs: Current-Controlled Gain and the Thermal Runaway Mechanism
+The kernel's `regulator` subsystem (under `drivers/regulator/`) controls these switching regulators via I²C or SPI; the inductor is what makes the conversion efficient rather than burning the voltage difference as heat (as a linear regulator does).
 
-A Bipolar Junction Transistor (BJT) has base, collector, and emitter. In the active region:
-
-$$I_C = \beta \cdot I_B$$
-
-where $\beta$ (also $h_{FE}$) is typically 50–500. The base-emitter junction behaves like a forward-biased diode: $V_{BE} \approx 0.6\ \text{V}$.
-
-The critical failure mode: BJT collector current has a **positive temperature coefficient** — roughly $+9\%/°C$. If one BJT in a parallel array runs slightly hotter than its neighbors, it draws more current, dissipates more power, heats further, and draws still more current. This thermal runaway is self-reinforcing and destroys the device. The fix is **emitter degeneration resistors** (small resistors in series with each emitter): as current through a device increases, the voltage drop across its emitter resistor increases, reducing $V_{BE}$, which reduces $I_B$, which reduces $I_C$ — a local negative feedback that forces equal current sharing.
-
-### MOSFETs: Voltage-Controlled Switches and the Tempco Inversion
-
-A MOSFET's gate is isolated from the channel by a thin oxide layer ($\text{SiO}_2$, typically $5$–$50\ \text{nm}$ thick). It draws virtually no DC gate current, which means:
-
-1. The drive circuit needs to supply only enough charge to charge gate capacitance, not a sustained current.
-2. The gate oxide is fragile. Exceeding the rated $V_{GS}$ — even briefly — ruptures it permanently.
-
-The gate-source voltage $V_{GS}$ controls drain current $I_D$. In saturation:
-
-$$I_D = \frac{1}{2} \mu_n C_{ox} \frac{W}{L} (V_{GS} - V_{th})^2$$
-
-The relevant parameter for switching power is $R_{DS(on)}$, the on-state drain-source resistance, which appears in datasheets and determines conduction loss:
-
-$$P_{\text{conduction}} = I_D^2 \cdot R_{DS(on)}$$
-
-**Temperature coefficient inversion.** At high drain currents (the regime of power switching), MOSFET $I_D$ has a **negative temperature coefficient**: higher temperature reduces carrier mobility, which increases $R_{DS(on)}$, which reduces current. This means parallel MOSFETs self-balance — a hotter device conducts less and cools down. No ballasting resistors needed. However, at low drain currents in the linear region, the tempco inverts to positive, so MOSFETs operating as linear pass elements (e.g., a linear regulator) can still suffer thermal runaway.
-
-### Oscillators: Gain Plus Frequency-Selective Feedback
-
-An oscillator requires two things: **gain** (from an active device) and **frequency-selective positive feedback** (from an LC tank or crystal). An LC tank oscillates because inductor and capacitor exchange energy: charge stored on the capacitor drives current through the inductor, the collapsing magnetic field recharges the capacitor in reverse polarity, and the cycle repeats at:
+**LC resonance:** An inductor and capacitor in a circuit exchange energy at:
 
 $$f_0 = \frac{1}{2\pi\sqrt{LC}}$$
 
-Real LC tanks lose energy to resistance, so oscillation damps out. The active device replenishes energy each cycle. A crystal replaces the LC tank with the mechanical resonance of quartz, which has a quality factor ($Q$) of $10^4$–$10^6$ — orders of magnitude higher than any practical LC circuit. This is why crystal oscillators achieve frequency stabilities of $\pm 20\ \text{ppm}$ or better, which your CPU reference clock requires.
+A 10 μH inductor and 100 nF capacitor resonate at $f_0 = \frac{1}{2\pi\sqrt{10^{-5} \times 10^{-7}}} \approx 159\text{ kHz}$. Signals at this frequency see a very high impedance (parallel LC) or very low impedance (series LC). Power supply designers choose $L$ and $C$ to push this resonance well above the switching frequency noise they want to filter.
 
----
+### Diodes
 
-## How It Works
+A diode passes current in one direction (anode to cathode, forward-biased) and blocks it in the other. The Shockley equation gives the full behavior:
 
-### RC Time Constant
+$$I = I_S \left( e^{V / n V_T} - 1 \right)$$
 
-Series R and C driven by a voltage step:
+where $I_S$ is the reverse saturation current ($\sim\text{fA}$ to $\text{nA}$), $n$ is the ideality factor (1–2), and $V_T = k_B T / q \approx 26\text{ mV}$ at room temperature. In practice: a silicon diode conducts significantly above $\approx 0.6\text{–}0.7\text{ V}$ forward bias and blocks in reverse up to its breakdown voltage.
 
-```
-          R
- Vin ----/\/\/----+---- Vout
-                  |
-                  C
-                  |
-                 GND
-```
+**Zener diode:** Engineered with a precise reverse breakdown voltage $V_Z$ (1–200 V range). Below $V_Z$, it blocks; at $V_Z$, it conducts in reverse at nearly constant voltage regardless of current. Use case: clamping a MOSFET gate signal to a safe voltage, or providing a voltage reference. The kernel's `hwmon` subsystem reads voltages from supervisor ICs that use Zener-based references.
 
-The capacitor charges exponentially:
+**Schottky diode:** Metal-semiconductor junction; lower forward voltage ($\approx 0.2\text{–}0.4\text{ V}$) and faster switching than silicon PN diodes. Used in power rectifiers and as clamp diodes on logic signals.
 
-$$V(t) = V_{\text{final}}\left(1 - e^{-t/\tau}\right), \quad \tau = RC$$
+### BJTs (Bipolar Junction Transistors)
 
-After one $\tau$: $63\%$ charged. After $5\tau$: $>99\%$ charged — effectively complete.
+A BJT is a current-controlled device. In the active region:
 
-With $R = 10\ \text{k}\Omega$, $C = 100\ \text{nF}$:
+$$I_C = \beta \cdot I_B, \qquad I_E = I_C + I_B = (\beta + 1) I_B$$
 
-$$\tau = 10^4 \cdot 10^{-7} = 1\ \text{ms}$$
+$\beta$ (also written $h_{FE}$) is the current gain, typically 100–300. The base–emitter junction is a forward-biased diode ($V_{BE} \approx 0.6\text{ V}$). Collector current also has an exponential dependence on $V_{BE}$:
 
-The RC circuit is nearly universal: debounce filters on GPIO inputs, pull-up networks on I²C lines (which set the maximum clock rate via $\tau = R_{\text
+$$I_C = I_S e^{V_{BE}/V_T}$$
+
+This means $I_C$ approximately doubles every 9°C at fixed $V_{BE}$. **Thermal runaway** in parallel BJTs: the hotter device has lower $V_{BE}$ for the same current, draws more current, heats further — a positive-feedback loop that destroys the device. The fix is emitter-ballast resistors that drop voltage proportional to current, introducing negative feedback. This is not just a power electronics concern: any BJT-based driver stage (e.g., driving an LED array or a relay coil from a GPIO) must respect this property.
+
+BJTs are less common in new digital designs than MOSFETs but remain in: audio circuits, high-voltage switching (some SiC/GaN drivers), and as part of BiCMOS processes used in RF ICs.
+
+### MOSFETs
+
+A MOSFET is a

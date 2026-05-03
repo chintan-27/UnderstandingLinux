@@ -12,117 +12,128 @@ resources:
 
 ## Why This Matters
 
-Every real circuit contains signals that change over time, and the moment you have change, you have components that *oppose* that change. Capacitors resist changes in voltage; inductors resist changes in current. Without understanding this, you cannot reason about why a power supply takes time to stabilize after you flip a switch, why audio signals are blocked or passed at certain frequencies, why a CPU power rail needs dozens of capacitors scattered across a motherboard, or why switching power converters (which run everything from your phone charger to server rack PSUs) work at all.
+Every circuit that does something interesting in time depends on components that store energy. Without capacitors and inductors, you have purely resistive circuits: instantaneous, memoryless, incapable of oscillation or filtering. A CPU's power rail would collapse the moment a transistor switched because the power supply cannot respond in nanoseconds — only a local capacitor can. A switching regulator couldn't transfer energy without an inductor to accumulate it during the on-phase and release it during the off-phase. A radio couldn't select a frequency without a resonant tank circuit.
 
-The Linux kernel manages hardware shaped by these behaviors at every level: GPIO transition timing is governed by RC time constants on the line, ADC inputs require RC anti-aliasing filters or sampled data is meaningless, DRAM refresh depends on capacitor charge retention, and every buck converter powering your SoC relies on an inductor to transfer energy without resistive loss. These are not analogies — they are direct dependencies.
+Inside the Linux kernel, these effects are not abstractions. The reason `CONFIG_HZ` is bounded, the reason USB high-speed requires controlled-impedance traces, the reason a PCIe lane has equalization — all of it traces back to capacitive and inductive behavior in real conductors. Knowing this lets you reason from first principles when hardware misbehaves, not just pattern-match against a checklist.
 
 ---
 
 ## Core Concepts
 
-### Capacitors Store Energy in an Electric Field
+### Capacitors: Electric Field Storage
 
-A capacitor is two conductors separated by a dielectric. Applying a voltage drives charge onto the plates, creating an electric field between them:
+A capacitor stores energy in the electric field between two conductors separated by a dielectric. Charge accumulates on the plates as current flows; the relationship between that current and the resulting voltage change is:
 
-$$Q = CV$$
+$$I = C \frac{dV}{dt}$$
 
-where $Q$ is stored charge (coulombs), $C$ is capacitance (farads), $V$ is voltage across the plates. The stored energy is:
+The causality runs left to right: current flowing in *causes* voltage to rise. If voltage isn't changing, no current flows — not because the capacitor "blocks" DC as a rule, but because a static charge distribution requires no ongoing current to maintain itself. Conversely, if a load demands a sudden burst of current, the capacitor can supply it from stored charge before the power supply has time to respond. This is the physical basis for decoupling.
+
+Energy stored in the electric field:
 
 $$E = \frac{1}{2}CV^2$$
 
-The governing equation is:
+This energy is recoverable — an ideal capacitor dissipates nothing.
 
-$$I = C\frac{dV}{dt}$$
+### Inductors: Magnetic Field Storage
 
-This is the causal core. Current flows *only* when voltage is changing. No change in $V$, no current — DC is blocked. Rapidly changing $V$ drives large current — high-frequency AC passes freely. More precisely, the capacitor's impedance is $Z_C = 1/j\omega C$: it falls as frequency rises, so the capacitor increasingly short-circuits high-frequency signals to ground in a filter topology.
+An inductor stores energy in the magnetic field threading its coil. The dual of the capacitor relation:
 
-**You cannot change the voltage across a capacitor instantaneously.** $I = C\,dV/dt$ rearranges to $dV/dt = I/C$: a finite current into a finite capacitance produces a finite rate of voltage change. Instantaneous voltage change would require $dV/dt \to \infty$, which demands infinite current. This is not a soft limit — it is a direct consequence of charge conservation.
+$$V = L \frac{dI}{dt}$$
 
-### Inductors Store Energy in a Magnetic Field
+Current through an inductor cannot change instantaneously because doing so would require infinite voltage. When you try to interrupt inductor current abruptly — say, by opening a switch — $dI/dt$ is forced very large and negative, so $V = L\,dI/dt$ spikes to whatever voltage is necessary to maintain continuity of current. This is not a quirk; it is a direct consequence of the field's inability to collapse instantaneously.
 
-An inductor is a coil of wire. Current through it builds a magnetic flux $\Phi$ through the coil. The stored energy is:
+Energy stored in the magnetic field:
 
 $$E = \frac{1}{2}LI^2$$
 
-where $L$ is inductance (henries). The governing equation is:
+At DC, an inductor is just wire — zero voltage drop across a fixed current. At high frequencies, $dI/dt$ is large even for small current amplitudes, so the opposing voltage is large. This is the exact complement of capacitor behavior.
 
-$$V = L\frac{dI}{dt}$$
+### Transients: RC and RL Time Constants
 
-This is the exact dual of the capacitor equation. The inductor forces a voltage across itself proportional to how fast you try to change the current through it. Slow changes (DC) produce no opposing voltage — inductors pass DC freely. Rapid changes produce large opposing voltage — inductors impede high-frequency current. Impedance: $Z_L = j\omega L$, rising linearly with frequency.
+Connect a resistor $R$ and capacitor $C$ in series to a voltage step $V_{in}$ at $t = 0$. The capacitor voltage obeys:
 
-**You cannot change the current through an inductor instantaneously.** The consequence is violent when you try: open a switch in series with an inductor and the current *must* continue, so the inductor drives $V = L\,dI/dt$ as high as necessary — arcing across the switch contacts or destroying a transistor. Flyback diodes exist precisely to give that current somewhere to go.
+$$V_C(t) = V_{in}\left(1 - e^{-t/\tau}\right), \quad \tau = RC$$
 
-### Transients: The Approach to Steady State
+Why exponential? The current that charges the capacitor is $I = (V_{in} - V_C)/R$. As $V_C$ rises, the driving voltage $(V_{in} - V_C)$ falls, reducing current, which slows the rise — a self-limiting feedback loop. The differential equation $C\,dV_C/dt = (V_{in} - V_C)/R$ has the exponential as its unique solution.
 
-Connect a resistor $R$ and capacitor $C$ in series to a voltage step. The capacitor voltage obeys:
+After one $\tau$: 63.2% of final value. After $5\tau$: 99.3%. The resistor sets how fast charge can arrive; the capacitor sets how much charge is required per volt.
 
-$$V_C(t) = V_s\!\left(1 - e^{-t/\tau}\right), \quad \tau = RC$$
+For an RL circuit, the dual gives current rise:
 
-The time constant $\tau$ is not arbitrary — it emerges from the differential equation $V_s = IR + V_C = RC\,\dot{V}_C + V_C$, whose solution is the exponential above. The current is:
+$$I(t) = \frac{V_{in}}{R}\left(1 - e^{-t/\tau}\right), \quad \tau = \frac{L}{R}$$
 
-$$I(t) = \frac{V_s}{R}\,e^{-t/\tau}$$
+The resistor now limits how fast voltage can be applied across the inductor, throttling $dI/dt$.
 
-It starts at $V_s/R$ (the capacitor looks like a short at $t=0$, since $V_C$ cannot jump) and decays as the capacitor charges. The resistor dissipates energy $\frac{1}{2}CV_s^2$ during charging regardless of $R$ — the same as the energy stored in the capacitor. Halving $R$ halves the charging time but doubles the peak current, leaving the total dissipation unchanged.
+### Impedance: Frequency-Domain Behavior
 
-The RL circuit is the dual: current builds as $I(t) = (V_s/R)(1 - e^{-t/\tau})$ with $\tau = L/R$.
+Replace $d/dt$ with $j\omega$ (valid for sinusoidal steady-state). Capacitor and inductor impedances become:
+
+$$Z_C = \frac{1}{j\omega C}, \quad Z_L = j\omega L$$
+
+where $\omega = 2\pi f$. These are not merely "frequency-dependent resistors" — they are reactive: they shift phase by $\pm 90°$ and store rather than dissipate energy. The magnitude $|Z_C| = 1/(\omega C)$ decreases with frequency, which is why a capacitor shunting a power rail to ground attenuates high-frequency noise. The magnitude $|Z_L| = \omega L$ increases with frequency, which is why a series inductor in a power filter blocks high-frequency switching transients from reaching the load.
+
+Voltage leads current by 90° in an inductor; current leads voltage by 90° in a capacitor. The mnemonic **ELI the ICE man**: **E**MI leads **I** in an i**L** (inductor), **I** leads **E** in a **C** (capacitor).
 
 ### Resonance in LC Circuits
 
-In an LC circuit, energy transfers between the electric field (capacitor) and magnetic field (inductor) at a rate set by both components. The natural resonant frequency is:
+Place a capacitor and inductor in a loop. Energy oscillates: capacitor voltage drives current into the inductor, building a magnetic field; when the capacitor is discharged, the inductor drives current back, recharging the capacitor in reverse polarity. This repeats at the frequency where $|Z_L| = |Z_C|$:
 
-$$\omega_0 = \frac{1}{\sqrt{LC}}, \qquad f_0 = \frac{1}{2\pi\sqrt{LC}}$$
+$$\omega_0 L = \frac{1}{\omega_0 C} \implies \omega_0 = \frac{1}{\sqrt{LC}}, \quad f_0 = \frac{1}{2\pi\sqrt{LC}}$$
 
-At $\omega_0$, the capacitor's impedance $1/j\omega C$ and the inductor's impedance $j\omega L$ are equal in magnitude and opposite in sign — they cancel. In a series RLC circuit at resonance, only $R$ limits the current; the reactive components' voltages can individually exceed the source voltage by the quality factor $Q$:
-
-$$Q = \frac{1}{R}\sqrt{\frac{L}{C}} = \frac{\omega_0 L}{R} = \frac{1}{\omega_0 RC}$$
-
-High $Q$ means narrow resonance bandwidth $\Delta f = f_0/Q$ — the circuit responds sharply to frequencies near $f_0$ and rejects others. Low $Q$ means broad, heavily damped response. Quartz crystals achieve $Q \sim 10^5$–$10^6$ by exploiting the extremely low mechanical damping of crystalline quartz, which is why they produce far more stable frequencies than LC circuits built from discrete components.
+In a series RLC circuit, total impedance at resonance is purely $R$ — the reactive parts cancel — so current is maximized. In a parallel RLC circuit, the reactive currents circulate internally and impedance is maximized, meaning the circuit presents a high impedance to external drive at $f_0$. A radio receiver exploits this: a parallel tank circuit presents high impedance only near $f_0$, so only that frequency develops significant voltage across it.
 
 ---
 
 ## How It Works
 
-### The RC Transient in Detail
+### RC Charging: A Worked Calculation
 
-For $R = 1\,\text{k}\Omega$, $C = 1\,\mu\text{F}$, $V_s = 5\,\text{V}$:
+Series RC with $R = 1\,\text{k}\Omega$, $C = 1\,\mu\text{F}$, step input $V_{in} = 5\,\text{V}$ at $t = 0$:
 
-$$\tau = RC = 10^3\,\Omega \times 10^{-6}\,\text{F} = 1\,\text{ms}$$
+$$\tau = RC = 10^3 \cdot 10^{-6} = 1\,\text{ms}$$
 
-| Time | $V_C$ | % of $V_s$ |
-|------|-------|------------|
-| $\tau = 1\,\text{ms}$ | $3.16\,\text{V}$ | 63.2% |
-| $2\tau = 2\,\text{ms}$ | $4.32\,\text{V}$ | 86.5% |
-| $3\tau = 3\,\text{ms}$ | $4.75\,\text{V}$ | 95.0% |
-| $5\tau = 5\,\text{ms}$ | $4.97\,\text{V}$ | 99.3% |
+Voltage across capacitor at $t = 2\,\text{ms}$:
 
-The 63.2% figure is not magic — it is $1 - e^{-1}$, the value of the charging equation at $t = \tau$. Engineers use $5\tau$ as "fully charged" because $e^{-5} \approx 0.0067$, meaning less than 0.7% error remains.
+$$V_C(2\,\text{ms}) = 5\left(1 - e^{-2}\right) = 5 \times 0.8647 = 4.32\,\text{V}$$
 
-The energy stored in the capacitor at full charge is $\frac{1}{2}CV_s^2 = \frac{1}{2}(10^{-6})(25) = 12.5\,\mu\text{J}$. The resistor dissipates exactly $12.5\,\mu\text{J}$ during the charge cycle — you can verify by integrating $I^2 R$ over all time:
+Current at the same instant:
 
-$$\int_0^\infty I^2 R\,dt = \int_0^\infty \frac{V_s^2}{R}\,e^{-2t/\tau}\,dt = \frac{V_s^2}{R} \cdot \frac{\tau}{2} = \frac{V_s^2}{R} \cdot \frac{RC}{2} = \frac{1}{2}CV_s^2$$
+$$I(2\,\text{ms}) = \frac{V_{in} - V_C}{R} = \frac{5 - 4.32}{10^3} = 0.68\,\text{mA}$$
 
-This 50% efficiency ceiling applies to any resistive charging path. It is why switched-mode power supplies (which charge inductors rather than capacitors through resistances) are necessary when efficiency matters.
+Equivalently, using the exponential form:
 
-### Inductors in Switching Converters
+$$I(t) = \frac{V_{in}}{R}e^{-t/\tau} = 5\,\text{mA} \cdot e^{-2} = 0.68\,\text{mA}$$
 
-In a synchronous buck converter, the switch (a MOSFET) alternates between connecting the inductor to $V_{in}$ and to ground. During the ON phase, with the switch connecting $V_{in}$ to the inductor's input and $V_{out}$ on the output side:
+The charge delivered to the capacitor by $t = 2\,\text{ms}$:
 
-$$V_{in} - V_{out} = L\frac{dI_L}{dt} \implies \frac{dI_L}{dt} = \frac{V_{in} - V_{out}}{L}$$
+$$Q = C \cdot V_C = 10^{-6} \times 4.32 = 4.32\,\mu\text{C}$$
 
-Current ramps up linearly. During the OFF phase, the inductor drives current through the low-side switch (or freewheeling diode), with the output voltage opposing the current:
+You can verify: $Q = \int_0^t I\,dt' = \frac{V_{in}}{R}\int_0^t e^{-t'/\tau}dt' = C V_{in}(1 - e^{-t/\tau})$. Consistent.
 
-$$\frac{dI_L}{dt} = -\frac{V_{out}}{L}$$
+### The Flyback Converter: Inductors Storing and Releasing Energy
 
-Current ramps down linearly. In steady state, the net change in inductor current over a full switching period must be zero (otherwise the current would drift without bound). Setting $\Delta I_{up} = \Delta I_{down}$:
+A flyback converter stores energy in an inductor during the switch-on phase and delivers it to the output during the switch-off phase. This is the topology in most USB chargers and isolated DC-DC converters.
 
-$$\frac{V_{in} - V_{out}}{L} \cdot DT = \frac{V_{out}}{L} \cdot (1-D)T$$
+**Switch ON:** The input voltage $V_{in}$ is applied across the primary inductance $L_{pri}$. Current ramps linearly:
 
-where $D$ is the duty cycle (fraction of the period $T$ that the switch is ON). Solving:
+$$I_{pri}(t) = \frac{V_{in}}{L_{pri}} \cdot t$$
 
-$$V_{out} = D \cdot V_{in}$$
+Energy accumulates in the core: $E = \frac{1}{2}L_{pri}I_{pk}^2$, where $I_{pk}$ is the peak current at switch-off.
 
-The output capacitor smooths the triangular current ripple from the inductor into an approximately DC output voltage. The peak-to-peak current ripple is:
+**Switch OFF:** The primary current path is broken. The magnetic field must collapse, which reverses the inductor voltage (flyback). The secondary winding sees this reversed voltage, forward-biasing the output diode, and the stored energy transfers to the output capacitor and load.
 
-$$\Delta I_L = \frac{(V_{in} - V_{out})\,D}{L\,f_{sw}}$$
+If there is *no* valid current path when the switch opens, $dI/dt$ is limited only by stray capacitance. The voltage spike $V = L\,dI/dt$ can reach hundreds of volts on the switch node in microseconds, destroying the MOSFET. Snubber circuits (RC or RCD across the switch) provide a controlled discharge path to absorb this energy.
 
-where $
+### RLC Damping: Three Regimes
+
+A series RLC circuit with step input has its transient behavior determined by the damping ratio:
+
+$$\zeta = \frac{R}{2}\sqrt{\frac{C}{L}}$$
+
+Equivalently, $\zeta = R / (2\omega_0 L)$. The natural frequency is $\omega_0 = 1/\sqrt{LC}$.
+
+| Regime | Condition | Behavior |
+|---|---|---|
+| Overdamped | $\zeta > 1$ | Two real exponential modes, no oscillation, slow |
+| Critically damped | $\zeta = 1$ | Fastest rise to final value without overshoot |
+| Underdamped | $\zeta < 1$ | Decaying

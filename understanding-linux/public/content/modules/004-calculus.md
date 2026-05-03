@@ -12,130 +12,108 @@ resources:
 
 ## Why This Matters
 
-A CPU scheduler decides how long each process runs. A congestion controller decides how fast to push packets. A thermal regulator decides when to throttle a core. All three are feedback systems: the current state determines how the state changes next. Calculus is the formal language for describing that relationship. Without derivatives, "rate of change" is undefined. Without integrals, you cannot accumulate a quantity over time. Without differential equations, you cannot model a system that responds to itself — which means CFS, CUBIC, and `thermald` are all special cases of ODE dynamics running on silicon.
+Every performance-sensitive Linux subsystem is built on rates of change and accumulated quantities. The kernel's load average is a discrete solution to a continuous decay ODE. TCP's congestion window grows and shrinks according to a piecewise derivative. A PID controller in a motor driver computes a proportional term (the value), a derivative term (how fast it's changing), and an integral term (accumulated error) — get any one wrong and the system oscillates or stalls. Discrete sums and continuous integrals are two sides of the same coin: the kernel computes one where theory gives you the other, and knowing the relationship tells you *why* an approximation is good enough — or dangerously wrong.
 
 ---
 
 ## Core Concepts
 
-### Limits
-
-A limit asks: what value does $f(x)$ approach as $x$ approaches $a$, independent of whether $f(a)$ exists?
+### Limits: Stability at a Boundary
 
 $$\lim_{x \to a} f(x) = L$$
 
-This matters because the derivative — and therefore every rate-of-change quantity in systems work — is *defined as a limit*. Without it, "instantaneous rate" is a category error. The limit is not about the value at the point; it is about behavior in every punctured neighborhood around it.
+means: for every tolerance $\varepsilon > 0$, there exists $\delta > 0$ such that $|x - a| < \delta \Rightarrow |f(x) - L| < \varepsilon$.
 
-### Derivatives
+The $\varepsilon$-$\delta$ formulation is not ceremony. It forces a precise question: *does the system behave predictably near a boundary, and how tightly must I constrain the input to guarantee a given output tolerance?* A function with no limit at a point — left and right limits disagree, or the function oscillates infinitely — means the system at that boundary is unpredictable regardless of how carefully you approach it.
+
+The Linux load average approaches but never reaches certain thresholds in a well-behaved system. When utilization approaches 1.0 on a single-core system under a Poisson arrival model, queue length diverges:
+
+$$\lim_{\rho \to 1^-} \mathbb{E}[Q] = \lim_{\rho \to 1^-} \frac{\rho}{1-\rho} = \infty$$
+
+This is not a coincidence — it is the $M/M/1$ queueing result, and it explains why a system at 95% CPU feels far worse than one at 90%.
+
+### Derivatives: Instantaneous Rate of Change
 
 $$f'(x) = \lim_{h \to 0} \frac{f(x+h) - f(x)}{h}$$
 
-You are asking: for an infinitesimally small perturbation $h$ to the input, how much does the output move, per unit of $h$? The answer is itself a function — it gives you the slope at every point simultaneously.
+You are asking: as the input perturbation $h$ shrinks to zero, what does the output ratio converge to? If the limit exists, the function is differentiable at $x$ and has a well-defined instantaneous rate. If it does not — because the function is discontinuous or has a corner — the derivative is undefined, which has physical meaning: the rate of change is not well-defined at that point.
 
-The power rule is the most-used result in applied work:
+**Key rules:**
 
-$$\frac{d}{dx} x^n = n x^{n-1}$$
+- **Power rule:** $\dfrac{d}{dx} x^n = nx^{n-1}$
+- **Chain rule:** $\dfrac{d}{dx} f(g(x)) = f'(g(x)) \cdot g'(x)$ — composed functions like $e^{-\lambda t^2}$ require this; you differentiate the outer function evaluated at the inner, times the derivative of the inner
+- **Product rule:** $\dfrac{d}{dx}[f \cdot g] = f'g + fg'$
 
-The chain rule handles composition, which appears constantly when one system's output feeds another's input:
+The chain rule is why exponential decay in the form $e^{-t/\tau}$ has derivative $-\frac{1}{\tau}e^{-t/\tau}$: the outer function is $e^u$ with derivative $e^u$, the inner function is $-t/\tau$ with derivative $-1/\tau$, and the product of those is the result. This is the derivative that determines how fast a thermal sensor reading falls after a CPU goes idle.
 
-$$\frac{d}{dx} f(g(x)) = f'(g(x)) \cdot g'(x)$$
+### Integrals: Accumulated Change
 
-### Integrals
+The definite integral is defined as a limit of Riemann sums — you partition $[a,b]$ into $n$ subintervals of width $\Delta x = (b-a)/n$ and sum:
 
-The definite integral is the limit of a Riemann sum:
+$$\int_a^b f(x)\, dx = \lim_{n \to \infty} \sum_{k=0}^{n-1} f(a + k\Delta x)\cdot \Delta x$$
 
-$$\int_a^b f(x)\, dx = \lim_{n \to \infty} \sum_{k=0}^{n-1} f(x_k)\,\Delta x, \quad \Delta x = \frac{b-a}{n}$$
+This construction is directly what `perf stat` does when it samples hardware counters at intervals and accumulates: it is a left Riemann sum with $\Delta x$ equal to the sampling period. The error of a Riemann sum approximation relative to the true integral is $O(\Delta x)$ for a left/right sum and $O(\Delta x^2)$ for the midpoint rule — this is why higher-frequency sampling gives proportionally more accurate energy accounting.
 
-It accumulates $f(x)\,dx$ — a product of *rate* and *interval width* — over the whole domain. Total CPU time consumed, total bytes transferred, total energy dissipated: all are integrals.
+The **Fundamental Theorem of Calculus** connects the two operations:
 
-The **Fundamental Theorem of Calculus** is why computing antiderivatives solves the area problem:
+$$\frac{d}{dx} \int_a^x f(t)\, dt = f(x)$$
 
-$$\frac{d}{dx}\int_a^x f(t)\,dt = f(x)$$
+Accumulation and differentiation are inverses. If you integrate the instantaneous power draw $P(t)$ over time, you get total energy consumed. If you then differentiate that accumulated energy with respect to time, you recover the instantaneous power. This is why RAPL energy counters in `/sys/class/powercap/` give you accumulated joules — differentiate numerically between two reads to get watts.
 
-Differentiation undoes integration. If you know an antiderivative $F$ with $F' = f$, then $\int_a^b f(x)\,dx = F(b) - F(a)$.
+### Finite vs. Continuous Calculus: The Discrete Parallel
 
-### Partial Derivatives
+Computers are discrete machines, so it is worth making the analogy explicit. Define the **difference operator** $\Delta f(x) = f(x+1) - f(x)$, which plays the role of the derivative $D = d/dx$, and the **summation operator** $\sum$ as the anti-difference, playing the role of $\int$. The correspondence:
 
-For $f(x_1, x_2, \ldots, x_n)$, the partial derivative with respect to $x_i$ holds all other inputs fixed:
-
-$$\frac{\partial f}{\partial x_i} = \lim_{h \to 0} \frac{f(\ldots, x_i + h, \ldots) - f(\ldots, x_i, \ldots)}{h}$$
-
-The gradient $\nabla f = \left(\frac{\partial f}{\partial x_1}, \ldots, \frac{\partial f}{\partial x_n}\right)$ points in the direction of steepest increase. Gradient descent moves opposite to $\nabla f$ to minimize $f$, which is how any system with multiple tunable parameters finds an optimum. Knowing which partial derivative is large tells you which input is worth tuning.
-
-### Taylor Expansion
-
-Any sufficiently smooth $f$ can be approximated near $a$ by a polynomial that matches $f$ and all its derivatives at that point:
-
-$$f(x) = \sum_{n=0}^{\infty} \frac{f^{(n)}(a)}{n!}(x-a)^n$$
-
-Each term corrects the residual error left by all previous terms. Truncating after the linear term gives:
-
-$$f(x) \approx f(a) + f'(a)(x-a), \quad \text{error} = O\!\left((x-a)^2\right)$$
-
-This is *linear approximation*, and it is why control systems can use simple proportional feedback: for small deviations from setpoint, every smooth system looks linear. The $O((x-a)^2)$ bound tells you exactly how fast that approximation breaks down.
-
-### Ordinary Differential Equations (ODEs)
-
-An ODE relates a function to its own derivatives. The simplest feedback case:
-
-$$\frac{dy}{dt} = k \cdot y, \quad y(0) = y_0 \implies y(t) = y_0 e^{kt}$$
-
-When $k < 0$, this is exponential decay — the basis of TCP's multiplicative decrease and CPU frequency scaling cooldown. When $k > 0$, it is exponential growth — unchecked queue buildup, thermal runaway. The sign of $k$ determines stability. More realistic systems add damping:
-
-$$\frac{d^2y}{dt^2} + 2\zeta\omega_n \frac{dy}{dt} + \omega_n^2 y = 0$$
-
-This is the damped harmonic oscillator. $\zeta < 1$ gives oscillation (underdamped), $\zeta = 1$ gives the fastest non-oscillatory return to equilibrium (critically damped), $\zeta > 1$ gives sluggish return (overdamped). PID tuning is the engineering problem of choosing $\zeta$.
-
----
-
-## How It Works
-
-### The Finite Calculus Parallel
-
-Standard calculus is built on limits over the reals. Finite calculus is built on differences over integers — exactly what hardware counters and discrete schedulers produce. The structures are exactly parallel:
-
-| Continuous | Finite (Discrete) |
+| Continuous | Discrete |
 |---|---|
-| Derivative $Df$ | Difference $\Delta f(x) = f(x+1) - f(x)$ |
-| Antiderivative $\int$ | Antidifference $\sum$ |
-| $\frac{d}{dx} x^n = n x^{n-1}$ | $\Delta x^{\underline{m}} = m\, x^{\underline{m-1}}$ |
-| $\int_0^n x^m\,dx = \frac{n^{m+1}}{m+1}$ | $\sum_{0 \le k < n} k^{\underline{m}} = \frac{n^{\underline{m+1}}}{m+1}$ |
-| $\int x^{-1}\,dx = \ln x$ | $\sum x^{\underline{-1}}\,\delta x = H_x$ |
+| $Df(x) = f'(x)$ | $\Delta f(x) = f(x+1) - f(x)$ |
+| $\int f(x)\,dx$ | $\sum f(x)\,\delta x$ |
+| $x^n$ | $x^{\underline{n}} = x(x-1)(x-2)\cdots(x-n+1)$ |
+| $D(x^n) = nx^{n-1}$ | $\Delta(x^{\underline{m}}) = m \cdot x^{\underline{m-1}}$ |
+| $\int_0^n x^m\,dx = \dfrac{n^{m+1}}{m+1}$ | $\displaystyle\sum_{0 \le k < n} k^{\underline{m}} = \dfrac{n^{\underline{m+1}}}{m+1}$ |
 
-The **falling factorial** $x^{\underline{m}} = x(x-1)(x-2)\cdots(x-m+1)$ is the discrete analog of $x^m$. It plays the same role in discrete sums that $x^m$ plays in continuous integrals — and the formulas are identical in structure, with no approximation required.
+The **falling factorial** $x^{\underline{m}}$ is the natural basis for discrete calculus because differences of falling powers obey exactly the same rule as derivatives of ordinary powers. Ordinary powers do not have this property — $\Delta(k^2) \ne 2k$, but $\Delta(k^{\underline{2}}) = 2k^{\underline{1}}$, exactly as expected.
 
-The **harmonic number** $H_x = \sum_{k=1}^{x} \frac{1}{k}$ is the discrete analog of $\ln x$. They differ by the Euler–Mascheroni constant:
+**Why this matters operationally:** when you analyze the time complexity of a loop that iterates over pairs, triples, or $m$-tuples of indices, expressing the count as a falling factorial sum gives you a closed form by mechanical anti-differencing, with no guessing or induction required.
 
-$$H_n = \ln n + \gamma + O\!\left(\frac{1}{n}\right), \quad \gamma \approx 0.5772$$
+### Partial Derivatives and the Gradient
 
-This is not coincidental. The integral $\int_1^n \frac{1}{x}\,dx = \ln n$ approximates the sum $\sum_{k=1}^{n} \frac{1}{k}$; the constant $\gamma$ is the accumulated error of that approximation.
+When a function depends on multiple inputs, a partial derivative holds all but one variable fixed:
 
-### Computing a Closed-Form Sum via Finite Calculus
+$$\frac{\partial f}{\partial x}(x, y) = \lim_{h \to 0} \frac{f(x+h, y) - f(x, y)}{h}$$
 
-To evaluate $\sum_{k=0}^{n-1} k^2$ exactly, convert to falling factorials first:
+The **gradient** is the vector of all partial derivatives:
 
-$$k^2 = k(k-1) + k = k^{\underline{2}} + k^{\underline{1}}$$
+$$\nabla f = \left(\frac{\partial f}{\partial x_1}, \frac{\partial f}{\partial x_2}, \ldots, \frac{\partial f}{\partial x_n}\right)$$
 
-Apply the antidifference formula $\sum_{0 \le k < n} k^{\underline{m}} = \frac{n^{\underline{m+1}}}{m+1}$:
+It points in the direction of steepest increase of $f$. **Gradient descent** steps opposite the gradient to minimize a cost function:
 
-$$\sum_{k=0}^{n-1} k^2 = \frac{n^{\underline{3}}}{3} + \frac{n^{\underline{2}}}{2} = \frac{n(n-1)(n-2)}{3} + \frac{n(n-1)}{2}$$
+$$x_{k+1} = x_k - \eta \,\nabla f(x_k)$$
 
-Factor:
+where $\eta > 0$ is the step size (learning rate). The reason this works is that $-\nabla f$ is locally the direction of fastest decrease, so a small step in that direction is guaranteed to decrease $f$ — *provided the step is small enough* that the local linear approximation remains valid.
 
-$$= \frac{n(n-1)}{6}\bigl[2(n-2) + 3\bigr] = \frac{n(n-1)(2n-1)}{6}$$
+This appears in kernel parameter autotuning (e.g., BBR's bandwidth estimation), NUMA placement optimization, and any ML inference workload you run on Linux hardware.
 
-This is the classical formula, derived without induction, without guessing, purely by the discrete antidifference mechanism. The technique generalizes to any polynomial sum — express in falling factorials, apply the rule, expand.
+### Taylor Expansion: Local Polynomial Approximation
 
-### Taylor Expansion: Numerical Approximation
+Any function smooth enough to be differentiated $n$ times can be approximated near a point $a$ by:
 
-To approximate $\sqrt{1 + \epsilon}$ for small $\epsilon$, expand $(1+\epsilon)^{1/2}$ around $\epsilon = 0$. The $n$-th derivative of $(1+\epsilon)^{1/2}$ at $\epsilon = 0$ gives coefficients via the generalized binomial theorem:
+$$f(x) = \sum_{k=0}^{n} \frac{f^{(k)}(a)}{k!}(x-a)^k + R_n(x)$$
 
-$$\sqrt{1+\epsilon} = 1 + \frac{1}{2}\epsilon - \frac{1}{8}\epsilon^2 + \frac{1}{16}\epsilon^3 - \cdots$$
+where $R_n(x) = O\!\left((x-a)^{n+1}\right)$ is the remainder. Each term corrects the error left by all previous terms — the $k$-th term matches the $k$-th derivative of $f$ at $a$ exactly, and contributes nothing to any lower derivative.
 
-The error after $N$ terms is $O(\epsilon^N)$. For $|\epsilon| \ll 1$ this converges fast; for $|\epsilon| \approx 1$ many terms are needed and a different expansion point $a \ne 0$ would be preferable.
+Two practically critical truncations:
 
-```python
-import math
-from itertools import accumulate
+$$e^x \approx 1 + x + \frac{x^2}{2} \quad \text{for small } x$$
 
-def sqrt_taylor_coeffs(n_terms: int) -> list[float]:
+$$\sin\theta \approx \theta - \frac{\theta^3}{6} \quad \text{for small } \theta$$
+
+The first-order approximation $e^x \approx 1 + x$ is why the Linux kernel's EWMA decay factor $e^{-1/n}$ is sometimes approximated as $1 - 1/n$ for fast fixed-point arithmetic — the relative error is $O(1/n^2)$, acceptable for large $n$.
+
+### Ordinary Differential Equations
+
+An ODE relates a function to its own derivatives. The simplest first-order linear ODE:
+
+$$\frac{dy}{dt} = ky, \quad y(0) = y_0$$
+
+has solution $y(t) = y_0 e^{kt}$. The solution exists and is unique because the ODE specifies the slope of $y$ at every point, and given a starting value you can integrate forward. For $k < 0$:

@@ -12,9 +12,9 @@ resources:
 
 ## Why This Matters
 
-Every non-trivial computation is a transformation of data. A graphics driver rotating a 3D scene applies a matrix to every vertex. The Linux kernel's CFS scheduler represents per-CPU load as a weighted sum — a linear combination — of task weights. A compiler's liveness analysis over a control-flow graph solves a system of linear equations over bit-vectors. When you understand linear algebra, you see these as instances of the same machinery.
+Every performance-critical subsystem in Linux eventually bottlenecks on a linear algebra primitive. The GPU command processor in `drivers/gpu/drm/` submits transformation matrices to hardware that rotates, scales, and projects geometry — a broken rotation matrix produces visual corruption that looks like a driver bug but is an algebraic one. The kernel's CFS scheduler maintains per-CPU load vectors and computes weighted sums to balance work; when NUMA topology is involved, that weighting is essentially a matrix-vector product. ALSA's resampling path in `sound/core/` applies FIR filters that are convolutions — which become pointwise multiplications after an FFT, a fact that falls directly out of eigenvalue theory. `scikit-learn`'s PCA, `numpy`'s `linalg.solve`, and OpenBLAS's `dgemm` are all calling into the same LAPACK routines ultimately traceable to Gaussian elimination.
 
-The structural fact underlying much of this: a homogeneous system $A\mathbf{x} = \mathbf{0}$ with more unknowns than equations *always* has a nonzero solution. This is not a coincidence — it is a theorem about rank, and it determines whether a set of constraints is satisfiable, whether an optimization has a free parameter, and whether an algorithm is guaranteed to terminate.
+When these systems fail the root cause is almost always an invariant violation: rank dropped where it shouldn't, a matrix became ill-conditioned so small floating-point errors exploded, eigenvalues went negative in a covariance matrix that must be positive-semidefinite. You cannot diagnose those failures without knowing what the invariants are and why they must hold.
 
 ---
 
@@ -22,92 +22,92 @@ The structural fact underlying much of this: a homogeneous system $A\mathbf{x} =
 
 ### Vectors
 
-A vector $\mathbf{v} \in \mathbb{R}^n$ is an ordered $n$-tuple of real numbers:
-
-$$\mathbf{v} = \begin{pmatrix} v_1 \\ v_2 \\ \vdots \\ v_n \end{pmatrix}$$
-
-Two operations are defined: componentwise addition and scalar multiplication:
+A vector is an ordered $n$-tuple of scalars. Two operations define it completely — addition and scalar multiplication:
 
 $$\mathbf{u} + \mathbf{v} = \begin{pmatrix} u_1 + v_1 \\ \vdots \\ u_n + v_n \end{pmatrix}, \qquad c\mathbf{v} = \begin{pmatrix} cv_1 \\ \vdots \\ cv_n \end{pmatrix}$$
 
-These two operations, and the eight axioms they satisfy (associativity, commutativity, distributivity, existence of zero and negation), define a **vector space**. The axioms are not decoration — they are exactly the conditions needed to guarantee that linear combinations behave predictably. Every result in linear algebra follows from them.
+A **vector space** is any set closed under these two operations with the expected associativity, commutativity, and distributivity axioms. The reason to care about the abstract definition is that the same theorems apply everywhere: $\mathbb{R}^n$, polynomials of degree $\leq k$, continuous functions on $[0,1]$, and finite fields $\mathbb{F}_2^n$ (used in error-correcting codes) are all vector spaces. Intuitions built in $\mathbb{R}^3$ transfer directly.
 
-A **linear combination** of vectors $\mathbf{v}_1, \ldots, \mathbf{v}_k$ is any sum $c_1\mathbf{v}_1 + \cdots + c_k\mathbf{v}_k$. The set of all such combinations is the **span** of those vectors. If no vector in a set is a linear combination of the others, the set is **linearly independent**.
+### Matrices as Linear Transformations
 
-### Matrices
-
-A matrix $A$ of shape $m \times n$ encodes a **linear transformation** $T: \mathbb{R}^n \to \mathbb{R}^m$. The array of numbers is just the representation; the object is the transformation.
-
-Matrix-vector multiplication:
-
-$$A\mathbf{x} = \begin{pmatrix} a_{11} & a_{12} \\ a_{21} & a_{22} \end{pmatrix} \begin{pmatrix} x_1 \\ x_2 \end{pmatrix} = x_1\begin{pmatrix} a_{11} \\ a_{21} \end{pmatrix} + x_2\begin{pmatrix} a_{12} \\ a_{22} \end{pmatrix}$$
-
-Reading it this way — as a linear combination of columns — is more useful than the row-dot-product formula. The output of $A\mathbf{x}$ is always a linear combination of the columns of $A$. This is why the set of all possible outputs is called the **column space** of $A$.
-
-Matrix multiplication $C = AB$ composes transformations: $C\mathbf{x} = A(B\mathbf{x})$ means apply $B$ first, then $A$. Non-commutativity ($AB \neq BA$ in general) is a direct consequence: rotating then reflecting is geometrically different from reflecting then rotating.
-
-### Linear Transformations
-
-$T: \mathbb{R}^n \to \mathbb{R}^m$ is linear if and only if:
+A matrix is not a grid of numbers — it is a compact encoding of a **linear transformation** $T: \mathbb{R}^m \to \mathbb{R}^n$ satisfying:
 
 $$T(\mathbf{u} + \mathbf{v}) = T(\mathbf{u}) + T(\mathbf{v}), \qquad T(c\mathbf{v}) = cT(\mathbf{v})$$
 
-Setting $c = 0$ in the second rule forces $T(\mathbf{0}) = \mathbf{0}$. This immediately disqualifies translation: $T(\mathbf{x}) = \mathbf{x} + \mathbf{b}$ satisfies $T(\mathbf{0}) = \mathbf{b} \neq \mathbf{0}$ when $\mathbf{b} \neq \mathbf{0}$. Graphics pipelines handle this by lifting $\mathbb{R}^3$ into **homogeneous coordinates** $\mathbb{R}^4$, where translation *is* linear — this is exactly what the standard OpenGL model-view matrix does.
+Linearity means $T$ is completely determined by its action on a basis. If you know where $T$ sends $n$ basis vectors, you know where it sends every vector. An $n \times m$ matrix encodes exactly this: **column $j$ is the image of the $j$-th basis vector**. This is why matrix-vector multiplication looks the way it does:
 
-The power of linearity: the entire behavior of $T$ is determined by its values on a basis. If you know where $T$ sends $n$ independent vectors, you know where it sends everything.
+$$A\mathbf{x} = x_1 \mathbf{a}_1 + x_2 \mathbf{a}_2 + \cdots + x_m \mathbf{a}_m$$
+
+The output is a linear combination of $A$'s columns weighted by the entries of $\mathbf{x}$.
 
 ### Rank
 
-The **rank** of $A$ is the dimension of its column space — the number of linearly independent columns. It measures how much of the codomain the transformation actually reaches.
+The **rank** of $A$ is the dimension of its column space — the number of linearly independent directions the transformation actually produces. For an $m \times n$ matrix:
 
-For an $m \times n$ matrix with rank $r$:
+$$r = \operatorname{rank}(A) \leq \min(m, n)$$
 
-- The **null space** (kernel) has dimension $n - r$. This is the **rank-nullity theorem**: $r + \dim(\ker A) = n$.
-- $A\mathbf{x} = \mathbf{b}$ has a solution if and only if $\mathbf{b}$ is in the column space of $A$.
-- If $r < n$: the null space is nontrivial, meaning $A\mathbf{x} = \mathbf{0}$ has nonzero solutions. Any solution to $A\mathbf{x} = \mathbf{b}$ is non-unique — you can add any null-space vector to it.
-- If $r = n$: $A$ is injective (distinct inputs give distinct outputs).
-- If $r = m = n$: $A$ is invertible.
+The **rank-nullity theorem** states:
 
-The homogeneous-system principle follows directly: if $n > m$, then $r \leq m < n$, so $\dim(\ker A) = n - r \geq 1$. More unknowns than equations guarantees a nonzero solution. This is the structural guarantee behind Gosper-Zeilberger's summation algorithm — when it sets up a system with more free parameters than constraint equations, it is guaranteed to find a nontrivial recurrence.
+$$\operatorname{rank}(A) + \operatorname{nullity}(A) = n$$
+
+where $\operatorname{nullity}(A) = \dim(\ker A)$ is the dimension of the null space — the subspace of inputs that map to zero. Every direction in the null space is destroyed by $A$; information sent into those directions is unrecoverable. A rank-deficient $A\mathbf{x} = \mathbf{b}$ system either has no solution (if $\mathbf{b}$ lies outside the column space) or infinitely many (the solution is a particular solution plus any vector in the null space).
+
+Practically: if you build a system of equations whose coefficient matrix is rank-deficient because two sensors are measuring the same physical quantity, you will not get a unique solution no matter how good your solver is. The algebraic structure reflects the physical redundancy.
 
 ### Eigenvalues and Eigenvectors
 
-For a square matrix $A \in \mathbb{R}^{n \times n}$, a nonzero vector $\mathbf{v}$ is an **eigenvector** with eigenvalue $\lambda$ if:
+For a square $n \times n$ matrix $A$, a nonzero vector $\mathbf{v}$ is an **eigenvector** if the transformation only scales it:
 
-$$A\mathbf{v} = \lambda\mathbf{v}$$
+$$A\mathbf{v} = \lambda \mathbf{v}$$
 
-$A$ does not rotate $\mathbf{v}$ — it only scales it by $\lambda$. Negative $\lambda$ flips the direction; $|\lambda| > 1$ stretches; $|\lambda| < 1$ contracts; $\lambda = 0$ collapses to zero (and signals that $A$ is not invertible).
-
-Eigenvalues are roots of the **characteristic polynomial**:
+The scalar $\lambda$ is the **eigenvalue**. Rearranging: $(A - \lambda I)\mathbf{v} = \mathbf{0}$ has a nontrivial solution iff $A - \lambda I$ is singular, i.e.:
 
 $$\det(A - \lambda I) = 0$$
 
-For a $2 \times 2$ matrix this gives a quadratic; for $n \times n$ a degree-$n$ polynomial. The roots may be complex even for real $A$ — a rotation matrix has no real eigenvectors because no direction is preserved under rotation.
+This **characteristic polynomial** has degree $n$, so there are $n$ eigenvalues (counting multiplicity, over $\mathbb{C}$). Eigenvectors are the natural axes of $A$ — directions the transformation acts on independently, with no coupling to other directions.
 
-Why eigenvectors matter causally: they are the directions along which a transformation is *decoupled*. In those directions, the system behaves like independent scalar equations, not a coupled system. Everything that makes repeated application tractable — Markov chains converging to steady state, differential equations with exponential solutions, recurrences with closed forms — exploits this decoupling.
+Why they matter computationally: repeated application of $A$ amplifies directions with $|\lambda| > 1$ and suppresses directions with $|\lambda| < 1$. The largest eigenvalue dominates after enough iterations. This is exactly why the **power method** works for finding the dominant eigenvector, and why Google's original PageRank algorithm reduces to finding the principal eigenvector of a stochastic matrix.
 
 ### Diagonalization
 
-If $A \in \mathbb{R}^{n \times n}$ has $n$ linearly independent eigenvectors $\mathbf{v}_1, \ldots, \mathbf{v}_n$ with eigenvalues $\lambda_1, \ldots, \lambda_n$, form the matrix $P = [\mathbf{v}_1 \mid \cdots \mid \mathbf{v}_n]$. Then:
+$A$ is **diagonalizable** if it has $n$ linearly independent eigenvectors. Then:
 
-$$A = PDP^{-1}, \qquad D = \begin{pmatrix} \lambda_1 & & \\ & \ddots & \\ & & \lambda_n \end{pmatrix}$$
+$$A = P D P^{-1}$$
 
-The payoff for repeated application:
+where $D = \operatorname{diag}(\lambda_1, \ldots, \lambda_n)$ and the columns of $P$ are the corresponding eigenvectors. The payoff is that powers and exponentials become trivial:
 
-$$A^k = PD^kP^{-1}, \qquad D^k = \begin{pmatrix} \lambda_1^k & & \\ & \ddots & \\ & & \lambda_n^k \end{pmatrix}$$
+$$A^k = P D^k P^{-1}, \qquad D^k = \operatorname{diag}(\lambda_1^k, \ldots, \lambda_n^k)$$
 
-Computing $D^k$ costs $O(n)$ scalar exponentiations instead of $O(n^3)$ per matrix multiplication. The Apéry recurrence
+$$e^{At} = P \operatorname{diag}(e^{\lambda_1 t}, \ldots, e^{\lambda_n t}) P^{-1}$$
 
-$$(n+2)^3 A_{n+2} - (2n+3)(17n^2+51n+39)A_{n+1} + (n+1)^3 A_n = 0$$
+The matrix exponential $e^{At}$ is the exact solution to the ODE system $\dot{\mathbf{x}} = A\mathbf{x}$, which governs everything from circuit transients to linearized control systems in real-time kernels. Without diagonalization, computing $e^{At}$ for each timestep would require a full $O(n^3)$ matrix exponential algorithm; with it, the per-step cost is $O(n)$.
 
-is analyzed by exactly this: writing it as a matrix recurrence $\mathbf{w}_{n+1} = M_n \mathbf{w}_n$ and studying the asymptotic growth of eigenvalues to prove irrationality of $\zeta(3)$.
+### Singular Value Decomposition
 
-### Orthogonality
+Eigendecomposition requires a square matrix and may not exist over $\mathbb{R}$. The **SVD** has no such restriction. Every $m \times n$ matrix $A$ decomposes as:
 
-Two vectors are **orthogonal** when their dot product is zero:
+$$A = U \Sigma V^T$$
 
-$$\mathbf{u} \cdot \mathbf{v} = \sum_{i=1}^n u_i v_i = 0$$
+where $U$ ($m \times m$) and $V$ ($n \times n$) are orthogonal, and $\Sigma$ ($m \times n$) is diagonal with nonnegative entries $\sigma_1 \geq \sigma_2 \geq \cdots \geq \sigma_r > 0$ called **singular values**. The rank of $A$ is exactly the number of nonzero singular values.
 
-A set of mutually orthogonal unit vectors ($\|\mathbf{v}\| = 1$) is an **orthonormal basis**. In such a basis, projecting $\mathbf{b}$ onto direction $\hat{\mathbf{u}}$ is exact and cheap:
+The geometric reading: $V^T$ rotates the input, $\Sigma$ stretches along the coordinate axes, $U$ rotates the output. The condition number $\kappa(A) = \sigma_1 / \sigma_r$ measures how much the transformation amplifies errors. A large condition number means small perturbations in $\mathbf{b}$ cause large changes in $\mathbf{x}$ when solving $A\mathbf{x} = \mathbf{b}$ — the matrix is **ill-conditioned**.
 
-$$\text{proj}_{\hat{\mathbf{u}}}\, \mathbf{b} = (\
+The **rank-$k$ truncated SVD**:
+
+$$A_k = \sum_{i=1}^k \sigma_i \mathbf{u}_i \mathbf{v}_i^T$$
+
+is the best rank-$k$ approximation to $A$ in both spectral and Frobenius norms (Eckart-Young theorem). This is the mathematical foundation of PCA, latent semantic analysis, and low-rank matrix compression.
+
+### Orthogonality and QR
+
+Two vectors are **orthogonal** when $\mathbf{u} \cdot \mathbf{v} = \sum_i u_i v_i = 0$. An **orthonormal basis** ($Q$) has mutually orthogonal unit vectors. Its defining property: $Q^T Q = I$, so $Q^{-1} = Q^T$. Inversion costs nothing — just a transpose.
+
+**Gram-Schmidt** constructs an orthonormal basis from any linearly independent set by iteratively subtracting projections:
+
+$$\mathbf{u}_k = \mathbf{a}_k - \sum_{j=1}^{k-1} \frac{\mathbf{a}_k \cdot \mathbf{q}_j}{\mathbf{q}_j \cdot \mathbf{q}_j} \mathbf{q}_j, \qquad \mathbf{q}_k = \frac{\mathbf{u}_k}{\|\mathbf{u}_k\|}$$
+
+This is the constructive proof of **QR decomposition**: $A = QR$ where $Q$ is orthogonal and $R$ is upper triangular. QR is numerically stabler than LU for least-squares problems because orthogonal transformations have condition number 1 — they do not amplify errors.
+
+---
+
+## How It Works

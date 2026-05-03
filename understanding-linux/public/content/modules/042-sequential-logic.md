@@ -12,147 +12,131 @@ resources:
 
 ## Why This Matters
 
-Every value your CPU holds — a loop counter, a memory address, a flag in `RFLAGS` — exists physically as a collection of bistable circuits forced into one of exactly two stable states. Without sequential logic, computation collapses to pure combinational logic: circuits that transform inputs to outputs with no memory of prior state. The moment you need a result to persist across a clock edge — which is every instruction in every real processor — you need sequential elements.
-
-The Linux kernel's `jiffies` counter, the program counter advancing through your code, the dirty bit in a page table entry: all of these ultimately rest on the physics of cross-coupled transistors. Understanding sequential logic tells you *why* registers are faster than cache, *why* metastability is a real hardware failure mode, and *why* the CPU pipeline imposes the timing constraints it does.
+Every piece of state in a running Linux system exists because a physical circuit can hold a value over time. The CPU register file that holds your local variables, the L1 cache returning data in 4 cycles, the pipeline registers separating fetch from decode from execute — all of these are built from one primitive: a feedback loop around a gate that creates two stable states. When the kernel schedules a process, the hardware saves register state to memory; when it reschedules, it restores it. That save/restore is only meaningful because the destination — a flip-flop, an SRAM cell — reliably holds a bit across arbitrary time. Understanding sequential logic means understanding *where state lives* and *what physical constraints govern when it can change*.
 
 ---
 
-## Core Concepts
+## Combinational vs. Sequential Logic
 
-### Bistability: Two Stable States and One Unstable One
+Combinational logic computes an instantaneous function: $\text{out}(t) = f(\text{in}(t))$. Remove the input, the output collapses. Sequential logic adds a state variable $s$ such that:
 
-A bistable element has two stable DC operating points separated by an unstable equilibrium. Perturb it toward either side and positive feedback drives it fully into that state. The unstable middle point — metastability — exists but is transient: thermal noise, transistor mismatch, or any small asymmetry causes the circuit to resolve, though the resolution time is unbounded in theory (and statistically distributed in practice).
+$$\text{out}(t) = f(\text{in}(t),\, s(t)), \qquad s(t+1) = g(\text{in}(t),\, s(t))$$
 
-This is not an abstraction imposed by software. It is a consequence of the circuit's transfer characteristic having three fixed points: two stable ($Q=0$, $Q=1$) and one unstable. All digital memory — from a single flip-flop to gigabytes of SRAM cache — is a hierarchy of bistable elements.
+State requires feedback — routing an output back to an input so the circuit can "remember" a previous condition. Every memory element in a CPU, from a single flip-flop to a megabyte of L1 cache, is a physical realization of this feedback.
 
-### The SR Latch: Feedback Creates Memory
+---
 
-The SR latch is built from two cross-coupled NOR gates. There is no clock — it is asynchronous, responding immediately to input changes.
+## The SR Latch
 
-```
-S ──┬── NOR ──┬── Q
-    │    ↑    │
-    │    │    │
-    └────┘    │
-              │
-Q̄ ──┬── NOR ──┴── Q̄
-    │    ↑
-    │    │
-R ──┴────┘
-```
+Two cross-coupled NOR gates. Each gate's output is the other gate's input. The truth table has a forbidden region, which is what makes the topology useful:
 
-The feedback is the mechanism: once $Q$ is driven high, it holds the lower NOR gate's output low ($\bar{Q}=0$), which feeds back to keep the upper NOR gate's output high — even after $S$ returns to 0. The circuit stores state because its output is one of its own inputs.
+| $S$ | $R$ | $Q$ | $\overline{Q}$ |
+|-----|-----|-----|-----------------|
+| 0   | 0   | hold | hold           |
+| 1   | 0   | 1   | 0               |
+| 0   | 1   | 0   | 1               |
+| 1   | 1   | — | — (forbidden)  |
 
-| S | R | $Q_{next}$ | Meaning   |
-|---|---|-----------|-----------|
-| 1 | 0 | 1         | Set       |
-| 0 | 1 | 0         | Reset     |
-| 0 | 0 | $Q$       | Hold      |
-| 1 | 1 | invalid   | Forbidden |
+**Why two stable states exist:** The circuit satisfies the fixed-point equation
 
-The $S=R=1$ case forces both NOR outputs to 0, making $Q = \bar{Q} = 0$ — a violation of their complementary relationship. Worse, when both inputs simultaneously return to 0, the final state depends on which gate wins the race, which depends on manufacturing variation, temperature, and noise. The forbidden state is forbidden because its *exit* is nondeterministic.
+$$Q = \overline{R + \overline{S + Q}}$$
 
-### The D Latch: Collapsing Two Inputs to One
+This has exactly two self-consistent solutions when $S = R = 0$: $Q = 1$ or $Q = 0$. Physically, the gate outputs reinforce each other — if $Q = 1$, it drives $\overline{Q} = 0$, which drives $Q = 1$. The loop is self-sustaining.
 
-The D latch enforces $R = \bar{S}$ via a single inverter, replacing $S$ and $R$ with a single data input $D$ and an enable input $CLK$. This eliminates the forbidden state entirely.
+**Why $S = R = 1$ is forbidden:** Both NOR gates are forced to output 0, so $Q = \overline{Q} = 0$, violating the complementary invariant. When $S$ and $R$ are released simultaneously, both gates race to determine which stable state wins. The outcome depends on transistor mismatch and noise — it is nondeterministic, and the circuit may enter **metastability**, resolving to a valid logic level only after an unbounded delay.
 
-When $CLK=1$ (transparent): $Q$ tracks $D$ continuously.  
-When $CLK=0$ (opaque): $Q$ holds its last value regardless of $D$.
+---
 
-Transparency is the latch's weakness. In a pipeline stage, if a combinational path is long enough that its output is still changing while $CLK$ is high, that change propagates directly through the latch into the next stage — breaking the stage boundary. A latch does not isolate; it merely gates.
+## The D Latch (Level-Sensitive)
 
-### The D Flip-Flop: Edge-Triggered Isolation
+The SR latch requires careful management of two inputs to avoid the forbidden state. The D latch collapses them: $S = D$, $R = \overline{D}$, gated by an enable signal $\text{CLK}$:
 
-A D flip-flop fixes the transparency problem by triggering exactly once per clock cycle, at a clock *edge* rather than during a level. The standard implementation is a master-slave cascade of two D latches with complementary enables:
+- $\text{CLK} = 1$: latch is **transparent** — $Q$ tracks $D$ continuously
+- $\text{CLK} = 0$: latch is **opaque** — $Q$ holds its last value
+
+**Why level-sensitivity is a problem:** If $D$ glitches (transitions spuriously due to combinational hazards) while $\text{CLK} = 1$, each glitch propagates to $Q$. In a pipeline stage, this means $Q$ can change dozens of times during a single clock phase, making it impossible to define a stable "computed value." Synchronous design requires that state updates happen at one precise moment per cycle — which the D latch cannot guarantee.
+
+---
+
+## The D Flip-Flop (Edge-Triggered)
+
+Built from two D latches in **master-slave** configuration:
 
 ```
-        CLK=0: transparent     CLK=1: transparent
-        CLK=1: opaque          CLK=0: opaque
-             │                       │
-D ──── [Master Latch] ──── [Slave Latch] ──── Q
-              ↑                       ↑
-             CLK̄                     CLK
+D ──[Master Latch]──[Slave Latch]── Q
+         CLK̄               CLK
 ```
 
-When $CLK=0$: Master tracks $D$; Slave is opaque, holding $Q$ stable.  
-When $CLK$ rises: Master closes instantly (capturing $D$); Slave opens, propagating the captured value to $Q$.
+- **Master**: transparent when $\text{CLK} = 0$, opaque when $\text{CLK} = 1$
+- **Slave**: opaque when $\text{CLK} = 0$, transparent when $\text{CLK} = 1$
 
-The output $Q$ changes exactly once per cycle, and only at the rising edge:
-
-$$Q[n+1] = D \big|_{t = t_{\text{rise}}}$$
-
-Two timing constraints govern correct operation:
-
-- **Setup time** $t_{su}$: $D$ must be stable for at least $t_{su}$ *before* the clock edge. Violation means the master latch may capture an intermediate voltage.
-- **Hold time** $t_h$: $D$ must remain stable for at least $t_h$ *after* the clock edge. Violation means the captured value can be corrupted while the master is still closing.
-
-Violating either constraint causes **metastability**: the flip-flop output settles to neither 0 nor 1 for an unpredictable duration. The probability of remaining metastable decays exponentially with time:
-
-$$P(\text{metastable after time } \tau) \propto e^{-\tau / \tau_c}$$
-
-where $\tau_c$ is a process-dependent time constant (typically tens of picoseconds). This is why synchronizer circuits in real hardware add deliberate latency after a crossing between clock domains — they are buying resolution time.
-
-### Pipeline Timing Constraints
-
-The critical path through a pipeline stage must satisfy:
-
-$$t_{\text{clk}} \geq t_{pcq} + t_{pd} + t_{su}$$
-
-where:
-- $t_{pcq}$ = propagation delay from clock edge to valid $Q$ output (flip-flop output delay)
-- $t_{pd}$ = worst-case combinational logic delay between flip-flops
-- $t_{su}$ = setup time of the receiving flip-flop
-
-The maximum clock frequency is therefore bounded by the longest combinational path:
-
-$$f_{\text{max}} = \frac{1}{t_{pcq} + t_{pd,\text{max}} + t_{su}}$$
-
-Pipeline design is the art of partitioning $t_{pd,\text{max}}$ across stages so that no single stage dominates. When Linux reports a CPU at 3.6 GHz, that frequency is constrained by the longest path in the entire processor meeting this inequality.
-
-There is also a minimum cycle time constraint from hold time. For correct operation:
-
-$$t_{pd,\text{min}} \geq t_h - t_{ccq}$$
-
-where $t_{ccq}$ is the contamination delay (earliest time $Q$ can change after the clock edge). If $t_{pd,\text{min}}$ is too small — which can happen with short paths when clock skew is present — the receiving flip-flop's hold time is violated and the pipeline corrupts data even at low frequencies.
-
-### Registers: N Flip-Flops, One Clock
-
-A register is $N$ D flip-flops sharing a clock signal, storing an $N$-bit value. The general-purpose registers in x86-64 (`rax`, `rbx`, etc.) are physically a small SRAM register file — an array of 6T SRAM cells with dedicated read and write ports, not discrete flip-flops. The reason registers are faster than L1 cache is structural: fewer cells means shorter bitlines, smaller row decoders, and a shorter critical path through the address logic.
-
-A 64-bit register stores 8 bytes. The x86-64 register file contains 16 general-purpose registers plus control registers, segment registers, and the 16 YMM/ZMM vector registers — each a wider parallel array of the same basic cell.
-
-### Counters: Registered Adders
-
-A counter is a register whose next state is its current state incremented by a constant. The $N$-bit binary counter:
-
-$$Q[n+1] = (Q[n] + 1) \bmod 2^N$$
-
-requires a combinational adder feeding back into the flip-flop D inputs. The carry chain through this adder is often the critical path in the timing analysis, since carry propagation through an $N$-bit ripple adder is $O(N)$.
-
-A practical implication: exhaustively cycling a 32-bit counter to verify its MSB transition from 0 to 1 requires $2^{31} \approx 2.1 \times 10^9$ clock pulses. At 1 GHz this takes over 2 seconds — which is why hardware designers add **scan chains**: a serial shift register threading through all flip-flops, allowing arbitrary state to be injected or extracted without running the circuit through its normal sequence.
-
-### SRAM Cells: Area-Optimized Bistability
-
-An SRAM cell stores one bit using six transistors: two cross-coupled CMOS inverters (the bistable element, identical in function to an SR latch) and two pass transistors controlled by the wordline.
+**Why this achieves edge-triggering:** When $\text{CLK} = 0$, Master tracks $D$ and Slave is locked — $Q$ cannot change. When $\text{CLK}$ rises, Master locks (freezing whatever $D$ was just before the edge) and Slave opens (propagating that frozen value to $Q$). $Q$ therefore changes exactly once per cycle, at the rising edge, regardless of how many times $D$ changed while the clock was low. There is never a moment when *both* latches are transparent simultaneously, so no combinational path from $D$ to $Q$ exists except across a clock edge.
 
 ```
-         VDD         VDD
-          │           │
-         [P1]        [P2]
-          │           │
-BL ──[N3]─┤─────────┤─[N4]── BL̄
-          │           │
-         [N1]        [N2]
-          │           │
-         GND         GND
-          ↑           ↑
-         WL asserted to read/write
+CLK:    ______|‾‾‾‾‾‾|______
+Master: transparent |opaque| transparent
+Slave:  opaque      |transp| opaque
+
+D changes freely here; Q is frozen.
+         ↑ At rising edge: Master locks, Slave opens, Q = D_captured
 ```
 
-- **Read**: Assert WL, sense the differential voltage on BL and BL̄ via a sense amplifier.
-- **Write**: Drive BL/BL̄ to the desired value, assert WL, forcing the cell to flip.
+---
 
-The six-transistor cell retains state as long as power is applied — no refresh needed. Compare to DRAM:
+## Setup Time, Hold Time, and Metastability
 
-$$\text{SRAM: } 6T \approx 0.1\text
+Edge-triggering has physical constraints. The internal nodes of the master latch need time to settle to valid logic levels before the clock edge commits them:
+
+- **Setup time** $t_{su}$: $D$ must be stable for at least $t_{su}$ *before* the clock edge. If violated, the master latch's internal nodes are still transitioning when the clock locks them.
+- **Hold time** $t_h$: $D$ must remain stable for at least $t_h$ *after* the clock edge. If violated, the slave latch's input is disturbed before it becomes opaque.
+- **Clock-to-Q delay** $t_{pcq}$: time from the clock edge until $Q$ is valid at the output.
+
+**Timing constraint for a combinational path** between two flip-flops FF1 and FF2, with combinational delay $t_{pd}$:
+
+$$t_{pcq} + t_{pd} + t_{su} \leq T_{\text{clk}}$$
+
+Rearranging for the minimum clock period:
+
+$$T_{\text{clk}} \geq t_{pcq} + t_{pd} + t_{su}$$
+
+The **critical path** — the longest combinational delay in the design — sets the maximum clock frequency $f_{\text{max}} = 1 / T_{\text{clk,min}}$.
+
+**Hold time constraint** (independent of clock period):
+
+$$t_{pcq} + t_{pd,\text{min}} \geq t_h$$
+
+This bounds the *minimum* combinational delay. A path that is too fast can cause FF2's input to change before $t_h$ has elapsed. Hold violations cannot be fixed by slowing the clock — they require adding buffer delays on the offending path.
+
+**Metastability:** If setup or hold is violated, the flip-flop's internal differential pair resolves neither to 0 nor 1 for an indeterminate time $T_{\text{resolve}}$. The probability that it remains unresolved after waiting time $t$ decays exponentially:
+
+$$P(\text{unresolved after } t) \propto e^{-t/\tau}$$
+
+where $\tau$ is a device parameter on the order of tens of picoseconds. This is the central challenge in **clock domain crossing**: an input asynchronous to the local clock can arrive at any phase, and a synchronizer (two cascaded flip-flops) buys resolution time at the cost of two cycles of latency. The kernel's device drivers deal with this whenever they receive an interrupt from hardware on a different clock domain.
+
+---
+
+## Registers
+
+A register is $N$ flip-flops sharing a common clock and reset line. All $N$ bits update simultaneously at the clock edge, so the register presents an atomically consistent value on the cycle after it is written.
+
+**Why SRAM, not flip-flops, for register files:** A 32-entry, 32-bit register file built from flip-flops would require $32 \times 32 = 1024$ flip-flops. Each flip-flop is roughly 20–40 transistors in a standard cell library. An SRAM bit cell is 6 transistors. The register file therefore uses 6T SRAM cells with a decoder and bitline sense amplifiers. The tradeoff: SRAM is slightly slower (bitline must charge/discharge) but far smaller.
+
+**Address decoding:** A 5-bit register address selects 1 of 32 rows. The decoder is a $5 \to 32$ one-hot demultiplexer; only one wordline goes high. Read latency is dominated by the RC delay of the bitline:
+
+$$t_{\text{read}} \approx R_{\text{bitline}} \cdot C_{\text{bitline}} \cdot N_{\text{cells}}$$
+
+This is why a deeper register file (more entries) is slower, and why out-of-order CPUs with large physical register files (e.g., 256 entries in modern x86) spend significant effort on register file access time.
+
+---
+
+## Counters
+
+A counter is a register whose next-state logic computes $Q + 1$. For an $n$-bit ripple counter, bit $k$ toggles when all bits $0 \ldots k-1$ are 1:
+
+$$T_k = Q_0 \cdot Q_1 \cdots Q_{k-1}$$
+
+The propagation delay of a ripple counter grows linearly: the carry must ripple through $n$ toggle gates before the output is valid, giving worst-case delay $n \cdot t_{pd,\text{gate}}$. This is why ripple counters cannot be clocked at high frequency for large $n$.
+
+A **synchronous counter** computes all carry bits in parallel using a carry-lookahead adder, limiting delay to $O(\log n)$ gate levels. All flip-flops see the same clock edge; no ripple.
+
+**The program counter (PC)

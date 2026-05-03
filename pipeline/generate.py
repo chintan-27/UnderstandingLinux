@@ -69,7 +69,7 @@ def retrieve_chunks(book_key: str, topics: list[str], conn: sqlite3.Connection, 
         score = sum(text.lower().count(kw) for kw in keywords)
         scored.append((score, page, section, text))
 
-    scored.sort(reverse=True)
+    scored.sort(key=lambda x: (x[0], x[1], x[2] or ""), reverse=True)
     top = scored[:n]
 
     parts = []

@@ -12,137 +12,144 @@ resources:
 
 ## Why This Matters
 
-A logic design that simulates perfectly can still fail in silicon. Synthesis converts RTL into a netlist of real gates; place-and-route maps those gates onto physical resources with real wire delays; timing closure verifies that every signal meets its setup and hold requirements under those physical delays. These are not bureaucratic steps — each one introduces constraints that did not exist at the RTL level. Wire resistance and capacitance at 7 nm add more delay than the gates themselves. A hold violation ships a chip that computes wrong answers at room temperature and fails completely at high temperature, where $t_{hold}$ increases. The flip-flop timing equations governing a single register path (Harris §3.5) must be satisfied simultaneously for every one of the millions of paths in a real design, under every corner of PVT (process, voltage, temperature) variation.
-
----
+A circuit that works in simulation can fail catastrophically in silicon. The gap between a correct logical design and a working physical chip is bridged by synthesis, place-and-route, and timing closure — and if any step fails silently, you get hardware that corrupts data at speed, locks up under temperature, or simply never boots. The failure mode is not a crash with a stack trace; it is a register sampling a transitioning signal, producing a metastable output that resolves to an arbitrary value. Every CPU, SoC, and FPGA that runs Linux passed through these workflows before a single instruction executed.
 
 ## Core Concepts
 
-### Synthesis
+### Synthesis: From HDL to Gates
 
-Synthesis takes RTL HDL — Verilog or VHDL — and maps it to a technology-specific netlist: a directed graph of gates, flip-flops, and interconnect. A synthesis tool applies three transformations in sequence:
+Synthesis takes Verilog or VHDL and maps it to a library of real, characterized cells — AND2, DFF, MUX2, full adder — from a target technology. For FPGAs the target is LUT-based fabric; for ASICs it is a foundry-specific standard cell library at a process node (e.g., TSMC 28 nm). The tool performs two distinct optimizations:
 
-1. **Elaboration** — parses HDL and builds a generic Boolean network (AND/OR/NOT/FF), resolving parameters and generate statements. The result is technology-independent.
-2. **Technology mapping** — replaces generic gates with cells from a standard cell library (for ASICs, e.g., TSMC 28nm PDK cells such as `AND2X1`, `DFFX1`) or with LUTs and registers (for FPGAs, e.g., Xilinx 6-input LUT6 and FDRE flip-flops). The mapper minimizes the number of cells used while respecting drive strength requirements.
-3. **Optimization** — restructures logic to minimize area, power, or delay. For timing, it may re-time flip-flops (move registers across combinational logic without changing behavior) or duplicate logic to reduce fanout, which reduces capacitive load and therefore $t_{pd}$.
+- **Logic optimization**: eliminates redundant terms using Boolean algebra and technology-independent restructuring, minimizing cone depth to reduce propagation delay
+- **Technology mapping**: selects which cells from the library implement each function, trading area (cell count) against speed (fewer logic levels)
 
-The output is a gate-level netlist in Verilog or a proprietary checkpoint format. At this stage wire delays are estimated using statistical RC models — actual delay is unknown until placement.
+The output is a **netlist**: a directed graph of gate instances and their connections, with no physical coordinates assigned. Critically, synthesis uses *estimated* wire delays — actual delays depend on physical placement, which has not happened yet.
 
-### Place and Route
+### Place-and-Route: Assigning Physical Reality
 
-**Placement** assigns each cell to a physical location on the die or FPGA fabric. **Routing** connects those cells with metal wires. Both steps determine timing because wire delay scales with length:
+Placement assigns each gate instance to a physical location. In an FPGA, that means assigning logic to specific LUT-FF slices; in an ASIC, to rows of standard cells. Routing then finds wire paths through the available metal layers.
 
-$$t_{wire} = R_{sheet} \cdot \frac{L}{W} \cdot C_{per\_unit} \cdot L = k \cdot L^2$$
+Wire delay is not negligible. Resistance $R$ and capacitance $C$ of a wire segment combine to produce an RC delay:
 
-For a wire of length $L$, resistance scales as $L$ and capacitance scales as $L$, so RC delay scales as $L^2$. At 28 nm and below, a 1 mm wire on a lower metal layer can add 200–400 ps — more than a logic gate. This is why placement quality directly determines whether timing closure is achievable: if two timing-critical registers are placed 2 mm apart, no amount of logic optimization recovers that delay.
+$$t_{wire} \approx 0.38 \cdot R \cdot C = 0.38 \cdot (\rho \cdot L / A) \cdot (\varepsilon \cdot L / d)$$
 
-On an FPGA, placement assigns logic to specific CLBs (Configurable Logic Blocks, each containing LUTs and flip-flops) and routing programs a switch matrix of pass transistors and multiplexers. The switch matrix itself has fixed delays that the router must account for.
+This grows quadratically with wire length $L$, which is why the placer actively minimizes wire length for timing-critical nets. A gate that synthesizes to a 50 ps delay can have its slack consumed entirely by a poorly placed, high-fanout net routing across the die.
 
-### Timing Closure
+The tool iterates between placement and timing analysis, using **timing-driven placement** to pull the endpoints of critical paths physically closer. After routing, every wire segment has a measured $RC$ and thus a precise delay that replaces the synthesis estimates.
 
-Timing closure is the iterative process of driving all path slacks non-negative. It terminates only when every register-to-register path satisfies both its setup and hold constraints simultaneously. The closure conditions come directly from flip-flop aperture requirements (Harris §3.5):
+### Timing Analysis: Enforcing the Dynamic Discipline
 
-**Setup constraint** — combinational logic between two registers must settle before the receiving flip-flop samples:
+Once routing is complete, static timing analysis (STA) enumerates every register-to-register path and checks two constraints that come directly from flip-flop physics.
+
+**Setup constraint** — data must arrive and be stable before the capturing clock edge:
 
 $$T_c \geq t_{pcq} + t_{pd} + t_{setup}$$
 
-**Hold constraint** — the new value must not arrive at the input of the receiving flip-flop before it has safely captured the old value:
+where $T_c$ is the clock period, $t_{pcq}$ is the clock-to-Q propagation delay of the launch register, $t_{pd}$ is the worst-case combinational path delay, and $t_{setup}$ is the setup time of the capture register.
+
+**Hold constraint** — data must not change before the capture register has latched the previous value:
 
 $$t_{ccq} + t_{cd} \geq t_{hold}$$
 
-where:
-- $t_{pcq}$ = clock-to-Q propagation delay (worst-case, for setup analysis)
-- $t_{ccq}$ = clock-to-Q contamination delay (best-case, for hold analysis)
-- $t_{pd}$ = combinational propagation delay on the longest (critical) path
-- $t_{cd}$ = combinational contamination delay on the shortest path
-- $t_{setup}$, $t_{hold}$ = receiver flip-flop aperture requirements
+where $t_{ccq}$ is the *contamination* (best-case) delay through the launch register and $t_{cd}$ is the shortest combinational path delay.
 
-A **setup violation** means $T_c$ is too short — fix by increasing the clock period or reducing $t_{pd}$ via pipelining or logic restructuring.
+The hold constraint is independent of clock frequency — it is a property of minimum-delay paths only. This means slowing the clock does not fix a hold violation; you must increase the short-path delay by inserting buffers. Hold violations introduced by routing are particularly dangerous because the routing tool may create a path shorter than the tool anticipated during synthesis.
 
-A **hold violation** means $t_{cd}$ is too small — the signal races through too quickly. **You cannot fix a hold violation by slowing the clock.** Reducing $T_c$ makes setup harder while leaving hold unchanged, because the hold constraint contains no $T_c$ term. The only fix is adding delay to the short path — inserting buffers or routing detours.
+### Timing Closure
 
-### Timing Constraints
+**Slack** is the signed margin on a constraint:
 
-The tool sees only a netlist. It does not know your clock frequency, which paths cross clock domains, or which paths are structurally present but never exercised in real operation. You supply this information in **SDC (Synopsys Design Constraints)** format, which all major tools accept:
+$$\text{slack}_{\text{setup}} = T_c - (t_{pcq} + t_{pd} + t_{setup})$$
 
-| Constraint | Purpose |
-|---|---|
-| `create_clock` | Declares frequency, waveform, and source pin |
-| `set_input_delay` / `set_output_delay` | Models delay from off-chip sources/sinks relative to the clock |
-| `set_false_path` | Excludes a path from timing analysis entirely |
-| `set_multicycle_path` | Relaxes a path to $N \cdot T_c$ instead of $T_c$ |
-| `set_clock_groups` | Declares asynchronous relationships between clock domains |
+$$\text{slack}_{\text{hold}} = (t_{ccq} + t_{cd}) - t_{hold}$$
 
-Incorrect constraints are as dangerous as a logic error. Over-constraining wastes area and power as the tool over-optimizes; under-constraining ships a design with undetected violations.
+Negative slack on any path is a violation. The tool reports the worst negative slack as **WNS (Worst Negative Slack)** and the sum of all negative slacks as **TNS (Total Negative Slack)**. Closure means driving both to zero or better.
 
----
+The iterative fix cycle is: identify critical path → re-synthesize that cone (retiming, gate sizing, logic restructuring) → re-place nearby cells → re-route affected nets → re-run STA. For hold violations, the fix is automatic buffer insertion on the offending short path.
+
+### Constraints: Telling the Tool What Matters
+
+Without constraints, STA has no reference point. The constraint file defines the problem the tool is solving. **SDC (Synopsys Design Constraints)** is the industry standard format, used by both FPGA and ASIC tools.
+
+Key constructs:
+
+- `create_clock`: defines a clock's period and waveform; without this, the tool cannot check any setup or hold constraint
+- `set_input_delay` / `set_output_delay`: models external path segments that the tool cannot see — the logic driving your input pins, or the register capturing your outputs downstream
+- `set_false_path`: marks paths that are never sensitized simultaneously (e.g., scan chains during functional mode, or configuration registers written only at startup) — removing them from STA prevents false critical paths
+- `set_multicycle_path`: when combinational logic is designed to take $N$ cycles, this relaxes the setup constraint by $(N-1) \cdot T_c$, preventing the tool from uselessly trying to shorten a path that is intentionally slow
+
+Incorrect constraints are often more dangerous than missing ones: a `set_false_path` applied to a path that *is* functionally active masks a real violation.
 
 ## How It Works
 
-### Slack and the Critical Path
+### A Concrete Timing Path
 
-For every register-to-register path, the tool computes:
+Given:
+- $t_{pcq} = 80\,\text{ps}$, $t_{setup} = 50\,\text{ps}$
+- Three gate levels at $t_{pd} = 40\,\text{ps}$ each, plus routing at $t_{wire} = 30\,\text{ps}$
 
-$$\text{setup slack} = T_c - (t_{pcq} + t_{pd} + t_{setup})$$
+$$T_c \geq 80 + 3(40) + 30 + 50 = 280\,\text{ps}$$
 
-$$\text{hold slack} = (t_{ccq} + t_{cd}) - t_{hold}$$
+$$f_{max} = \frac{1}{280\,\text{ps}} \approx 3.57\,\text{GHz}$$
 
-Positive slack means the constraint is met; negative slack is a **violation** that must be resolved before tapeout. The path with the most negative setup slack is the **critical path** — it sets the minimum achievable clock period and therefore $f_{max}$.
+For the hold check on a short path: $t_{ccq} = 30\,\text{ps}$, one gate $t_{cd} = 25\,\text{ps}$, wire $t_{wire,min} = 0\,\text{ps}$ (direct connection after routing). With $t_{hold} = 60\,\text{ps}$:
 
-The tool reports slack not at a single operating point but across multiple **timing corners**: slow-slow (slow process, low voltage, high temperature — worst for setup), fast-fast (fast process, high voltage, low temperature — worst for hold), and typically several intermediate corners. A design is not closed until all corners pass.
+$$\text{slack}_{hold} = (30 + 25) - 60 = -5\,\text{ps}$$
 
-### Example: Computing $f_{max}$ from a Critical Path
+This is a hold violation. The fix is inserting a buffer with contamination delay $\geq 5\,\text{ps}$ on that path. In practice, tools insert two matched buffers to avoid introducing new asymmetries.
 
-Three-stage combinational path (Harris §3.5, Figure 3.43): $t_{pcq} = 80\,\text{ps}$, $t_{pd} = 40\,\text{ps}$ per gate (three gates), $t_{setup} = 50\,\text{ps}$:
-
-$$T_c \geq t_{pcq} + 3 \cdot t_{pd} + t_{setup} = 80 + 120 + 50 = 250\,\text{ps}$$
-
-$$f_{max} = \frac{1}{T_c} = \frac{1}{250 \times 10^{-12}} = 4\,\text{GHz}$$
-
-Now suppose the same path after place-and-route has a wire delay of $t_{wire} = 200\,\text{ps}$ on the connection between gate 2 and gate 3:
-
-$$T_c \geq 80 + 40 + 40 + 200 + 40 + 50 = 450\,\text{ps}$$
-
-$$f_{max} = \frac{1}{450 \times 10^{-12}} \approx 2.22\,\text{GHz}$$
-
-The wire delay alone cut $f_{max}$ nearly in half. No logic optimization after placement can recover this — the fix must be at placement: move the two cells closer, or pipeline the path to split $t_{pd}$.
-
-### A Minimal SDC Constraints File
+### SDC Constraint File
 
 ```tcl
-# 100 MHz clock on the clk port; period in nanoseconds
-create_clock -period 10.0 -name sys_clk [get_ports clk]
+# Define a 4 GHz clock on pin clk
+create_clock -period 0.250 -name sys_clk [get_ports clk]
 
-# Input data is driven by a flip-flop on the board that launches
-# 2 ns after the rising edge; tool sees 2 ns already consumed
-set_input_delay -clock sys_clk -max 2.0 [get_ports data_in]
+# Input data arrives 50 ps after the launching clock edge (external register delay)
+set_input_delay -clock sys_clk -max 0.050 [get_ports data_in]
 
-# Receiving register on the board requires data stable 1 ns before
-# the next rising edge; tool sees 1 ns already consumed at destination
-set_output_delay -clock sys_clk -max 1.0 [get_ports data_out]
+# Output must be captured: it must be stable 30 ps before the next clock edge
+set_output_delay -clock sys_clk -max 0.030 [get_ports data_out]
 
-# Reset is an asynchronous input written once at power-on.
-# It crosses no timing path and must not be analyzed.
-set_false_path -from [get_ports rst_n]
+# This path crosses asynchronous clock domains — no timing relationship exists
+set_false_path -from [get_clocks clk_a] -to [get_clocks clk_b]
+
+# This accumulator takes 2 cycles by design — relax setup by one period
+set_multicycle_path 2 -setup -from [get_cells accum_reg*]
+# Also adjust hold for a 2-cycle path: hold checks shift to the previous edge
+set_multicycle_path 1 -hold  -from [get_cells accum_reg*]
 ```
 
-The `-max` variants of `set_input_delay` and `set_output_delay` apply to setup analysis. You should also set `-min` variants for hold analysis — omitting them leaves hold at the I/O boundary unconstrained.
+Note the paired `set_multicycle_path` for hold: forgetting the hold adjustment with a multicycle setup path creates a spurious hold violation at the original launch edge.
 
-### FPGA Synthesis and Implementation (Xilinx/AMD Vivado)
+### FPGA Implementation Flow (Open Source)
 
-Vivado separates synthesis and implementation into distinct phases, each producing a **design checkpoint** (`.dcp`) that captures the netlist, constraints, and physical state. This allows you to iterate on implementation without re-running synthesis.
+The open-source **Yosys + nextpnr** toolchain implements the full synthesis and place-and-route flow for several FPGA families. This runs natively on any Linux system.
 
 ```bash
-# Run synthesis in batch mode using a Tcl script
-vivado -mode batch -source synth.tcl 2>&1 | tee synth.log
+# Install on Debian/Ubuntu
+sudo apt install yosys nextpnr-ice40 icestorm
+
+# Synthesis: Verilog -> technology-mapped netlist for iCE40 fabric
+# synth_ice40 runs: coarse logic opt -> technology mapping -> LUT packing
+yosys -p "synth_ice40 -top my_module -json my_design.json" my_design.v
+
+# Place and route: assigns LUT-FF slices and routes interconnect
+# --hx8k: iCE40 HX8K device; --package ct256: 256-ball BGA package
+nextpnr-ice40 --hx8k --package ct256 \
+              --json my_design.json \
+              --pcf my_constraints.pcf \
+              --asc my_design.asc \
+              --timing-allow-fail   # remove this in production
+
+# nextpnr prints timing after routing, e.g.:
+# Info: Max frequency for clock 'clk': 87.32 MHz (PASS at 50.00 MHz)
+# If it prints FAIL, you have negative slack.
+
+# Pack placed/routed design into iCE40 binary bitstream
+icepack my_design.asc my_design.bin
+
+# Program the FPGA via USB (iceprog requires write permission on /dev/ttyUSB*)
+iceprog my_design.bin
 ```
 
-```tcl
-# synth.tcl — synthesis script
-read_verilog design.v
-read_xdc constraints.xdc
-
-# -part specifies the exact device: Artix-7 35T in CPG236 package, speed grade -1
-synth_design -top top_module -part xc7a35tcpg236-1
-
-write_checkpoint post_synth
+The `.pcf`

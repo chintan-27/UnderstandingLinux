@@ -12,115 +12,135 @@ resources:
 
 ## Why This Matters
 
-Every abstraction in computing bottoms out in physics. The transistor works because electrons in silicon are forbidden from occupying arbitrary energies — quantization is not a convenience of the model, it is what makes stable matter possible. Without it, an orbiting electron radiates, loses energy, and collapses into the nucleus in roughly $10^{-11}$ seconds. No stable atoms means no crystal lattices, no bandgap engineering, no semiconductors, no DRAM. The uncertainty principle is the mechanism that sets the minimum size of an atom — which sets the minimum size of a silicon unit cell — which ultimately bounds how small a transistor gate can be. This module builds that foundation.
+Transistors exist because silicon has a bandgap of 1.12 eV — not 0.5 eV, not 5 eV, but exactly that value, set by quantum mechanics. That bandgap determines the threshold voltage your CPU's gate oxide must maintain to distinguish logic 0 from logic 1. The 808 nm laser diode in a fiber-optic transceiver emits at precisely that wavelength because an electron in a specific semiconductor quantum well drops between two discrete energy levels separated by exactly 1.53 eV. None of this is tunable by engineering choice — it is fixed by atomic structure. If you want to understand why silicon works, why doping changes conductivity, or why photonic interconnects operate at specific wavelengths, you need the quantized atom.
 
 ---
 
 ## Core Concepts
 
-### Why Classical Orbits Are Impossible
+### Why the Classical Atom Fails — Specifically
 
-An electron in circular orbit is centripetally accelerating. Classical electrodynamics (Larmor's formula) says any accelerating charge radiates power:
+A classical orbiting electron is a charged particle undergoing centripetal acceleration. By Maxwell's equations, any accelerating charge radiates energy. The electron should continuously lose energy, spiraling inward. The radiated power is given by the Larmor formula:
 
-$$P = \frac{e^2 a^2}{6\pi \epsilon_0 c^3}$$
+$$P = \frac{e^2 a^2}{6\pi\epsilon_0 c^3}$$
 
-For a hydrogen ground-state orbit, the centripetal acceleration is $a \approx 9 \times 10^{22}\ \text{m/s}^2$, giving $P \approx 4.6 \times 10^{-8}$ W. The total orbital energy is about $-13.6$ eV $\approx 2.2 \times 10^{-18}$ J. The collapse time is:
+where $a$ is the centripetal acceleration. Plugging in the numbers for a ground-state Bohr orbit ($r \approx 0.5$ Å), the electron would collapse into the nucleus in about $10^{-11}$ s. Hydrogen has existed for 13 billion years. The classical prediction is wrong by a factor of $10^{28}$. Something prevents radiation from occurring at all in the ground state — that something is quantization. An electron in a stationary eigenstate has no oscillating charge distribution, so it produces no electromagnetic radiation.
 
-$$t_\text{collapse} \sim \frac{|E|}{P} \approx \frac{2.2 \times 10^{-18}}{4.6 \times 10^{-8}} \approx 5 \times 10^{-11}\ \text{s}$$
+### Standing Waves as the Origin of Shells
 
-This is not a rounding error — classical mechanics gives a definite, short timescale for atomic destruction. The fact that hydrogen atoms survive indefinitely is a hard falsification of classical mechanics at atomic scales.
+An electron confined near a nucleus is not a billiard ball in an orbit. It is a wave. For a circular orbit of radius $r$ to be a stable stationary state, the wave must close on itself without destructive interference — the circumference must contain an integer number of de Broglie wavelengths:
 
-### The Uncertainty Principle as a Stabilizing Pressure
+$$2\pi r = n\lambda = \frac{nh}{p}, \quad n = 1, 2, 3, \ldots$$
 
-Heisenberg's uncertainty principle:
+This is exactly the condition for standing waves on a closed loop. Any radius that doesn't satisfy this condition produces a wave that cancels itself out — it simply cannot exist as a stable state. The integer $n$ is the **principal quantum number**, and it is discrete because integers are discrete. Shells are not zones arbitrarily labeled by chemists; they are nodes of a standing wave.
 
-$$\Delta x \cdot \Delta p \gtrsim \frac{\hbar}{2}$$
+The de Broglie wavelength:
 
-is a statement about waves, not about measurement clumsiness. A wave packet localized to a region $\Delta x$ must be a superposition of many wavelengths spanning a range $\Delta \lambda$. Since $p = h/\lambda$, a spread in wavelength is a spread in momentum. Compressing the electron closer to the nucleus does not reduce its energy — it *increases* the momentum uncertainty, which increases the kinetic energy. This creates an outward pressure that opposes electrostatic attraction.
+$$\lambda = \frac{h}{p}$$
 
-The equilibrium between these two tendencies is not arbitrary — it defines a specific length scale, the Bohr radius $a_0 \approx 0.529$ Å, and a specific ground-state energy, $E_1 = -13.6$ eV. Both are derived below from first principles with no free parameters.
+where $h = 6.626 \times 10^{-34}$ J·s. For an electron with kinetic energy $KE$, $p = \sqrt{2m_e \cdot KE}$, so higher-energy electrons have shorter wavelengths and fit into smaller orbits — the causality runs from energy to orbit size, not the reverse.
 
-### Energy Quantization: Why Discrete Levels Exist
+### The Uncertainty Principle as the Physical Floor
 
-The same wave nature that produces the uncertainty principle requires that bound-state wavefunctions satisfy boundary conditions — they must be normalizable (vanish at infinity) and single-valued. These constraints are not optional; a wavefunction that fails them is unphysical. Imposing them on the Schrödinger equation for a $1/r$ potential yields solutions only at discrete energies. For hydrogen:
+Why doesn't the electron minimize its energy by sitting directly on the proton? Suppose you try to confine it to a region of size $\Delta x = a$. Then:
 
-$$E_n = -\frac{13.6\ \text{eV}}{n^2}, \quad n = 1, 2, 3, \ldots$$
+$$\Delta p \gtrsim \frac{\hbar}{2a}$$
 
-The $n^{-2}$ dependence is not phenomenological — it falls out of the radial Schrödinger equation exactly. The ground state ($n=1$, $E_1 = -13.6$ eV) is the lowest energy the electron can have while satisfying the wave boundary conditions and the uncertainty principle simultaneously. There is no lower state to decay into.
+This is not a measurement limitation. It is a statement about what the electron's momentum *is*: if you know where it is, its momentum is genuinely spread over a range, meaning its kinetic energy has a minimum value proportional to $1/a^2$. The smaller the box, the higher the kinetic energy floor. There is an equilibrium: electrostatic attraction pulls inward (energy $\propto -1/a$), kinetic confinement energy pushes outward (energy $\propto +1/a^2$). The atom settles at the radius where these balance.
 
-The ionization energy of hydrogen is:
+$$\Delta x \cdot \Delta p \gtrsim \frac{\hbar}{2}, \quad \hbar = \frac{h}{2\pi} \approx 1.055 \times 10^{-34} \text{ J·s}$$
 
-$$E_\infty - E_1 = 0 - (-13.6\ \text{eV}) = 13.6\ \text{eV}$$
+### Energy Quantization: The Rydberg Formula
 
-This is the **Rydberg energy**, $E_R = m_e e^4 / 2(4\pi\epsilon_0)^2\hbar^2$. Every constant in that expression has a physical origin: $m_e$ sets the inertia, $e^4$ the electrostatic strength, $\hbar^2$ the confinement penalty. The fact that they combine to give exactly 13.6 eV is a consistency check on the entire framework.
+The allowed energies of hydrogen are:
 
-### Electron Shells and the Pauli Exclusion Principle
+$$E_n = -\frac{m_e e^4}{8\epsilon_0^2 h^2} \cdot \frac{1}{n^2} = -\frac{13.6 \text{ eV}}{n^2}$$
 
-Electrons are fermions: the total wavefunction of two identical electrons must be antisymmetric under exchange. The consequence is that no two electrons in the same atom can share all four quantum numbers:
+The negative sign is binding energy — this much energy must be supplied to free the electron. The ground state ($n=1$) sits at $-13.6$ eV; the ionization threshold is $0$ eV. The energy difference between two levels is:
 
-| Number | Symbol | Physical Meaning | Allowed Values |
-|--------|--------|-----------------|----------------|
-| Principal | $n$ | Energy / shell radius | $1, 2, 3, \ldots$ |
-| Angular momentum | $\ell$ | Orbital shape (s, p, d, f) | $0, 1, \ldots, n-1$ |
-| Magnetic | $m_\ell$ | Orbital orientation | $-\ell, \ldots, +\ell$ |
-| Spin | $m_s$ | Intrinsic angular momentum | $+\tfrac{1}{2}, -\tfrac{1}{2}$ |
+$$\Delta E = 13.6 \text{ eV} \left(\frac{1}{n_1^2} - \frac{1}{n_2^2}\right)$$
 
-The number of states in shell $n$ is:
+A photon emitted when the electron drops from $n_2$ to $n_1$ carries exactly this energy. The spectrum of hydrogen is discrete because $n$ is an integer, and integers are not continuous. The photon wavelength is:
 
-$$\sum_{\ell=0}^{n-1}(2\ell+1) \times 2 = 2n^2$$
+$$\lambda = \frac{hc}{\Delta E}$$
 
-giving capacity 2, 8, 18, 32 for $n = 1, 2, 3, 4$. The Pauli principle forces each additional electron into the next available state, building the periodic table from the bottom up. Valence electrons — those in the outermost partially-filled shell — determine chemical bonding. Silicon has four valence electrons in $n=3$, which is why it forms a tetrahedral crystal and has a bandgap amenable to transistor operation.
+For the Balmer series ($n_1 = 2$), transitions land in the visible range — this is why a hydrogen discharge tube glows red (656 nm, $n=3\to2$) rather than white.
+
+### Why Atoms Resist Compression
+
+When two atoms are pushed together, their electron clouds overlap and must now occupy a smaller combined volume. By the uncertainty principle, confining those electrons more tightly raises their minimum kinetic energy. This increase is steeper than the electrostatic attraction — kinetic energy scales as $1/a^2$ while potential energy scales as $1/a$ — so the energy minimum disappears and you get a repulsive wall. This is why condensed matter is rigid. It is not a classical spring; it is a quantum kinetic energy effect.
 
 ---
 
 ## How It Works
 
-### Deriving the Hydrogen Ground State from the Uncertainty Principle
+### Deriving the Bohr Radius from First Principles
 
-Let the electron be at characteristic distance $a$ from the proton. The total energy has two terms.
+Set the confinement scale to $a$. By the uncertainty principle:
 
-**Potential energy** (Coulomb):
+$$\langle p^2 \rangle \sim \frac{\hbar^2}{a^2} \implies KE \sim \frac{\hbar^2}{2m_e a^2}$$
 
-$$U(a) = -\frac{e^2}{4\pi\epsilon_0 a}$$
+Electrostatic potential energy at separation $a$:
 
-**Kinetic energy**: Confinement to radius $a$ forces $\Delta x \sim a$, so:
+$$PE \sim -\frac{e^2}{4\pi\epsilon_0 a}$$
 
-$$\Delta p \sim \frac{\hbar}{a} \implies T \sim \frac{(\Delta p)^2}{2m_e} = \frac{\hbar^2}{2m_e a^2}$$
-
-**Total energy**:
+Total energy as a function of $a$:
 
 $$E(a) = \frac{\hbar^2}{2m_e a^2} - \frac{e^2}{4\pi\epsilon_0 a}$$
 
-The kinetic term scales as $a^{-2}$ and the potential as $a^{-1}$. At large $a$, the potential dominates and $E$ decreases as $a$ shrinks — the electron is attracted inward. At small $a$, the kinetic term dominates and $E$ increases — the confinement penalty pushes back. There is a minimum. Setting $dE/da = 0$:
+Minimize:
 
-$$-\frac{\hbar^2}{m_e a^3} + \frac{e^2}{4\pi\epsilon_0 a^2} = 0$$
+$$\frac{dE}{da} = -\frac{\hbar^2}{m_e a^3} + \frac{e^2}{4\pi\epsilon_0 a^2} = 0$$
 
-$$\boxed{a_0 = \frac{4\pi\epsilon_0 \hbar^2}{m_e e^2} \approx 0.529\ \text{Å}}$$
+$$\boxed{a_0 = \frac{4\pi\epsilon_0 \hbar^2}{m_e e^2} \approx 0.529 \text{ Å}}$$
 
-This is the **Bohr radius**. Substituting back into $E(a_0)$:
+Substituting $a_0$ back into $E(a)$:
 
-$$E_1 = \frac{\hbar^2}{2m_e a_0^2} - \frac{e^2}{4\pi\epsilon_0 a_0} = -\frac{m_e e^4}{2(4\pi\epsilon_0)^2 \hbar^2} \approx -13.6\ \text{eV}$$
+$$E(a_0) = -\frac{m_e e^4}{8\epsilon_0^2 h^2} \approx -13.6 \text{ eV}$$
 
-No fitting parameters. The ground state energy and atomic radius emerge from three constants ($m_e$, $e$, $\hbar$) and one principle (minimize energy subject to confinement). This is why all hydrogen atoms everywhere are the same size.
+Both numbers come out correctly. The argument is semiclassical but the physics is right: the atom's size and binding energy are determined entirely by $\hbar$, $m_e$, and $e$.
 
-### Spectral Lines: Energy Conservation in Photon Emission
+### Quantum Numbers and Shell Capacity
 
-When an electron transitions from level $n_i$ to $n_f < n_i$, the energy difference must go somewhere — it is carried away by a photon. Energy conservation requires:
+Each electron in an atom is completely characterized by four quantum numbers:
 
-$$E_\text{photon} = E_{n_i} - E_{n_f} = 13.6\ \text{eV}\left(\frac{1}{n_f^2} - \frac{1}{n_i^2}\right)$$
+| Number | Symbol | Range | Meaning |
+|---|---|---|---|
+| Principal | $n$ | $1, 2, 3, \ldots$ | Shell; sets energy scale |
+| Angular momentum | $\ell$ | $0$ to $n-1$ | Orbital shape (s, p, d, f) |
+| Magnetic | $m_\ell$ | $-\ell$ to $+\ell$ | Orbital orientation; $2\ell+1$ values |
+| Spin | $m_s$ | $\pm\frac{1}{2}$ | Intrinsic angular momentum |
 
-The photon frequency and wavelength follow from $E = hf = hc/\lambda$:
+The Pauli exclusion principle: no two electrons in the same atom can share all four quantum numbers. Counting all combinations for a given $n$:
 
-$$\frac{1}{\lambda} = \frac{E_\text{photon}}{hc} = R_\infty\left(\frac{1}{n_f^2} - \frac{1}{n_i^2}\right)$$
+$$N_n = \sum_{\ell=0}^{n-1} 2(2\ell+1) = 2n^2$$
 
-where $R_\infty = m_e e^4 / 8\epsilon_0^2 h^3 c \approx 1.097 \times 10^7\ \text{m}^{-1}$ is the **Rydberg constant**. This formula, derived purely theoretically, matches hydrogen spectral measurements to six significant figures.
+| $n$ | Max electrons |
+|:---:|:---:|
+| 1 | 2 |
+| 2 | 8 |
+| 3 | 18 |
+| 4 | 32 |
 
-The Balmer series ($n_f = 2$, transitions landing in the visible) gives:
+Silicon has 14 electrons. Its ground-state configuration is $1s^2\, 2s^2\, 2p^6\, 3s^2\, 3p^2$. The four electrons in the $n=3$ shell are the valence electrons that form covalent bonds in the crystal lattice. Doping introduces atoms with 3 or 5 valence electrons, creating holes or free electrons — but that mismatch only makes sense against the backdrop of the filled-shell structure.
 
-| Transition | $E_\text{photon}$ | $\lambda$ | Color |
-|------------|-------------------|-----------|-------|
-| $3 \to 2$ | 1.89 eV | 656 nm | Red |
-| $4 \to 2$ | 2.55 eV | 486 nm | Cyan |
-| $5 \to 2$ | 2.86 eV | 434 nm | Violet |
+### Photon Emission: Computing Wavelengths
 
-Each element has a unique nuclear
+```python
+# Hydrogen energy level transitions
+# E_n = -13.6 eV / n^2
+# Photon energy = delta_E, wavelength = hc / delta_E
+
+h   = 6.626e-34   # Planck's constant, J·s
+c   = 2.998e8     # speed of light, m/s
+eV  = 1.602e-19   # joules per eV
+
+def hydrogen_transition(n_upper: int, n_lower: int) -> dict:
+    """
+    Compute photon properties for a hydrogen emission transition.
+    n_upper > n_lower required for emission.
+    Returns energy in eV and wavelength in nm.
+    """
+    if n_upper <= n_lower:
+        raise ValueError("n_upper must exceed n_lower for emission")
+    delta_E_eV = 13.6 * (1/n_lower**2 - 1/n_upper**2)

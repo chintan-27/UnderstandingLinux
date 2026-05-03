@@ -12,7 +12,7 @@ resources:
 
 ## Why This Matters
 
-Every sensor, microphone, ADC input, and radio front-end in a Linux system produces signals too small or too poorly conditioned to use directly. Getting this wrong has concrete consequences: an amplifier with wrong gain clips the ADC input and produces flat-topped waveforms that look like distortion; one with wrong biasing cuts off half the waveform silently; one without correct frequency compensation oscillates and either destroys itself or floods the signal chain with RF noise that corrupts nearby ADC readings. The op-amp solves all of these problems when used correctly, but its real behavior departs from the ideal in ways that corrupt precision measurements and destabilize feedback loops. Understanding those departures from first principles — not just memorizing formulas — is what lets you diagnose failures and select components that actually work.
+Every sensor reading that enters a Linux system — a thermistor on a Raspberry Pi GPIO pin, a microphone feeding ALSA, a pressure transducer on an industrial Modbus controller — starts as a tiny, noisy analog voltage. Before an ADC can digitize it, something has to amplify it to a usable range, reject common-mode noise, and hold the operating point stable across temperature. The math in this module is the bridge between that physical signal and the integer in `/dev/input` or the PCM buffer in an ALSA period that Linux actually operates on.
 
 ---
 
@@ -24,90 +24,128 @@ Gain is the ratio of output signal to input signal. For a voltage amplifier:
 
 $$A_v = \frac{V_{out}}{V_{in}}$$
 
-Gain is dimensionless when both quantities are voltages, but is almost always expressed in decibels:
+Expressed in decibels:
 
 $$A_{dB} = 20 \log_{10}\left(\frac{V_{out}}{V_{in}}\right)$$
 
-A gain of 10 is 20 dB; a gain of 1000 is 60 dB. The log scale is not cosmetic — cascaded stages multiply their linear gains but *add* their dB values, which makes multi-stage design arithmetic tractable and lets you read stability margins directly off a Bode plot.
+The factor of 20, not 10, appears because power scales as $V^2$: $10\log_{10}(V_2^2/V_1^2) = 20\log_{10}(V_2/V_1)$. This matters beyond notation: cascaded stages **add** in dB rather than multiply, which is why a 40 dB preamp followed by a −6 dB attenuator gives 34 dB of net gain by inspection, no multiplication required.
 
-**Where does gain come from physically?** A transistor is a current-controlled (BJT) or voltage-controlled (MOSFET) device. A small change at the control terminal modulates a much larger current through the device. That current flowing through a load resistor $R_C$ produces a voltage swing $\Delta V = \Delta I_C \cdot R_C$. The ratio of that output swing to the input swing that caused it is the voltage gain. Gain is not magic — it is energy from the supply redirected by a small control signal.
+A few reference points worth memorizing:
+
+| Ratio | dB |
+|---|---|
+| 1× (unity) | 0 dB |
+| 2× | +6 dB |
+| 10× | +20 dB |
+| 0.5× | −6 dB |
+| 0.001× | −60 dB |
 
 ### Biasing
 
-A transistor amplifies only while it operates in its active (BJT) or saturation (MOSFET) region. If the DC operating point — the *quiescent point* $Q$ — is wrong, the transistor is either cut off (no current, signal is blocked entirely) or driven into hard saturation (transistor fully on, no headroom to swing). Biasing places the quiescent point in the middle of the linear range so that an AC signal can swing symmetrically in both directions without clipping.
+A bipolar junction transistor (BJT) amplifies only when it is in the **active region** — $V_{BE} \approx 0.6\,\text{V}$, $V_{CE}$ large enough to keep the collector junction reverse-biased. The **quiescent point (Q-point)** is the DC operating point around which a signal swings.
 
-For a BJT common-emitter stage with emitter degeneration:
+Without a proper Q-point, a sinusoidal input centered on 0 V spends half its cycle driving $V_{BE}$ below the turn-on threshold. The transistor cuts off, the output clips on the negative half, and you have crossover distortion — a hard nonlinearity that contaminates every harmonic. The bias network — resistor divider, current mirror, or active bias — sets the base/gate at a fixed DC voltage so the transistor is always partially on. The AC signal then rides on top of that DC level and the transistor sees only a small excursion around the Q-point in both directions.
 
-$$I_C \approx \frac{V_B - V_{BE}}{R_E}$$
+The Q-point also sets transconductance directly (see below), so a poorly chosen $I_{C,Q}$ changes the gain of every downstream calculation.
 
-where $V_{BE} \approx 0.6\,\text{V}$ and $V_B$ is set by a resistor divider from the supply. This makes $I_C$ depend on $V_B / R_E$ — both stable quantities — rather than on $\beta$.
+### Small-Signal Thinking
 
-**Why does this matter for production hardware?** $\beta$ varies by 3× across units of the same part number and also shifts significantly with temperature. A bias scheme that depends directly on $\beta$ will produce a working prototype and broken production units. Emitter degeneration breaks that dependency: $I_C$ is now determined by resistor ratios, which are stable to 1% or better.
+Around a valid Q-point, a nonlinear device is locally linear. The slope of $I_C$ vs. $V_{BE}$ at the Q-point defines **transconductance**:
 
-### Small-Signal Analysis
+$$g_m = \frac{\partial I_C}{\partial V_{BE}}\bigg|_{Q} = \frac{I_{C,Q}}{V_T}$$
 
-Once you have a stable DC operating point, you separate AC signal analysis from DC bias analysis entirely. The nonlinear transistor is replaced with a linear equivalent model — valid only for signals small enough that the nonlinearity is negligible.
+where $V_T = kT/q \approx 26\,\text{mV}$ at $T = 300\,\text{K}$. At a quiescent collector current of $1\,\text{mA}$:
 
-The central parameter is **transconductance** $g_m$: the ratio of small-signal collector current change to small-signal base-emitter voltage change:
+$$g_m = \frac{1\,\text{mA}}{26\,\text{mV}} \approx 38.5\,\text{mA/V}$$
 
-$$g_m = \frac{\partial I_C}{\partial V_{BE}}\bigg|_{Q} = \frac{I_C}{V_T}$$
+The small-signal model (the **hybrid-$\pi$ model**) replaces the transistor with:
+- $r_\pi = \beta / g_m$ between base and emitter
+- A dependent current source $g_m v_{be}$ from collector to emitter
+- All DC supplies replaced by short circuits (voltage sources) or open circuits (current sources)
 
-where $V_T = kT/q \approx 26\,\text{mV}$ at room temperature ($T = 300\,\text{K}$). A transistor biased at $I_C = 1\,\text{mA}$ has $g_m = 1\,\text{mA} / 26\,\text{mV} \approx 38\,\text{mA/V}$.
-
-The voltage gain of the common-emitter stage in small-signal terms:
-
-$$A_v = -g_m R_C$$
-
-The minus sign is real: the output is phase-inverted relative to the input. With $g_m = 38\,\text{mA/V}$ and $R_C = 1\,\text{k}\Omega$:
-
-$$A_v = -(38 \times 10^{-3})(1 \times 10^3) = -38$$
-
-**Why use a separate small-signal model rather than solving the full nonlinear equations?** Because linearity enables superposition, Thévenin/Norton equivalents, and phasor analysis — none of which apply to nonlinear systems. Small-signal analysis converts an intractable problem into a routine linear circuit problem. The price is that the model breaks down for large signals, which is when you see harmonic distortion in audio or intermodulation products in RF.
+This linearization is valid only for signal amplitudes small enough that the nonlinearity is negligible — roughly $v_{be} \ll V_T$, meaning peak swings well under 10 mV. Larger signals require either distortion analysis or a return to the full Ebers-Moll equations.
 
 ### Comparators
 
-A comparator outputs a logic HIGH when $V_+ > V_-$ and LOW otherwise. It is an open-loop amplifier exploiting enormous open-loop gain to slam the output to one rail or the other for any nonzero differential input:
+A comparator is a differential amplifier used **without negative feedback**. With open-loop gain $A_{OL} \sim 10^5$, a 100 µV imbalance drives the output to a supply rail. The output is binary regardless of the input magnitude.
 
-$$V_{out} = \begin{cases} V_{high} & \text{if } V_+ > V_- \\ V_{low} & \text{if } V_+ < V_- \end{cases}$$
+Comparators are **not** interchangeable with op-amps in closed-loop circuits for two reasons:
 
-**Why not use a general-purpose op-amp as a comparator?** Op-amps are internally compensated for stability in closed-loop feedback — they have a deliberately introduced dominant pole that rolls off their gain early (see below). This makes their output transitions slow: a compensated op-amp used open-loop may take microseconds to resolve a decision that a comparator resolves in nanoseconds. Worse, op-amp output stages are not designed for rail-to-rail switching and may enter an internal state that requires the input to overdrive far past the threshold before the output recovers — called *phase reversal* or *latch-up* depending on the architecture. Conversely, using a comparator (which has no frequency compensation) inside a feedback loop causes oscillation because the phase margin is undefined and almost certainly negative.
+1. **No internal frequency compensation.** General-purpose op-amps (e.g., LM741, TL071) are intentionally bandwidth-limited to keep them stable under feedback. A comparator (e.g., LM393) has no such compensation. Put feedback around it and it will oscillate.
+2. **Open-collector outputs.** Many comparators (LM393, LM339) have open-collector outputs requiring an external pull-up resistor. This is deliberate — it lets you wire-AND multiple comparators or pull up to a different supply than the comparator itself uses.
 
-### Op-Amp Intuition: Virtual Short and Why It Works
+The practical implication: if you are reading a threshold detector attached to a Raspberry Pi GPIO, the pull-up resistor on the comparator output (often `config.txt` sets `gpio=X=ip,pu` or the kernel configures it via `pinctrl`) is part of the circuit, not optional.
 
-An op-amp is a differential amplifier with open-loop DC gain $A_{OL}$ between $10^5$ and $10^8$ (100–160 dB). With negative feedback applied, the output adjusts to drive the differential input $V_+ - V_-$ to zero. This is the *virtual short* principle: in a correctly configured negative-feedback circuit, $V_+ \approx V_-$ because any departure from equality is amplified by $A_{OL}$ and immediately corrected at the output.
+### Op-Amp Intuition
 
-For the **non-inverting amplifier** (feedback divider from output to $V_-$, input at $V_+$):
+An ideal op-amp has infinite open-loop gain $A_{OL}$, infinite input impedance, and zero output impedance. Under **negative feedback**, these ideals collapse to two working rules:
 
-$$A_{CL} = 1 + \frac{R_f}{R_1}$$
+1. **Virtual short:** The output drives itself until $V_+ = V_-$.
+2. **Zero input current:** No current flows into either input terminal.
 
-For the **inverting amplifier** (input through $R_{in}$ to virtual ground at $V_-$, feedback through $R_f$):
+These are not intrinsic properties — they are consequences of high loop gain. Remove the feedback path and both rules fail immediately. This distinction is the source of most op-amp circuit errors.
 
-$$A_{CL} = -\frac{R_f}{R_{in}}$$
+Real deviations from the ideal:
 
-**Why does $A_{CL}$ depend only on resistors and not on $A_{OL}$?** Define the feedback fraction $B = R_1/(R_1 + R_f)$ for the non-inverting case. The closed-loop gain is:
+| Parameter | Ideal | Typical (LM358) | Low-offset (OPA2134) |
+|---|---|---|---|
+| $A_{OL}$ | $\infty$ | 100 dB | 120 dB |
+| Input offset $V_{OS}$ | 0 | ±2 mV | ±50 µV |
+| Input bias $I_B$ | 0 | 45 nA | 5 pA |
+| Output impedance | 0 | ~50 Ω (closed-loop) | ~10 Ω (closed-loop) |
 
-$$A_{CL} = \frac{A_{OL}}{1 + A_{OL} B}$$
-
-When $A_{OL} B \gg 1$, this reduces to $A_{CL} \approx 1/B$, which is set entirely by the resistor ratio. An op-amp whose $A_{OL}$ drifts from $10^6$ to $10^5$ with temperature changes $A_{CL}$ by a fraction of a part per million if $A_{OL} B = 10^4$. The resistors are doing the work; the op-amp is just enforcing the constraint.
+$V_{OS}$ matters most in high-gain DC-coupled circuits: a 2 mV offset amplified by 100 becomes a 200 mV DC error on the output — enough to eat half a 3.3 V ADC's input range before the signal arrives.
 
 ---
 
 ## How It Works
 
-### The Gain-Bandwidth Product and Frequency Compensation
+### The Inverting Amplifier
 
-Real op-amps have a dominant pole deliberately introduced by an internal compensation capacitor (Miller compensation is the most common technique). This causes the open-loop gain to roll off at $-20\,\text{dB/decade}$ starting from a corner frequency $f_1$ that may be as low as 10 Hz:
+```
+        Rf
+   ┌────┤├────┐
+   │          │
+   │   Rin    │
+Vin─┤├──┬───(−)\
+        │      >──── Vout
+        └───(+)/
+               |
+              GND
+```
 
-$$A_{OL}(f) = \frac{A_{OL,DC}}{1 + j\,f/f_1}$$
+Applying the golden rules: negative feedback holds $V_- = V_+ = 0\,\text{V}$ (virtual ground). Current through $R_{in}$:
 
-For $f \gg f_1$ this simplifies to:
+$$I = \frac{V_{in}}{R_{in}}$$
 
-$$|A_{OL}(f)| \approx \frac{f_T}{f}$$
+No current flows into the input terminal, so all of $I$ flows through $R_f$, developing a voltage drop that the output must supply:
 
-where $f_T$ is the **unity-gain bandwidth** or **GBW** (gain-bandwidth product). The closed-loop bandwidth of any configuration is therefore:
+$$V_{out} = -I \cdot R_f = -\frac{R_f}{R_{in}} V_{in}$$
 
-$$BW_{CL} = \frac{f_T}{A_{CL}}$$
+$$\boxed{A_v = -\frac{R_f}{R_{in}}}$$
 
-A 10 MHz GBW op-amp set to $A_{CL} = 100$ has $BW_{CL} = 100\,\text{kHz}$. If you need 1 MHz bandwidth at gain 100, you need a 100 MHz GBW part. This is a hard constraint from the compensation, not a fixable configuration issue.
+The negative sign is a 180° phase inversion, not a numerical sign error. The gain depends only on a resistor ratio, which is why the circuit is stable and accurate as long as $A_{OL}$ is large enough that the virtual ground approximation holds. The condition for that approximation to hold within error $\epsilon$:
 
-**Why is the dominant pole necessary?** A multi-stage amplifier accumulates phase lag from each internal pole. Each pole contributes up to $-90°$ of phase shift asymptotically. If two or more internal poles exist and the total phase shift reaches $-180°$ while the loop gain $|A_{OL} \cdot B|$ is still greater than 1, negative feedback becomes positive feedback and the circuit oscillates. The dominant pole ensures that $|A_{OL}|$ drops below 0 dB (unity gain) before the higher-order poles contribute enough phase shift to reach $-180°$. The cost is bandwidth; the benefit is uncon
+$$A_{OL} \gg \frac{1}{\epsilon} \cdot \frac{R_f}{R_{in}}$$
+
+For 1% error with a gain of 100, you need $A_{OL} \gg 10{,}000$ — satisfied by any modern op-amp at DC.
+
+### Gain-Bandwidth Product (GBW)
+
+Real op-amps have one deliberately introduced dominant pole at $f_1$ (often a few Hz to a few hundred Hz). Above $f_1$, open-loop gain rolls off at −20 dB/decade (6 dB/octave):
+
+$$A_{OL}(f) \approx \frac{A_{OL,DC}}{1 + j(f/f_1)} \xrightarrow{f \gg f_1} \frac{f_T}{f}$$
+
+where $f_T$ is the **unity-gain frequency** ($A_{OL} = 1$ at $f = f_T$). The product:
+
+$$\text{GBW} = A_{OL,DC} \cdot f_1 = f_T = \text{constant}$$
+
+is fixed by the compensation capacitor inside the chip — you cannot change it by choice of feedback resistors. The consequence: closed-loop bandwidth $f_{-3\text{dB}}$ for a non-inverting gain $G$ is:
+
+$$f_{-3\text{dB}} = \frac{f_T}{G}$$
+
+For an LM358 ($f_T = 1\,\text{MHz}$) configured for a gain of 50 ($34\,\text{dB}$):
+
+$$f_{-3\text{dB}} = \frac{1\,\text{MHz}}{50} = 20\,\text{kHz}$$
+
+That is barely adequate for audio. An OPA2134 ($f_T = 8\,\text{MHz}$) at the same gain gives $

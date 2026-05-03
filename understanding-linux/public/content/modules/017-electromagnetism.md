@@ -12,7 +12,7 @@ resources:
 
 ## Why This Matters
 
-Every transistor in your CPU is a voltage-controlled switch: a gate voltage above a threshold repels or attracts enough charge to open or close a conductive channel. Every DDR5 memory cell is a capacitor holding charge that the controller must periodically refresh before it leaks away. Every PCIe lane is a transmission line where signal propagation speed, impedance mismatch, and electromagnetic interference are engineering constraints, not incidental details. The Linux kernel's decisions — why `mmap` alignment matters, why DMA buffers need cache coherency, why interrupt latency has a floor — trace back to physics that this module makes explicit.
+Every piece of computation you have ever run exists because engineers learned to control the movement of charged particles through conductors. The CPU executing your shell commands, the RAM holding your kernel's page tables, the SSD storing your filesystem — all of it operates by exploiting electromagnetic force. Without a working model of charge, fields, and induction, you cannot reason about why a capacitor smooths voltage spikes on a power rail, why a changing magnetic field induces current in an inductor, why your network cable needs careful impedance matching, or why the kernel's power management subsystem exists at all. Electromagnetism is not background flavor for computing — it is the physical substrate that computing is built on.
 
 ---
 
@@ -20,100 +20,112 @@ Every transistor in your CPU is a voltage-controlled switch: a gate voltage abov
 
 ### Charge: The Primitive Quantity
 
-Electric charge is quantized in units of $e \approx 1.602 \times 10^{-19}$ C. Electrons carry $-e$, protons carry $+e$. Charge is *strictly conserved* — not approximately, not on average, but exactly: no process in classical or quantum physics has ever been observed to create or destroy net charge.
+Electric charge is a fundamental property of matter, carried by protons (positive) and electrons (negative). It is not derived from anything more basic. The critical fact is that ordinary matter is almost perfectly neutral: for every proton there is a balancing electron, and their forces cancel to extraordinary precision. Feynman illustrates this with two 1 mm grains of sand held 30 cm apart: if their charges were imbalanced by just 1%, the repulsive force between them would exceed three million tons. The entire edifice of electronics rests on controlling a *tiny* imbalance in this near-perfect neutrality — moving a fractional excess of electrons from one place to another.
 
-Ordinary matter is neutral to extraordinary precision. The electromagnetic force between two charges is:
+Charge is conserved — it cannot be created or destroyed, only moved. The continuity equation encodes this:
 
-$$F = k\frac{q_1 q_2}{r^2}, \quad k = \frac{1}{4\pi\epsilon_0} \approx 8.99 \times 10^9 \; \text{N·m}^2/\text{C}^2$$
+$$\frac{\partial \rho}{\partial t} + \nabla \cdot \mathbf{J} = 0$$
 
-For reference, $k/G \approx 10^{36}$ — electromagnetism is $10^{36}$ times stronger than gravity at the same scales. The reason you don't notice is that bulk matter maintains charge balance to better than one part in $10^{20}$. Even a $10^{-10}$ fractional imbalance in the charge of two 1 g objects 1 m apart would produce a force of roughly $10^9$ N. The near-perfect cancellation is not luck; it is enforced by the enormous energy cost of any imbalance.
+where $\rho$ is charge density (C/m³) and $\mathbf{J}$ is current density (A/m²). This says: the rate at which charge density decreases at a point equals the net current flowing out of that point. Kirchhoff's current law — the sum of currents at a node is zero — is a direct consequence.
 
-### Electric Field: Why the Abstraction Earns Its Keep
+### Coulomb's Law: Force Between Charges
 
-Instead of tracking force between every pair of charges, we define the field $\mathbf{E}$ as the force per unit positive test charge at a point, *before* any test charge is placed there:
+Two point charges $q_1$ and $q_2$ separated by distance $r$ exert a force on each other:
 
-$$\mathbf{E}(\mathbf{r}) = \frac{1}{4\pi\epsilon_0} \frac{Q}{r^2} \hat{r}$$
+$$F = \frac{1}{4\pi\epsilon_0} \frac{q_1 q_2}{r^2}$$
 
-This is not just bookkeeping. The field is *physically real*: it carries energy and momentum, propagates at $c$, and exerts force on whatever charge later appears there. The energy density stored in an electric field is:
+The constant $\epsilon_0 \approx 8.85 \times 10^{-12}\ \text{F/m}$ is the **permittivity of free space** — it characterizes how easily electric fields propagate through vacuum. Like charges repel, unlike attract; the sign of $q_1 q_2$ gives you the direction automatically. The $1/r^2$ dependence is geometrically inevitable: force spreads over the surface of a sphere of area $4\pi r^2$, so intensity falls as the inverse square. The electromagnetic force is roughly $10^{36}$ times stronger than gravity between two electrons — which is why even a tiny charge imbalance produces macroscopically observable forces.
 
-$$u_E = \frac{1}{2}\epsilon_0 E^2 \quad \text{(J/m}^3\text{)}$$
+### Electric Field: Decoupling Source from Effect
 
-This is the quantity that matters when a capacitor stores energy — not charge on plates in isolation, but field energy in the gap between them.
+Rather than describing forces between specific pairs of charges, define the **electric field** $\mathbf{E}$ as the force per unit positive test charge at a point:
 
-### Electric Potential: Scalar Bookkeeping for Vector Work
+$$\mathbf{E}(\mathbf{r}) = \frac{\mathbf{F}}{q_\text{test}}$$
 
-The potential $V$ at position $\mathbf{r}$ is the work done per unit charge by an external agent moving a positive test charge from a reference point (infinity, by convention) to $\mathbf{r}$, against the field:
+This decoupling is the key abstraction: the source charge distribution creates $\mathbf{E}$ everywhere in space, and then *any* charge $q$ placed at position $\mathbf{r}$ experiences $\mathbf{F} = q\mathbf{E}(\mathbf{r})$, independently of the source. You do not need to re-solve the many-body problem for each new charge you introduce. A point charge $q$ at the origin creates:
 
-$$V(\mathbf{r}) = -\int_\infty^{\mathbf{r}} \mathbf{E} \cdot d\mathbf{s}$$
+$$\mathbf{E}(\mathbf{r}) = \frac{1}{4\pi\epsilon_0} \frac{q}{r^2} \hat{r}$$
 
-For a point charge $Q$: $V = \frac{Q}{4\pi\epsilon_0 r}$. The field is recovered by:
+radiating outward for positive $q$, inward for negative.
+
+### Electric Potential: The Scalar Shortcut
+
+Moving a charge against an electric field requires work. The **electric potential** $V$ at a point is the work per unit positive charge required to bring a test charge from a reference (usually infinity or ground) to that point:
+
+$$V(\mathbf{r}) = -\int_{\mathbf{r}_\text{ref}}^{\mathbf{r}} \mathbf{E} \cdot d\mathbf{s}$$
+
+Potential is scalar — you add contributions from multiple sources algebraically rather than vectorially, which makes it far easier to compute than $\mathbf{E}$ directly. Once you have $V$, recover $\mathbf{E}$ via:
 
 $$\mathbf{E} = -\nabla V$$
 
-The gradient points uphill in potential; the field points downhill. Crucially, potential is a *scalar*, so superposition of contributions from multiple charges is simple addition rather than vector addition. Moving charge $q$ through potential difference $\Delta V$ transfers energy $W = q\Delta V$ — this is why "voltage" is the useful engineering quantity.
+The gradient points in the direction of steepest increase; the negative sign means $\mathbf{E}$ points from high to low potential, exactly as a ball accelerates downhill. **Voltage** in circuit analysis is the potential difference $\Delta V = V_a - V_b$ between two nodes. A charge $q$ moving through potential difference $\Delta V$ exchanges energy $W = q\,\Delta V$ with the field — releasing it if moving from high to low, absorbing it if moving against the field.
 
-### Current, Resistance, and Why Ohm's Law Is Not Fundamental
+### Current: Moving Charge
 
-Current is the rate of charge transport:
+**Current** $I$ is the net charge flowing past a cross-section per unit time:
 
-$$I = \frac{dq}{dt} \quad \text{(amperes = C/s)}$$
+$$I = \frac{dq}{dt}$$
 
-In a metal, conduction electrons have a thermal velocity $\sim 10^6$ m/s, but their *net drift* in an applied field is slow — typically $\sim 10^{-4}$ m/s. The drift velocity $v_d$ is proportional to the applied field because each electron accelerates briefly, then scatters off the lattice and loses its momentum. The mean free time $\tau$ between collisions gives:
+measured in amperes (C/s). Electrons are the actual carriers in metals, but current direction is conventionally defined as the direction positive charges would move — opposite to electron drift. This convention is arbitrary and harmless as long as you are consistent. What matters physically is the product $qv$: whether you move negative charges one way or positive charges the other, the resulting current is the same.
 
-$$v_d = \frac{eE\tau}{m_e}$$
+The drift velocity of electrons in a copper wire carrying typical currents is surprisingly slow — on the order of $10^{-4}$ m/s. The electrical *signal* propagates at near-$c$ because it is the field configuration, not the electrons themselves, that propagates down the wire.
 
-Current density is $J = nev_d = \sigma E$, where $\sigma = ne^2\tau/m_e$ is conductivity. Ohm's Law $V = IR$ follows from integrating this over the geometry of a resistor. It fails when $\tau$ becomes field-dependent (high fields, semiconductors, superconductors). The kernel driver model for a device implicitly assumes some version of Ohm's Law; this is why semiconductor device behavior at extreme voltages requires special handling in ACPI tables and thermal throttling logic.
+### Resistance and Ohm's Law
 
-### Magnetic Field: The Relativistic Consequence of Current
+Charges moving through a conductor scatter off lattice vibrations (phonons) and impurities, losing directed momentum. This irreversible loss is **resistance** $R$ (ohms, $\Omega$). For ohmic materials over normal operating ranges:
 
-A stationary charge creates $\mathbf{E}$ only. A moving charge — equivalently, a current — creates a magnetic field $\mathbf{B}$ that curls around the direction of motion (right-hand rule). The force on a charge $q$ moving with velocity $\mathbf{v}$:
+$$V = IR$$
 
-$$\mathbf{F} = q\mathbf{v} \times \mathbf{B}$$
+The linearity holds because scattering events are random and frequent: the net drift is a steady-state balance between field acceleration and collision braking. Resistance scales with conductor geometry as:
 
-The cross product means $\mathbf{F} \perp \mathbf{v}$, so the magnetic force does *no work* — it deflects without accelerating. The physical content here is subtle: the magnetic force on a current-carrying wire is actually just the electrostatic force between moving charges, transformed by special relativity. Length contraction of a moving charge distribution changes its apparent charge density from the frame of a moving test charge. Magnetism is, in this sense, *relativistic electricity*.
+$$R = \rho \frac{L}{A}$$
 
-### Induction: Why Changing Fields Cannot Exist in Isolation
+where $\rho$ is resistivity (Ω·m), $L$ is length, and $A$ is cross-sectional area. This is why long, thin traces on a PCB have higher resistance than short, wide ones. Power dissipated as heat is:
 
-Faraday's Law: a time-varying magnetic flux $\Phi_B = \int \mathbf{B} \cdot d\mathbf{A}$ through any loop drives an electromotive force around that loop:
+$$P = IV = I^2 R = \frac{V^2}{R}$$
+
+This is Joule heating — the energy extracted from the field permanently lost to thermal motion, not stored.
+
+### Capacitance: Storing Charge in an Electric Field
+
+A **capacitor** is two conductors separated by an insulator (dielectric). Forcing charge $+q$ onto one plate and $-q$ onto the other establishes a potential difference $V$ between them:
+
+$$q = CV$$
+
+where $C$ is **capacitance** in farads. For a parallel-plate capacitor with plate area $A$ and separation $d$:
+
+$$C = \frac{\epsilon_0 \epsilon_r A}{d}$$
+
+where $\epsilon_r$ is the relative permittivity of the dielectric (1 for vacuum, 2–10 for common insulators). The energy stored is in the electric field between the plates:
+
+$$U = \frac{1}{2}CV^2 = \frac{q^2}{2C}$$
+
+A capacitor does not dissipate energy — it stores and returns it. Current through a capacitor is:
+
+$$I = C\frac{dV}{dt}$$
+
+This is why capacitors block DC (constant $V$ means $dV/dt = 0$ means $I = 0$) and pass AC. It is also why capacitors on power rails suppress voltage spikes: a sudden surge of charge has $dV/dt$ limited by $C$, and the capacitor absorbs the excess charge before the voltage can rise far.
+
+### Inductance: Storing Energy in a Magnetic Field
+
+A current $I$ through a wire produces a **magnetic field** $\mathbf{B}$ encircling it (right-hand rule). For a solenoid of $n$ turns per unit length:
+
+$$B = \mu_0 n I$$
+
+where $\mu_0 = 4\pi \times 10^{-7}\ \text{H/m}$ is the permeability of free space. By Faraday's law, a *changing* magnetic flux $\Phi_B = \int \mathbf{B} \cdot d\mathbf{A}$ through a loop induces an EMF opposing that change:
 
 $$\mathcal{E} = -\frac{d\Phi_B}{dt}$$
 
-The negative sign is Lenz's Law: the induced current creates a field opposing the flux change. This is not a separate law — it is conservation of energy in field form. If the induced field aided the change, you would get runaway amplification; nature forbids it.
+The negative sign (Lenz's law) is not arbitrary — it is required by energy conservation. An **inductor** formalizes this: when current through it changes, the resulting change in $\mathbf{B}$ induces a voltage opposing that change:
 
-Maxwell's addition: a *time-varying electric flux* also drives a magnetic field — the displacement current $\epsilon_0 \frac{d\Phi_E}{dt}$. Maxwell added this term not from experiment but from *dimensional consistency*: without it, Ampere's Law gave contradictory results for open surfaces. The consequence is that $\mathbf{E}$ and $\mathbf{B}$ sustain each other in vacuum and propagate as waves at:
+$$V = L\frac{dI}{dt}$$
 
-$$c = \frac{1}{\sqrt{\mu_0 \epsilon_0}} = \frac{1}{\sqrt{(4\pi \times 10^{-7})(8.854 \times 10^{-12})}} \approx 2.998 \times 10^8 \; \text{m/s}$$
+where $L$ is inductance in henries. Energy is stored in the magnetic field:
 
-This derivation — predicting the speed of light from static measurements of $\mu_0$ and $\epsilon_0$ — was one of the most consequential predictions in physics.
+$$U = \frac{1}{2}LI^2$$
 
----
+The danger: if you interrupt current through an inductor suddenly (large negative $dI/dt$), it generates whatever voltage is necessary to maintain that current. For a relay coil with $L = 10\ \text{mH}$ and current $I = 100\ \text{mA}$ interrupted in $\Delta t = 1\ \mu\text{s}$:
 
-## How It Works
+$$V_\text{spike} = L\frac{\Delta I}{\Delta t} = (10^{-2})\frac{0.1}{10^{-6}} = 1000\ \text{V}$$
 
-### Maxwell's Equations (Integral Form)
-
-$$\oint_S \mathbf{E} \cdot d\mathbf{A} = \frac{Q_\text{enc}}{\epsilon_0} \tag{Gauss — } \mathbf{E} \text{ sourced by charge}$$
-
-$$\oint_S \mathbf{B} \cdot d\mathbf{A} = 0 \tag{no magnetic monopoles}$$
-
-$$\oint_C \mathbf{E} \cdot d\mathbf{s} = -\frac{d\Phi_B}{dt} \tag{Faraday — changing } \mathbf{B} \text{ drives } \mathbf{E}$$
-
-$$\oint_C \mathbf{B} \cdot d\mathbf{s} = \mu_0 I_\text{enc} + \mu_0\epsilon_0 \frac{d\Phi_E}{dt} \tag{Ampere-Maxwell}$$
-
-Together with the Lorentz force $\mathbf{F} = q(\mathbf{E} + \mathbf{v} \times \mathbf{B})$, these four equations are the complete classical theory. Circuit theory, transmission line theory, antenna design, and optics are all limiting cases or approximations derived from these equations under specific boundary conditions.
-
-### The Capacitor: Storing Energy in a Field
-
-A parallel-plate capacitor: plates of area $A$, separation $d$, charge $\pm q$ on opposing plates. Gauss's Law gives a uniform field between the plates:
-
-$$E = \frac{\sigma}{\epsilon_0} = \frac{q}{\epsilon_0 A}$$
-
-Integrating across the gap: $V = Ed = \frac{qd}{\epsilon_0 A}$. Define capacitance:
-
-$$C = \frac{\epsilon_0 A}{d}$$
-
-so $q = CV$. The stored energy is the integral of work done charging from zero:
-
-$$U = \int_0^Q \frac{q}{C}\,dq = \frac{Q^2}{2C} = \frac{1}{2}CV^2$$
-
-This energy lives in the electric field between the plates, with density $u_E = \frac{1}{2}\epsilon_0 E^2$. Verify: the volume between the plates is $Ad$, so $u_E \cdot Ad = \frac{1}{2}\epsilon_0 \left(\frac{V}{d}\right)^2 Ad
+A 1000 V spike on a 5 V logic rail destroys transistors instantly. A flyback diode across the inductor provides a current path that lets

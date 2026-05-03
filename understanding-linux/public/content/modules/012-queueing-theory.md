@@ -12,136 +12,134 @@ resources:
 
 ## Why This Matters
 
-Every Linux system is a collection of queues. Network packets wait in the NIC ring buffer. Disk I/O requests pile up in the block layer. CPU-bound processes sit in the run queue. When you ignore queueing theory, you build systems that appear fine at 40% load and collapse at 70% — not because you ran out of resources, but because queue depth explodes nonlinearly as utilization approaches 1. The math lets you predict *where* a system breaks before it breaks, size buffers correctly, identify the true bottleneck in a pipeline, and explain why doubling CPU speed sometimes does nothing for latency.
-
----
+Every resource in a computer — a CPU core, a disk, a network interface, a lock — can serve only one request at a time. When requests arrive faster than they can be served, they queue. The relationship between arrival rate, service rate, and latency is nonlinear: a server at 90% utilization does not behave like a slightly busier version of one at 50% — it behaves like a different system. Without a quantitative model, you will misread the numbers Linux gives you, because the numbers are right but your mental model of what they imply is wrong.
 
 ## Core Concepts
 
-### Arrivals and the Arrival Rate $\lambda$
+### Arrivals and the Poisson Process
 
-Work arrives at a system at average rate $\lambda$ (requests per second, packets per second, syscalls per second). In the Poisson arrival model, the number of arrivals in any fixed interval is independent of other intervals. This approximates real workloads well when arrivals come from many independent sources — HTTP requests from distinct clients, disk I/O from unrelated processes, interrupts from uncoordinated devices.
+Requests arrive at rate $\lambda$ (arrivals per second). In the M/M/1 model, arrivals follow a **Poisson process**: inter-arrival times are exponentially distributed with mean $1/\lambda$, and the count of arrivals in any interval $t$ is:
 
-The Poisson assumption matters because it makes the system analytically tractable. Its key consequence: inter-arrival times are exponentially distributed with mean $1/\lambda$. If arrivals are bursty or correlated (flash crowds, synchronized cron jobs), the Poisson model underestimates queue depth — the real system will be worse than the model predicts.
+$$P(N(t) = k) = \frac{(\lambda t)^k e^{-\lambda t}}{k!}$$
 
-### Service Rate $\mu$ and Service Time $S$
+This is not merely a convenient assumption. When a large number of independent sources each contribute rarely and without coordinating, the aggregate arrival process converges to Poisson by a superposition argument. Network packets from thousands of independent flows, syscalls from unrelated processes, and async disk I/O from unrelated threads all fit this regime. The assumption breaks when sources synchronize — a thundering herd after a cache miss, or a cron job firing on every host simultaneously.
 
-A server — a CPU core, a disk, a thread pool worker — completes work at rate $\mu$. The average service time per request is:
+### Service Rate and Service Time
 
-$$S = \frac{1}{\mu}$$
+A server processes requests at rate $\mu$ completions per second, so the mean service time is $1/\mu$. In M/M/1, service times are exponentially distributed, which gives the **memoryless property**: $P(T > s + t \mid T > s) = P(T > t)$. Knowing a request has already been in service for $s$ seconds tells you nothing about how much longer it will take. This collapses the state of the system to a single number — the queue length — which is what makes M/M/1 analytically tractable.
 
-Service time is how long the server is *occupied* with your request. It excludes waiting. A disk with 5ms average seek time has $\mu = 200$ I/O operations per second, $S = 5\text{ ms}$ — but a request sitting behind nine others waits far longer than 5ms.
+### Utilization
 
-### Utilization $\rho$
+$$\rho = \frac{\lambda}{\mu}$$
 
-$$\rho = \frac{\lambda}{\mu} = \lambda \cdot S$$
-
-Utilization is the fraction of time the server is busy. For a stable queue, $\rho < 1$. When $\rho \geq 1$, arrivals outpace completions and the queue grows without bound — the server cannot drain work as fast as it arrives, ever.
-
-**The nonlinear trap:** utilization does not feel dangerous until it is. The system at $\rho = 0.5$ and the system at $\rho = 0.9$ are consuming similar fractions of nominal capacity, but their queue behaviors are orders of magnitude apart. This is not an operational observation — it follows directly from the $\frac{1}{1-\rho}$ term in the response time formula.
-
-### Throughput $X$
-
-$$X = \min(\lambda, \mu)$$
-
-When $\lambda < \mu$, every arriving request is eventually served and $X = \lambda$. When $\lambda \geq \mu$, the server saturates and $X$ is capped at $\mu$ regardless of how fast requests arrive. Throughput measures useful work the system produces; utilization measures how close you are to the ceiling that caps it.
+$\rho$ is the fraction of time the server is busy. Stability requires $\rho < 1$. When $\rho \geq 1$, the queue grows without bound: the server is always behind and never catches up. This is a phase transition, not a gradual degradation. A system at $\rho = 0.99$ will collapse under any transient spike because transient spikes always exist.
 
 ### Little's Law
 
-**Little's Law** requires no assumptions about arrival distributions, service time distributions, or scheduling policy. For any stable system in steady state:
+$$L = \lambda W$$
 
-$$N = X \cdot R$$
+- $L$ = mean number of requests in the system (queue + in service)
+- $\lambda$ = arrival rate
+- $W$ = mean time a request spends in the system
 
-Where:
-- $N$ = average number of requests in the system (queued + in service)
-- $X$ = throughput (completions per second)
-- $R$ = average response time (seconds per request)
+This is a conservation law. It requires no assumptions about arrival distribution, service distribution, number of servers, or scheduling policy — only that the system is stable (inputs equal outputs over time). Its power is that it connects an operator-visible metric ($L$, the queue depth you read from a tool) to a user-visible metric ($W$, the latency your application measures), via something you can instrument ($\lambda$, the arrival rate). If your run queue length averages 4 and your arrival rate is 400 processes/second, mean scheduling latency is $W = L/\lambda = 10\text{ ms}$.
 
-This is exact, not an approximation. If you measure two of these quantities with `ss`, `iostat`, or application metrics, you know the third. If your monitoring gives you $N$ from queue depth and $X$ from request rate, $R = N / X$ is your average latency — without ever instrumenting the latency directly.
+### The Bottleneck Law
 
-### Response Time
+In a pipeline of resources, throughput is capped by the resource with the highest demand:
 
-**Response time** $R$ is total time a request spends in the system: queuing time $W$ plus service time $S$:
+$$X \leq \min_i \left(\frac{1}{D_i}\right)$$
 
-$$R = W + S$$
-
-What you observe as "latency" in `strace` timing, `perf`, or application logs is $R$, not $S$. When users report high latency on a system that isn't CPU-saturated, the explanation is usually $W$ — time spent in a queue before any service begins.
-
-### The M/M/1 Queue
-
-Poisson arrivals (M), exponential service times (M), single server (1). This is the baseline model for any single-resource bottleneck:
-
-$$R = \frac{S}{1 - \rho}$$
-
-$$N = \frac{\rho}{1 - \rho}$$
-
-The $\frac{1}{1-\rho}$ factor is the entire story of capacity planning. As $\rho \to 1$, both response time and queue depth diverge to infinity. This is not a pathological edge case — it is what the equations predict for *any* system fitting this model, including your disk, your NIC, your database connection pool.
-
-### Bottleneck Analysis
-
-In a pipeline of stages, each stage $i$ has service demand $S_i$ (average time per request spent at stage $i$). System throughput is bounded by the slowest stage:
-
-$$X \leq \frac{1}{\max_i(S_i)}$$
-
-Utilization at stage $i$ under offered load $\lambda$ is $\rho_i = \lambda \cdot S_i$. The stage where $\rho_i$ is highest is the bottleneck. Improving any other stage does not increase system throughput — this is Amdahl's Law expressed through queueing rather than parallelism.
-
----
+where $D_i$ is the **service demand** at resource $i$ — the total time resource $i$ spends per completed job, equal to (visits to $i$) $\times$ (mean service time per visit). The bottleneck is not necessarily the busiest-looking resource; it is the one whose demand $D_i$ is largest. Optimizing any other resource cannot raise $X$ above $1/D_{\text{bottleneck}}$.
 
 ## How It Works
 
-### The Latency Cliff
+### M/M/1 Steady-State Results
 
-The M/M/1 response time formula $R = S / (1 - \rho)$ is a hyperbola in $\rho$. Small changes near $\rho = 1$ cause large changes in latency:
+For a single server with Poisson arrivals and exponential service:
 
-| $\rho$ | $R / S$ |
-|--------|---------|
-| 0.10   | 1.11    |
-| 0.50   | 2.00    |
-| 0.80   | 5.00    |
-| 0.90   | 10.00   |
-| 0.95   | 20.00   |
-| 0.99   | 100.00  |
+$$L = \frac{\rho}{1-\rho}, \qquad W = \frac{1/\mu}{1-\rho} = \frac{1}{\mu - \lambda}$$
 
-A disk with $S = 5\text{ ms}$ service time at $\rho = 0.80$ delivers $R = 25\text{ ms}$ average response time. At $\rho = 0.95$ — only 15 percentage points higher utilization — $R = 100\text{ ms}$. The disk is doing the same work per request; the extra 75ms is pure waiting. This is why capacity planning targets $\rho \leq 0.70$–$0.80$ as a *ceiling*, not a warning threshold.
+$$L_q = \frac{\rho^2}{1-\rho}, \qquad W_q = \frac{\rho}{\mu - \lambda}$$
 
-### Queue Depth and Memory Pressure
+The relationship $W = W_q + 1/\mu$ is exact: mean sojourn time equals mean wait in queue plus mean service time.
 
-From Little's Law and the M/M/1 result, average queue depth (including the request in service):
+The nonlinearity is in $W$:
 
-$$N = \frac{\rho}{1 - \rho}$$
+| $\rho$ | $W$ (units of $1/\mu$) | Increase from $\rho = 0.5$ |
+|--------|------------------------|---------------------------|
+| 0.50   | 2.0                    | —                         |
+| 0.75   | 4.0                    | ×2                        |
+| 0.90   | 10.0                   | ×5                        |
+| 0.95   | 20.0                   | ×10                       |
+| 0.99   | 100.0                  | ×50                       |
 
-At $\rho = 0.50$: $N = 1$. At $\rho = 0.90$: $N = 9$. At $\rho = 0.99$: $N = 99$.
+Going from 50% to 90% utilization — a change that sounds modest — multiplies mean latency by five. The curve is convex and accelerating. A system running at 90% that absorbs a 10% traffic spike hits $\rho = 0.99$ and its latency increases tenfold, not by 10%.
 
-Queue depth is not just an abstract number — it directly determines buffer memory consumption. The Linux block layer maintains a per-device request queue. The default queue depth for NVMe devices is 1023 (visible in `/sys/block/nvme0n1/queue/nr_requests`). If your storage utilization is chronically above 90%, that queue is routinely 10–100 entries deep. Each entry in the block layer's `struct request` is roughly 400–500 bytes, but more critically, the *data* those requests reference stays pinned in memory until completion. Queue depth × average request size = pinned memory. At $\rho = 0.99$ with 128KB requests and queue depth 99, you are pinning ~12MB per device just in in-flight I/O.
+### Simulating the Hockey Stick
 
-### Multi-Server Queues: M/M/c
+```python
+import numpy as np
+import matplotlib.pyplot as plt
 
-With $c$ parallel servers (thread pool workers, CPU cores handling interrupts, parallel disk paths), effective per-server utilization is:
+mu = 1.0
+rho = np.linspace(0.01, 0.999, 2000)
 
-$$\rho = \frac{\lambda}{c \mu}$$
+W_mm1 = 1.0 / (mu - rho * mu)          # M/M/1: W = 1/(mu - lambda)
+W_md1 = (1.0 / mu) * (1 - rho / 2) / (1 - rho)  # M/D/1: deterministic service
 
-The system is stable when $\rho < 1$. Adding servers shifts the saturation point but does not eliminate the latency cliff — it relocates it. The M/M/c response time formula is more complex than M/M/1, but the same $\frac{1}{1-\rho}$ divergence applies.
+fig, ax = plt.subplots()
+ax.plot(rho, W_mm1, label='M/M/1 (exponential service)')
+ax.plot(rho, W_md1, label='M/D/1 (deterministic service)', linestyle='--')
+ax.axvline(0.80, color='red', linestyle=':', label='ρ=0.80')
+ax.set_xlabel('Utilization ρ')
+ax.set_ylabel('Mean sojourn time W (× 1/μ)')
+ax.set_ylim(0, 50)
+ax.legend()
+plt.tight_layout()
+plt.show()
+```
 
-Concrete example: an NGINX worker pool with $c = 4$ workers, mean request service time $S = 20\text{ ms}$, $\mu = 50\text{ req/s per worker}$.
+M/D/1 (deterministic service time, as with a fixed-size packet on a wire) produces exactly half the queueing delay of M/M/1 at the same utilization. This is why reducing service time variance — not just mean service time — matters: $W_q^{M/D/1} = W_q^{M/M/1}/2$. Variability in service time directly inflates the queue.
 
-At $\lambda = 150\text{ req/s}$:
+### M/M/c: Multiple Servers
 
-$$\rho = \frac{150}{4 \times 50} = \frac{150}{200} = 0.75$$
+With $c$ identical servers, per-server utilization is $\rho = \lambda/(c\mu)$, and the system can serve up to $c$ requests simultaneously. The mean queue wait is:
 
-At $\lambda = 190\text{ req/s}$:
+$$W_q = \frac{C(c, \lambda/\mu)}{c\mu - \lambda} \cdot \frac{1}{1}$$
 
-$$\rho = \frac{190}{200} = 0.95$$
+where $C(c, \lambda/\mu)$ is the **Erlang C formula** — the probability that an arriving request finds all $c$ servers busy. Adding a second server does not halve latency uniformly; it moves the blowup point to $\rho = 1$ for $c$ servers combined, but Erlang C means the gain is sharpest at high utilization, where it matters most.
 
-The M/M/1 approximation gives $R/S \approx 20$ at $\rho = 0.95$ — so average response time is approximately $20 \times 20\text{ ms} = 400\text{ ms}$ versus $4 \times 20\text{ ms} = 80\text{ ms}$ at $\rho = 0.75$. A 27% increase in traffic produced a 5× increase in latency.
+### Worked Example: Disk Subsystem
 
-### Bottleneck Analysis: A Complete Example
+A disk handles $\mu = 200$ IOPS. Your application drives $\lambda = 160$ IOPS.
 
-Consider a request pipeline with three measured service demands:
+$$\rho = \frac{160}{200} = 0.80$$
 
-| Subsystem | $S_i$ (ms) | $\rho_i$ at $\lambda = 100\text{ req/s}$ |
-|-----------|-----------|------------------------------------------|
-| CPU       | 2         | 0.20                                     |
-| Disk      | 8         | 0.80                                     |
-| Network   | 1         | 0.10                                     |
+$$W = \frac{1}{\mu - \lambda} = \frac{1}{200 - 160} = 25\text{ ms}, \qquad W_q = W - \frac{1}{\mu} = 25 - 5 = 20\text{ ms}$$
 
-Total response time without queueing: $S_{\text{total}} = 11\text{ ms}
+A batch job adds 20 IOPS, bringing $\lambda$ to 180:
+
+$$\rho = 0.90, \qquad W = \frac{1}{200 - 180} = 50\text{ ms}$$
+
+A 12.5% increase in load doubled latency. The disk's service time ($1/\mu = 5\text{ ms}$) is unchanged. The entire increase came from queueing. This is why "the disk is only at 90%" is not reassuring — it means you are on the steep part of the curve.
+
+## Linux Connection
+
+### CPU Run Queue: `vmstat`, `/proc/schedstat`
+
+The kernel run queue holds threads that are runnable but not yet scheduled. Its length is the $L$ in Little's Law for the CPU subsystem.
+
+```bash
+# 'r' column: threads waiting + running on CPU
+# if r > number of logical CPUs, threads are waiting
+vmstat 1 5
+```
+
+```
+procs -----------memory---------- ---swap-- -----io---- -system-- ------cpu-----
+ r  b   swpd   free   buff  cache   si   so    bi    bo   in   cs us sy id wa st
+ 6  0      0 2048000  45000 900000    0    0     0   120 1200 2400 40 10 50  0  0
+```
+
+Here `r=6` on a 4-core machine means $\rho > 1$: the CPU subsystem is overloaded. The two excess threads are queued. Apply Little's Law: if $\lambda = 1200$ context switches/second (the `cs` field), and $L = 6$, then $W = L/\lambda = 5\text{ ms}$ average scheduling

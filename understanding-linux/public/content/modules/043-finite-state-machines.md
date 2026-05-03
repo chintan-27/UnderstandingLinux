@@ -12,158 +12,171 @@ resources:
 
 ## Why This Matters
 
-Every sequential system that must remember *where it is* and *decide what to do next* is a finite-state machine. The MIPS CPU controller, the USB protocol handler, and the Linux kernel's TCP stack all reduce to the same skeleton: a state register, a next-state function, and an output function. Get the encoding or the transition logic wrong and you get metastability, missed edges, or outputs that glitch between clock cycles — bugs that are invisible in simulation and catastrophic in silicon or in a running kernel.
+Every sequential system that must remember *where it is* in order to decide *what to do next* is a finite-state machine. The alternative — ad-hoc flags, global booleans, and implicit ordering assumptions — produces control logic that is untestable by construction: you cannot enumerate the states because you never defined them. CPUs use FSMs to sequence instruction execution stages. TCP uses them to enforce legal connection lifecycles. The Linux kernel uses them to govern process scheduling, USB enumeration, and block device request queues. When a system hangs or corrupts state under a timing edge case, the root cause is almost always a transition that was never explicitly defined.
 
-The reason FSMs matter beyond academic exercises: any time you write `if (state == X) do_thing()` in a driver or protocol handler, you are implementing an FSM manually. Understanding the formal model tells you when your ad-hoc version is correct and when it will break under concurrent input.
+---
 
 ## Core Concepts
 
-### What an FSM Actually Is
+### State: Compressed History
 
-An FSM is defined by five components:
+A state encodes the minimum information about the past required to produce correct future outputs. Everything irrelevant is discarded. For a traffic light controller, the relevant history is not every car that passed — it is only the current phase. That compression is the FSM's power: instead of unbounded history, you have $n$ bits.
 
-- $S$ — a finite set of states
-- $I$ — a set of inputs
-- $O$ — a set of outputs
-- $\delta: S \times I \rightarrow S$ — the next-state (transition) function
-- $\lambda$ — the output function
+A machine with $n$ state bits represents at most $2^n$ distinct states. If your design needs $k$ states, you need at least $\lceil \log_2 k \rceil$ flip-flops.
 
-The **state register** holds the current state, sampled on every clock edge. The two combinational blocks $\delta$ and $\lambda$ are pure logic: no memory, no feedback. This separation is not a style preference — it is what makes the machine formally analyzable and what synthesis tools rely on to infer flip-flops versus gates.
+### State Encoding: Binary vs. One-Hot
 
-The total number of distinct behaviors an FSM can express is bounded by its state count. An FSM with $N$ states can distinguish at most $N$ equivalence classes of input history. This is the formal reason why a 2-bit state register cannot implement a protocol with more than 4 distinct phases without aliasing states.
+**Binary encoding** uses $\lceil \log_2 k \rceil$ bits for $k$ states. Compact, but next-state logic requires Boolean minimization — the decoder is implicit in the logic equations.
 
-### Moore vs. Mealy
+**One-hot encoding** uses $k$ bits for $k$ states, exactly one bit high at a time. Next-state equations become trivial to read from the state diagram, and the combinational logic is shallower (fewer gate levels), which increases maximum clock frequency. The tradeoff is $k$ flip-flops versus $\lceil \log_2 k \rceil$. In FPGAs with abundant registers and routing constraints on logic, one-hot usually wins.
 
-In a **Moore machine**, outputs depend only on current state:
+For the divide-by-3 counter with states $\{S_0, S_1, S_2\}$:
 
-$$\lambda: S \rightarrow O$$
-
-In a **Mealy machine**, outputs depend on current state *and* current inputs:
-
-$$\lambda: S \times I \rightarrow O$$
-
-The tradeoff is not just latency. Mealy machines can react in the same clock cycle an input arrives, which means they can often solve the same problem with fewer states — but at a cost. Because Mealy outputs are combinational functions of inputs, any glitch or mid-cycle transition on an input propagates directly to the output before the next clock edge. Moore outputs only change on clock edges because they are functions of the registered state alone, making them inherently glitch-free. For outputs that drive downstream registers, Moore behavior is safer; for outputs that need minimum-latency response, Mealy is necessary.
-
-A Mealy machine with $N$ states is computationally equivalent to a Moore machine, but the Moore version may require up to $N \cdot |I|$ states in the worst case to replicate each Mealy output without the combinational path.
-
-### State Encoding
-
-The same abstract FSM can be encoded multiple ways. The encoding determines which bits change on each transition, which directly determines the complexity of $\delta$.
-
-**Binary encoding** uses $\lceil \log_2 N \rceil$ flip-flops for $N$ states. It is compact but produces more complex next-state logic because multiple bits change on many transitions — the Gray code ordering $00 \to 01 \to 11 \to 10$ is sometimes used to minimize simultaneous bit changes and reduce glitching on outputs that read the state directly.
-
-**One-hot encoding** uses $N$ flip-flops with exactly one bit asserted per state. It uses more registers but the next-state logic is near-trivial: the next-state bit for $S_j$ is the OR of all current-state bits that have a transition to $S_j$ under the relevant input condition. In FPGAs, where flip-flops are abundant and LUT inputs are the scarce resource, one-hot encoding frequently produces faster and smaller designs than binary encoding.
-
-For a divide-by-3 counter with states $S_0, S_1, S_2$:
-
-| State | Binary ($S_1 S_0$) | One-Hot ($S_2 S_1 S_0$) |
+| State | Binary ($S_1 S_0$) | One-Hot ($b_2 b_1 b_0$) |
 |-------|-------------------|------------------------|
 | $S_0$ | `00`              | `001`                  |
 | $S_1$ | `01`              | `010`                  |
 | $S_2$ | `10`              | `100`                  |
 
-With binary encoding, the next-state equations derived from the transition table are:
+With binary encoding, next-state logic requires a K-map. With one-hot, each next-state bit equals the current-state bit of the predecessor state — the equations are direct:
 
-$$S_1' = S_1 \oplus S_0, \quad S_0' = \overline{S_1} \cdot \overline{S_0}$$
+$$S_0' = b_2, \quad S_1' = b_0, \quad S_2' = b_1$$
 
-With one-hot encoding, the next-state equations collapse to:
+No minimization needed because each state bit is driven by exactly one predecessor.
 
-$$S_0' = S_2, \quad S_1' = S_0, \quad S_2' = S_1$$
+### Transition Logic: The Next-State and Output Functions
 
-Each next-state bit is a single wire from a current-state bit — zero logic gates required. The silicon area for the logic block drops to nothing; you only pay for the extra flip-flops.
+The next-state function $\delta$ and output function $\lambda$ fully define machine behavior:
 
-### Synchronous vs. Asynchronous Reset
+$$\delta: S \times I \rightarrow S \qquad \lambda: S \rightarrow O \text{ (Moore)} \qquad \lambda: S \times I \rightarrow O \text{ (Mealy)}$$
 
-The state register must be reset to a known state on power-up. Without this, the machine enters an arbitrary state determined by leakage currents and capacitive charge on the flip-flop nodes — undefined behavior in the most literal sense.
+**Moore machine:** output depends only on current state, so it is stable for the entire clock period. Downstream logic can sample it without worrying about intra-cycle glitches.
 
-**Synchronous reset**: the reset condition is checked only on the clock edge. The reset signal must be held long enough to be captured — at minimum one full clock period. The advantage is that it is filtered through the clock, so a glitch on `reset` that is shorter than one clock period has no effect.
+**Mealy machine:** output depends on both state and input. This gives one-cycle latency advantage — the machine can respond in the same cycle the input arrives — but the output is only valid while inputs are stable. If an input glitches mid-cycle, the Mealy output glitches with it.
 
-**Asynchronous reset**: the flip-flop responds to `reset` immediately, independent of the clock. It forces the state to $S_0$ even between clock edges. The risk is that releasing `reset` close to a clock edge can cause metastability — the flip-flop input is changing in the setup/hold window of the very edge that is supposed to capture the post-reset state.
+The latency difference matters: in a Moore machine asserting $Y$ after recognizing a sequence, $Y$ arrives one cycle after the final input. In the equivalent Mealy machine, $Y$ arrives in the same cycle as the final input. For high-throughput pipelines this is significant.
 
-For most synthesized designs, synchronous reset is preferred precisely because it avoids the metastability hazard on reset release. FPGA primitives often support both; the choice propagates into the inferred primitive's reset pin type.
+### The Three-Block Structure
 
-```verilog
-// Synchronous reset — reset is only sampled on posedge clk
-always_ff @(posedge clk)
-    if (reset) state <= S0;
-    else        state <= nextstate;
+Every synthesizable FSM separates into exactly three blocks:
 
-// Asynchronous reset — reset forces state immediately
-always_ff @(posedge clk, posedge reset)
-    if (reset) state <= S0;
-    else        state <= nextstate;
-```
+1. **State register** — synchronous; updates on the clock edge
+2. **Next-state logic** — combinational; computes $\delta(s, i)$
+3. **Output logic** — combinational; computes $\lambda(s)$ or $\lambda(s, i)$
+
+Mixing sequential and combinational logic into one block causes synthesis tools to infer unintended latches (when `always_comb` has incomplete sensitivity or missing `default`) or causes simulation to diverge from hardware behavior. The three-block split makes the boundary between registered and combinational state explicit.
+
+---
 
 ## How It Works
 
-### The Three-Block HDL Structure
+### The Divide-by-3 Counter
 
-Every synthesizable FSM description breaks into three independent blocks: state register, next-state logic, output logic. Mixing them is the primary source of synthesis mismatches — where simulation matches intent but the synthesized netlist does not.
+This FSM cycles $S_0 \to S_1 \to S_2 \to S_0$ and asserts $Y = 1$ only in $S_0$. It divides a clock by 3: $Y$ pulses at $f_{clk}/3$.
+
+**State transition table (binary encoding):**
+
+| $S_1 S_0$ | $S_1' S_0'$ | $Y$ |
+|-----------|-------------|-----|
+| `00` ($S_0$) | `01` ($S_1$) | 1 |
+| `01` ($S_1$) | `10` ($S_2$) | 0 |
+| `10` ($S_2$) | `00` ($S_0$) | 0 |
+| `11` (illegal) | `00` ($S_0$) | 0 |
+
+From the table, Boolean minimization gives:
+
+$$S_1' = S_0, \qquad S_0' = \overline{S_1} \cdot \overline{S_0}$$
+
+Verify: `00` → $S_1' = 0$, $S_0' = 1$ → `01` ✓. `01` → $S_1' = 1$, $S_0' = 0$ → `10` ✓. `10` → $S_1' = 0$, $S_0' = 0$ → `00` ✓.
+
+**SystemVerilog (three-block style):**
 
 ```verilog
-// SystemVerilog — Moore pattern recognizer
-// Recognizes the sequence where input 'a' goes 1 then 0
-// y is asserted when S0 is active (post-recognition or reset)
-module patternMoore (
-    input  logic clk, reset, a,
+module divby3 (
+    input  logic clk,
+    input  logic reset,
     output logic y
 );
-    typedef enum logic [1:0] {S0, S1, S2} statetype;
+    typedef enum logic [1:0] {S0 = 2'b00,
+                               S1 = 2'b01,
+                               S2 = 2'b10} statetype;
     statetype state, nextstate;
 
-    // Block 1: state register — the ONLY sequential element
-    // Synthesis tool infers flip-flops here and nowhere else
+    // Block 1: State register
     always_ff @(posedge clk, posedge reset)
         if (reset) state <= S0;
-        else        state <= nextstate;
+        else       state <= nextstate;
 
-    // Block 2: next-state logic — purely combinational
-    // always_comb (not always @(*)) forces tool to check
-    // that all outputs are assigned in all branches,
-    // preventing unintended latch inference
+    // Block 2: Next-state logic (combinational)
     always_comb
         case (state)
-            S0: nextstate = a ? S1 : S0;
-            S1: nextstate = a ? S1 : S2;
-            S2: nextstate = a ? S1 : S0;
-            default: nextstate = S0;  // handles X/Z states in sim
+            S0:      nextstate = S1;
+            S1:      nextstate = S2;
+            S2:      nextstate = S0;
+            default: nextstate = S0;  // handles illegal state 2'b11
         endcase
 
-    // Block 3: output logic — depends only on state (Moore)
-    // A combinational assign; no clock, no latch
+    // Block 3: Output logic (Moore)
     assign y = (state == S0);
 endmodule
 ```
 
-The `always_ff` block infers flip-flops. The `always_comb` block infers only combinational logic. The `default` branch in the `case` is not defensive padding — it handles the case where synthesis optimizations or power-on transients leave the state register in an encoding that does not correspond to any named state, preventing the machine from locking up in an unreachable state with undefined outputs.
+The `default` branch is not defensive boilerplate — it is the recovery path for power-on state. At startup, flip-flops can reset to any value depending on silicon process variation and board conditions. Without `default`, the FSM can enter `2'b11` and loop there forever because no valid transition exists. With it, any illegal state converges to $S_0$ on the next clock edge.
+
+### Pattern Recognizer: Moore vs. Mealy Latency
+
+FSM detects serial sequence `1, 0, 1` on input $a$ and asserts $Y$.
+
+**Moore state diagram:**
+
+```
+RESET → S0 --(a=1)--> S1 --(a=0)--> S2 --(a=1)--> S3 [Y=1]
+              (a=0)↩      (a=1)↩            (a=0)→S0
+```
+
+$Y$ is tied to $S3$: it arrives one cycle after the final `1`.
+
+**Mealy version eliminates $S3$:** $Y$ is asserted combinationally in $S2$ when $a = 1$, so it arrives in the same cycle as the final `1`. The machine needs only three states instead of four.
+
+```verilog
+// Mealy output block — note: output is combinational, not registered
+always_comb begin
+    y = 1'b0;
+    case (state)
+        S2: y = (a == 1'b1);  // asserted this cycle if input completes pattern
+        default: y = 1'b0;
+    endcase
+end
+```
+
+The Mealy output $y$ is valid only while $a$ is stable. If $a$ glitches high and low within the same clock cycle, $y$ glitches too. For a Moore machine, $y$ cannot glitch within a cycle because it derives from registered state only.
 
 ### Why Nonblocking Assignment Is Not Optional
 
-In `always_ff` blocks, use **nonblocking** assignment (`<=`). The distinction is not stylistic — it reflects how real flip-flops work.
-
-Nonblocking assignment evaluates all right-hand sides first, using the values that exist at the start of the time step, then updates all left-hand sides simultaneously. This matches the physical behavior of a bank of flip-flops clocked by the same edge: all inputs are sampled at the same instant.
-
-Blocking assignment (`=`) executes sequentially within the block, writing the left-hand side before the next statement reads it. In a state register this breaks the simultaneous-capture abstraction:
+In hardware, all flip-flops in a register stage sample their $D$ inputs simultaneously at the clock edge, then drive their $Q$ outputs simultaneously. Blocking assignment `=` in an `always_ff` block breaks this model by causing immediate in-order evaluation.
 
 ```verilog
-// BROKEN — blocking assignment in sequential block
-// 'state' is updated before the always block finishes,
-// so any subsequent read of 'state' in the same time step
-// sees the new value, not the value that existed at the clock edge
-always @(posedge clk) begin
-    state  = nextstate;   // state updated NOW
-    output = state;       // reads the NEW state, not the old one
+// WRONG: blocking assignment in sequential block
+always_ff @(posedge clk) begin
+    state = nextstate;   // state updated immediately in simulation
+    q     = state;       // reads the NEW state — models a wire, not a register
 end
 
-// CORRECT — nonblocking preserves the captured-at-edge semantics
+// CORRECT: nonblocking
 always_ff @(posedge clk) begin
-    state  <= nextstate;  // RHS evaluated at clock edge
-    output <= state;      // also reads state at the clock edge
-end                       // both LHS updates happen after the block
+    state <= nextstate;
+    q     <= state;      // reads state value from BEFORE this clock edge
+end
 ```
 
-The rule is absolute: **combinational blocks use `=`; sequential blocks use `<=`.**
+The nonblocking `<=` schedules all right-hand side evaluations before any left-hand side updates. This matches the physical behavior of a master-slave flip-flop: the master samples on the clock edge while the slave is still driving the old value.
 
-### Working Through the Traffic Light FSM
+If you use blocking assignment in a shift register, each stage reads the already-updated output of the previous stage rather than its pre-clock value — the "register" becomes transparent, and $n$ stages of delay collapse to zero.
 
-The traffic light controller has 4 states encoding light colors for two roads (Academic Ave = A, Bravado Blvd
+---
+
+## Linux Connection
+
+### Process Lifecycle FSM
+
+The Linux process scheduler models every task as an

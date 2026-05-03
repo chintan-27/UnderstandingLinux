@@ -12,115 +12,113 @@ resources:
 
 ## Why This Matters
 
-Silicon is a semiconductor not because of what it *is* but because of what you *do* to it: you deliberately introduce foreign atoms that either donate or accept electrons, shifting the Fermi level and creating regions that conduct only under specific conditions. That process — doping — is redox chemistry. Copper traces corrode when oxygen oxidizes the metal surface, increasing resistance and eventually breaking continuity. Thermal interface materials conduct heat in proportion to how well their molecular structure couples phonon vibration across a junction. Solder flows at a precise temperature because that is where the metallic bond energy of the alloy is overcome by thermal agitation. None of this is accessible without a working model of atomic structure, electron transfer, and bonding geometry. This module builds that model from first principles, oriented toward the physical behavior of computing hardware.
-
----
+Every process running on your Linux system is, at the deepest level, a story about electrons. The transistors in your CPU switch because electrons move between silicon atoms whose bonding geometry changes under an applied electric field. The thermal throttling in `cpufreq` exists because atomic vibration — heat — scatters conduction electrons, increasing resistance and causing voltage drops that corrupt logic levels. Flash storage wears out because electrons tunnel through silicon dioxide layers and become permanently trapped, shifting the threshold voltage of the floating gate until the cell can no longer distinguish 0 from 1. Chemistry is not background knowledge — it is the reason your hardware has the failure modes it does.
 
 ## Core Concepts
 
-### Atoms and Electrons
+### Atoms and the Stability Imperative
 
-A nucleus contains protons (which define the element) and neutrons (which affect mass and nuclear stability but almost nothing about chemistry). Electrons surround the nucleus in discrete energy levels called shells.
+An atom consists of a nucleus (protons + neutrons) surrounded by electrons in discrete energy shells. Shell capacities follow from quantum mechanics: 2, 8, 8, 18, ... The outermost shell — the **valence shell** — determines all bonding behavior.
 
-The critical quantity is the number of electrons in the **outermost shell** — the **valence electrons**. These are the only electrons involved in bonding. Inner electrons are shielded by the nucleus and do not participate. The periodic table is organized so that every element in the same column has the same valence electron count, which is why column position predicts chemical behavior.
+The driving principle: **electrostatic potential energy is minimized when the valence shell is full**. This is not a metaphor. The Coulomb potential between a nucleus of charge $+Ze$ and an electron at distance $r$ is:
 
-Shell capacities:
+$$V(r) = -\frac{Ze^2}{4\pi\epsilon_0 r}$$
 
-- Shell 1: 2 electrons
-- Shell 2: 8 electrons
-- Shell 3: 8 electrons (for main-group elements), expandable for transition metals
+Electrons in a full shell are screened by inner electrons and settle into a configuration where net force on each electron is minimized. Atoms with incomplete valence shells have asymmetric charge distributions — exposed nuclear charge — that create electrostatic gradients. Bonding is the mechanical consequence of atoms lowering that gradient.
 
-An atom is most stable when its outermost shell is full. This is not a preference — it is a consequence of quantum mechanical energy minimization. A full shell is a local energy minimum; any partially filled shell represents stored potential energy that can be released by bonding.
+### Valence: Precise Bookkeeping
 
-### Valence and Bonding Rules
+Valence electrons are the electrons in the outermost shell. They determine bond count exactly:
 
-| Element | Valence electrons | Bonds typically formed | Why |
-|---------|-------------------|----------------------|-----|
-| H       | 1                 | 1                    | Needs 1 more to fill shell 1 (capacity 2) |
-| C       | 4                 | 4                    | Needs 4 more to fill shell 2 (capacity 8) |
-| N       | 5                 | 3                    | Needs 3 more; 1 lone pair remains |
-| O       | 6                 | 2                    | Needs 2 more; 2 lone pairs remain |
-| Si      | 4                 | 4                    | Same configuration as C, one shell lower |
+| Element | Valence $e^-$ | Bonds formed | Reason |
+|---------|--------------|--------------|--------|
+| H | 1 | 1 | needs 1 more to fill shell (capacity 2) |
+| C | 4 | 4 | needs 4 more to fill shell (capacity 8) |
+| N | 5 | 3 | needs 3 more; 1 lone pair remains |
+| O | 6 | 2 | needs 2 more; 2 lone pairs remain |
+| Si | 4 | 4 | same as carbon — this is not a coincidence |
 
-Si and C both have 4 valence electrons and form 4 bonds. This is why silicon can form the same tetrahedral crystal lattice as diamond carbon, and why silicon is the basis of semiconductor fabrication rather than, say, aluminum.
+Silicon's 4-valence structure is why it was chosen for transistors: like carbon, it forms a tetrahedral lattice with exactly 4 bonds per atom, and that lattice can be precisely doped by substituting atoms with 3 or 5 valence electrons to create controlled charge deficits (p-type) or surpluses (n-type).
 
-### Bonding: Why Atoms Stick Together
+$\text{CO}_2$ is linear with double bonds ($\text{O=C=O}$) because carbon's 4 bonding slots are filled by two double bonds, and each oxygen's 2 bonding slots are filled by one double bond. There is no other stable configuration that satisfies both atoms' valence requirements simultaneously.
 
-Bonding occurs because sharing or transferring electrons produces a lower total energy state than two isolated atoms. The energy released in forming a bond is the bond dissociation energy — you have to put that much energy *back in* to break it.
+### Covalent vs. Ionic Bonds
 
-**Covalent bonding**: Electrons are shared between atoms. Neither atom gives up the electron entirely; both nuclei attract the shared pair, and the electron density between them lowers the total electrostatic energy. Water ($\text{H}_2\text{O}$) is covalent: each hydrogen shares its single electron with oxygen, and both achieve full outer shells. The O–H bond dissociation energy is approximately 459 kJ/mol — that is the energy cost to sever it.
+**Covalent bonds** form when atoms *share* electrons into overlapping orbitals. Neither atom surrenders the electrons; both nuclei attract the shared pair, lowering the system's potential energy. The bond has a definite spatial direction — it points along the line of orbital overlap — which is why molecules have rigid geometries.
 
-**Ionic bonding**: One atom transfers an electron to another. Sodium has 1 valence electron; removing it leaves a full shell (shell 2) and produces $\text{Na}^+$. Chlorine has 7 valence electrons; accepting one more fills its shell and produces $\text{Cl}^-$. The resulting ions attract each other by Coulomb's law:
+Bond strength is quantified as **bond dissociation energy**: the energy required to break one mole of bonds homolytically. Representative values:
 
-$$F = k_e \frac{q_1 q_2}{r^2}$$
+| Bond | Dissociation energy |
+|------|-------------------|
+| C–C | 347 kJ/mol |
+| C=C | 614 kJ/mol |
+| C≡C | 839 kJ/mol |
+| Si–O | 452 kJ/mol |
+| Si–H | 318 kJ/mol |
 
-In solid NaCl there is no discrete "NaCl molecule." The crystal is an infinite lattice of alternating $\text{Na}^+$ and $\text{Cl}^-$ ions, each surrounded by six of the opposite charge. Every ion is bonded to its six neighbors equally — there is no natural boundary where one "molecule" ends and another begins.
+The Si–O bond's strength (452 kJ/mol) is why silicon dioxide ($\text{SiO}_2$) is used as a gate dielectric — it forms spontaneously on silicon surfaces and is chemically stable enough to survive fabrication temperatures.
 
-**Metallic bonding**: Valence electrons are not localized to specific atoms or pairs. They delocalize across the entire material, forming a mobile electron sea. The metal cations sit in fixed lattice positions; the electrons flow freely between them. This is why metals conduct electricity: an applied electric field exerts force on those free electrons, and they drift. It is also why metals are malleable — the lattice can shift without breaking discrete bonds, because the electron sea adjusts continuously.
+**Ionic bonds** form when the electronegativity difference between two atoms is large enough that electron transfer is energetically favorable over sharing. Sodium (1 valence electron) transfers it to chlorine (7 valence electrons). The result:
 
-### Molecular Geometry
+- $\text{Na}^+$: full outer shell, net charge $+1$
+- $\text{Cl}^-$: full outer shell, net charge $-1$
+- Electrostatic attraction: $F = k_e \frac{q_1 q_2}{r^2}$
 
-Bond angles are not arbitrary. Electron pairs — both bonding pairs and lone pairs — repel each other electrostatically (VSEPR: Valence Shell Electron Pair Repulsion). They arrange to maximize angular separation.
+NaCl forms a repeating cubic lattice with no discrete molecule — every $\text{Na}^+$ is surrounded by 6 $\text{Cl}^-$ ions and vice versa. "A molecule of salt" is not a meaningful concept; the lattice energy is the sum of all pairwise Coulomb interactions across the crystal.
 
-$\text{CO}_2$ is linear because carbon forms two double bonds with oxygen, and two electron groups separated by 180° is the maximum possible separation. No lone pairs exist on carbon to distort this.
+### Molecular Geometry and Polarity
 
-Water is bent, not linear, because oxygen has **two lone pairs** in addition to its two bonding pairs. Four electron groups arrange tetrahedrally (~109.5°), but lone pairs occupy more angular space than bonding pairs, compressing the H–O–H bond angle to approximately 104.5°. This distortion has direct physical consequences — it makes water polar.
+Bond angles emerge from **valence shell electron pair repulsion (VSEPR)**: all electron pairs — bonding and lone — repel each other and adopt maximum angular separation. Water has 4 electron pairs around oxygen (2 bonding, 2 lone), which adopt a tetrahedral arrangement; but because the lone pairs are invisible to X-ray diffraction, the observed geometry is bent with a bond angle of $104.5°$ rather than the ideal tetrahedral $109.5°$. Lone pairs repel more strongly than bonding pairs, compressing the H–O–H angle.
 
-Molecular geometry determines:
-- **Polarity** (whether charge is asymmetrically distributed)
-- **Intermolecular forces** (which determine boiling point and viscosity)
-- **Reactivity** (which face of a molecule an attacking species can approach)
+The asymmetric geometry means the center of negative charge does not coincide with the center of positive charge. This separation constitutes a **dipole moment**:
 
-### Equilibrium and Dynamic Balance
+$$\vec{\mu} = q \cdot \vec{d}$$
 
-A sealed flask half-full of water at constant temperature looks static. It is not. At the liquid surface, molecules continuously escape into the vapor phase (evaporation) and vapor molecules continuously return to the liquid (condensation). Equilibrium is the condition where these rates are equal — not where they are zero.
+where $q$ is the magnitude of separated charge and $\vec{d}$ points from negative to positive. Water's dipole moment is $1.85 \text{ D}$ (debyes). This is why water dissolves ionic compounds: the $\delta^-$ oxygen end orients toward cations; the $\delta^+$ hydrogen ends orient toward anions. The hydration energy released exceeds the lattice energy of the ionic solid, so dissolution proceeds.
 
-This has a precise quantitative form. The vapor pressure $P$ at temperature $T$ follows the Clausius-Clapeyron equation:
+Nonpolar molecules (symmetric charge distribution, $\vec{\mu} = 0$) cannot interact favorably with water's dipole — hence "like dissolves like." This matters for semiconductor fabrication: nonpolar photoresists are deliberately chosen so they don't absorb atmospheric water vapor.
 
-$$\ln\frac{P_2}{P_1} = -\frac{\Delta H_\text{vap}}{R}\left(\frac{1}{T_2} - \frac{1}{T_1}\right)$$
+### Reactions: Energy Accounting
 
-where $\Delta H_\text{vap}$ is the molar enthalpy of vaporization and $R$ is the gas constant. Increase $T$ and $P$ rises exponentially — the equilibrium shifts toward the vapor phase because more molecules have enough energy to escape.
+A chemical reaction rearranges bonds. Atoms are conserved; bond energies are not. Whether a reaction releases or absorbs energy depends on the difference in bond energies between products and reactants:
 
-The same logic applies to dissolving ionic salts: equilibrium occurs when the rate of ions leaving the crystal lattice equals the rate of ions re-depositing from solution. Heating shifts the equilibrium because it changes reaction rates unequally.
+$$\Delta H_{rxn} = \sum \text{(bonds broken)} - \sum \text{(bonds formed)}$$
 
-### Chemical Reactions: Rearranging Atoms
+Methane combustion:
 
-A reaction breaks bonds and forms new bonds. Atoms are conserved; only their connectivity changes. The energy balance determines whether the reaction releases heat (exothermic) or absorbs it (endothermic):
+$$\text{CH}_4 + 2\text{O}_2 \rightarrow \text{CO}_2 + 2\text{H}_2\text{O}$$
 
-$$\Delta H_\text{rxn} = \sum (\text{bond energies broken}) - \sum (\text{bond energies formed})$$
+Bonds broken: 4(C–H) + 2(O=O) = 4(413) + 2(498) = 2648 kJ/mol  
+Bonds formed: 2(C=O) + 4(O–H) = 2(799) + 4(463) = 3450 kJ/mol  
+$\Delta H \approx 2648 - 3450 = -802$ kJ/mol (exothermic; products are lower energy)
 
-If bonds formed are stronger than bonds broken, $\Delta H_\text{rxn} < 0$ and energy is released. The reaction $2\text{H}_2 + \text{O}_2 \rightarrow 2\text{H}_2\text{O}$ is strongly exothermic because O–H bonds (~459 kJ/mol each) are much stronger than the H–H (~436 kJ/mol) and O=O (~498 kJ/mol) bonds they replace.
+The general spontaneity criterion is Gibbs free energy:
 
-**Reaction rate** depends on temperature through the Arrhenius equation:
+$$\Delta G = \Delta H - T\Delta S$$
 
-$$k = A \cdot e^{-E_a / RT}$$
+A reaction proceeds spontaneously when $\Delta G < 0$. At low $T$, enthalpy dominates — whether bonds in products are stronger than in reactants determines the outcome. At high $T$, the $T\Delta S$ term dominates — reactions that increase disorder ($\Delta S > 0$) become favorable. This crossover is why some reactions are endothermic but still proceed at high temperatures: the entropy gain outweighs the enthalpy cost.
 
-where $E_a$ is the activation energy — the energy barrier that must be crossed to rearrange bonds. Below the activation threshold, collisions are elastic and no reaction occurs. The exponential dependence means small temperature increases produce large rate increases.
+Activation energy $E_a$ is the energy barrier the system must surmount to reach the transition state. The rate constant follows the Arrhenius equation:
+
+$$k = A e^{-E_a / RT}$$
+
+Doubling temperature does not double the rate — it exponentially increases it. This is why a CPU running 20°C hotter than rated does not degrade twice as fast; it degrades *much* faster, because the reaction rates for electromigration and oxide breakdown follow the Arrhenius form.
 
 ### Oxidation and Reduction
 
-Oxidation and reduction always occur together — one species loses electrons, another gains them. The mnemonic: **OIL RIG** — Oxidation Is Loss, Reduction Is Gain.
+**Oxidation** is loss of electrons; **reduction** is gain of electrons (OIL RIG). They always occur as a pair — electrons lost by one species are gained by another. The **oxidation state** is a bookkeeping assignment of formal electron ownership: in $\text{H}_2\text{O}$, oxygen is $-2$, hydrogen is $+1$.
 
-$$4\text{Fe} + 3\text{O}_2 \rightarrow 2\text{Fe}_2\text{O}_3$$
+$$\text{Zn} + \text{Cu}^{2+} \rightarrow \text{Zn}^{2+} + \text{Cu}$$
 
-Iron is oxidized: each Fe atom loses electrons to reach a positive oxidation state (+3 in $\text{Fe}_2\text{O}_3$). Oxygen is reduced: each O atom gains electrons, reaching oxidation state −2.
+Zinc: $0 \rightarrow +2$, oxidized, lost 2 electrons.  
+Copper: $+2 \rightarrow 0$, reduced, gained 2 electrons.
 
-**Oxidation state** is a bookkeeping convention for electron distribution in a compound. Rules:
-- Free elements have oxidation state 0
-- Monatomic ions have oxidation state equal to their charge
-- In a neutral compound, all oxidation states sum to zero
-- Oxygen is almost always −2; hydrogen is almost always +1
+The cell potential driving this reaction is:
 
-For $\text{Fe}_2\text{O}_3$: let Fe = $x$. Then $2x + 3(-2) = 0$, so $x = +3$. Iron has been oxidized by 3 electrons per atom.
+$$\mathcal{E}_{cell} = \mathcal{E}_{cathode} - \mathcal{E}_{anode}$$
 
-This is not a surface phenomenon in iron. Once the oxide layer forms, oxygen diffuses through it to reach fresh metal underneath. Unless the oxide layer is impermeable (as with aluminum's $\text{Al}_2\text{O}_3$, which is dense and self-limiting), corrosion continues inward.
+For Zn/Cu: $\mathcal{E}_{cell} = +0.34\text{ V} - (-0.76\text{ V}) = 1.10\text{ V}$
 
----
+This is the basis of every battery — controlled redox produces an electromotive force. Lithium-ion cells use intercalation (lithium ions moving between graphite and metal oxide lattices) rather than dissolution, but the electrochemistry is identical in principle: electron flow through an external circuit, ion flow through the electrolyte.
 
-## How It Works
-
-### Why Water Is Polar and Why That Matters
-
-Electronegativity measures how strongly a nucleus attracts shared bonding electrons toward itself. Oxygen's electronegativity (3.44 on the Pauling scale) is much higher than hydrogen's (2.20). In an O–H bond, the shared electrons spend more time near oxygen, creating a partial negative charge ($\delta^-$) on oxygen and partial positive charges ($\delta^+$) on the hydrogens.
-
-Because water is bent rather than linear, these bond dipoles do not cancel — the molecule has a net dipole moment of 1.85 D. If water were linear like $\text{CO}_2$ (where the two C=O dipoles point in exactly opposite directions and cancel), it would
+Oxidation is also how aluminum forms its protective $\text{Al}_2\text{O}_3$ layer — aluminum at the surface is oxidized by atmospheric oxygen, and the resulting oxide is dense enough to prevent further oxidation of the bulk metal. Heatsink material selection is partially a story about which oxides form, how dense they are, and whether they conduct

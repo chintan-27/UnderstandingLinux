@@ -12,7 +12,7 @@ resources:
 
 ## Why This Matters
 
-Every instruction a CPU executes passes through a specific set of hardware components in a specific order. If the control signals that coordinate them fire at the wrong time or in the wrong combination, the processor computes garbage or halts. This is not abstract: the kernel's context switch code in `arch/x86/kernel/process_64.c` saves and restores registers because the register file has finite ports and writeback is synchronous — skip a register, lose a thread's state. The syscall ABI specifies which registers survive a call because the hardware has no automatic save mechanism; software convention fills the gap. Performance counters exposed by `perf` measure the exact pipeline stages this lesson describes. You cannot reason about any of this without understanding what the datapath is and why the control signals are structured the way they are.
+Every instruction the Linux kernel executes — a system call entry via `syscall`, a `memcpy` inside `copy_to_user`, a scheduler `cmpxchg` on the run queue — is ultimately a sequence of control signals routed through physical hardware. The datapath determines what transformations are *possible* on any given cycle; the control unit determines which transformation *actually happens*. If you don't understand this layer, you can't reason about why `add` costs one cycle while `lw` costs more, why out-of-order CPUs need hazard detection, or why the Linux ABI mandates that function arguments live in specific registers. These aren't arbitrary conventions — they're direct consequences of datapath geometry.
 
 ---
 
@@ -20,115 +20,98 @@ Every instruction a CPU executes passes through a specific set of hardware compo
 
 ### The Datapath
 
-The datapath is the collection of hardware elements that move and transform data: instruction memory, register file, ALU, data memory, adders, and multiplexors. It is the *mechanism*. Control signals are the *policy* that steers it. Separating the two matters because the same physical hardware executes dozens of different instruction types — changing which multiplexor input is selected and what operation the ALU performs is cheaper than building separate circuits per instruction.
+The datapath is the set of hardware elements that hold and transform data: instruction memory, data memory, register file, ALU, dedicated adders, and the buses connecting them. The PC is a register inside the datapath holding the address of the instruction currently being fetched.
+
+On each rising clock edge, the datapath reads the instruction at `PC`, routes operands through functional units, and writes results back. The PC increments by 4 because each 32-bit instruction occupies exactly 4 bytes — incrementing by 1 would point into the middle of the current instruction:
+
+$$\text{PC}_{\text{next}} = \text{PC} + 4$$
+
+For a taken branch, the 16-bit offset encoded in the instruction is sign-extended to 32 bits and shifted left by 2 (converting a *word* offset to a *byte* offset), then added to $\text{PC} + 4$ — not to `PC` itself, because the PC has already advanced during fetch:
+
+$$\text{PC}_{\text{branch}} = (\text{PC} + 4) + (\text{SignExt}(\text{offset}) \ll 2)$$
+
+The shift-left-by-2 is not an arbitrary encoding decision. It encodes $4\times$ the word offset in only 16 bits, giving a branch range of $\pm 2^{15} \times 4 = \pm 131072$ bytes from the instruction following the branch. Exceeding that range requires a jump instruction or a trampoline.
 
 ### The Register File
 
-The register file is a small, fast array of 32 registers (on MIPS), each 32 bits wide, with two read ports and one write port. The reason there are exactly two read ports is that all binary operations need exactly two inputs. A third read port would cost silicon and increase the critical path length without benefit for the common case.
+The register file is a synchronous-read, synchronous-write array of 32 × 32-bit storage cells (on MIPS). It exposes **two read ports** and **one write port**, so it can deliver both source operands and absorb one result within a single clock cycle.
 
-A register file read is **combinational**: the output appears as soon as the address lines are stable, with no clock edge required. A write is **synchronous**: it only commits on a rising clock edge when `RegWrite` is asserted. This asymmetry is load-bearing. Combinational reads mean the hardware can speculatively route operands through the ALU before the instruction is fully decoded. Synchronous writes mean state never changes accidentally — a write either completes atomically on a clock edge or not at all.
+Read is combinational: supply a 5-bit register index, and the value propagates to the output within the same half-cycle, before the clock edge that latches the ALU result. Write is clocked: the value is latched on the rising edge only when **RegWrite** is asserted. This asymmetry is intentional — if writes were also combinational, a write and a read to the same register in the same cycle would produce a race condition with undefined behavior.
 
-On x86-64, the kernel exploits this directly. The `TASK_STRUCT` in Linux stores register state as a flat array:
+Why exactly two read ports? Because every ALU R-type instruction (`add`, `sub`, `and`, `slt`, …) has two source registers. A single read port would require two sequential read cycles per instruction, doubling the cycle count for the most common instruction class. Adding a third read port would benefit almost no instruction (stores need two registers, but one is an address, handled separately) at the cost of increased silicon area and wiring complexity.
 
-```c
-// arch/x86/include/asm/processor.h (simplified)
-struct thread_struct {
-    unsigned long   sp;      // stack pointer
-    unsigned long   ip;      // instruction pointer
-    // ... segment registers, debug registers ...
-};
-```
+The cost of a register access versus a cache access is architectural, not incidental:
 
-When the scheduler calls `__switch_to_asm` in `arch/x86/entry/entry_64.S`, it issues a sequence of `pushq`/`popq` instructions that exploit the write-port discipline: every register save is a synchronous write to memory, every restore is a read that becomes combinational once the address is stable in cache.
+- Register read latency: $\sim 0.2\,\text{ns}$ (on-die, direct index)
+- L1 cache hit latency: $\sim 1\text{–}4\,\text{ns}$ (on-die, but requires tag comparison and set indexing)
+- L2 cache hit latency: $\sim 10\text{–}20\,\text{ns}$
+
+This is why the compiler works hard to keep hot variables in registers rather than spilling them to the stack.
 
 ### The ALU
 
-The ALU performs integer arithmetic and logic on two 32-bit operands, producing a 32-bit result plus status bits. The most important status bit is the `Zero` flag: it is asserted when the output is exactly $0$, and it is wired directly into the branch logic. The ALU does not decide what to compute — a 4-bit `ALUcontrol` signal tells it.
+The ALU takes two 32-bit inputs $A$ and $B$ and produces a 32-bit result $R$ plus status bits. The critical status bit for control flow is **Zero**: if $R = 0$, Zero is asserted. For `beq`, the ALU computes $A - B$; if $A = B$, the difference is zero and the branch is taken. The branch decision costs no extra cycles — the subtraction and Zero detection happen in parallel with the rest of the execute stage.
 
-`ALUcontrol` is derived in two stages:
+The ALU does not decide its own operation. A 3-bit **ALUcontrol** input selects from the supported operations:
 
-1. The main control unit decodes `opcode` (bits 31–26) and emits a 2-bit `ALUOp`.
-2. The ALU control unit combines `ALUOp` with the `funct` field (bits 5–0) to produce the final 4-bit `ALUcontrol`.
+| ALUcontrol | Operation |
+|---|---|
+| `000` | AND |
+| `001` | OR |
+| `010` | Add |
+| `110` | Subtract |
+| `111` | Set-less-than |
 
-The reason for two layers is that the `opcode` alone cannot distinguish `add` from `sub` from `and` — all R-type instructions share `opcode = 000000`. The `funct` field carries the distinction. Keeping the main controller ignorant of `funct` means it stays a small combinational ROM; the ALU control handles R-type nuance locally.
+Those 3 bits are produced by a two-level decoding scheme to avoid making the main control unit aware of every funct-field variant:
 
-The ALU's `Zero` output is a single wire. It feeds a two-input AND gate:
+1. The **main control unit** reads the 6-bit opcode (bits 31:26) and emits a 2-bit **ALUOp**: `00` = add (for `lw`/`sw`), `01` = subtract (for `beq`), `10` = look at funct (for R-type).
+2. The **ALU control unit** combines ALUOp with the 6-bit funct field (bits 5:0) to produce the final 3-bit ALUcontrol.
 
-$$\text{PCSrc} = \text{Branch} \land \text{Zero}$$
+The two-level scheme exists because R-type instructions encode their specific operation in funct, not opcode. The opcode for every R-type instruction is `000000`; without the funct field, `add` and `sub` and `slt` would be indistinguishable. The main control unit handles the coarse categorization; the ALU control unit handles the fine discrimination within R-type.
 
-`Branch` is asserted by the main controller for `beq`. `Zero` is asserted by the ALU when the subtraction of the two branch operands equals $0$. Both conditions must hold simultaneously to redirect the PC — hardware-enforced two-factor authorization for a branch.
+For `lw`, the funct field is irrelevant — ALUOp `00` forces add regardless, because `lw` always computes `base + offset`. This is why the "don't care" entries exist in the truth table.
 
 ### Control Signals
 
-Seven control signals govern the single-cycle datapath. Each selects between two datapaths or enables a write:
+The control unit is a combinational circuit: it maps a 6-bit opcode to 7 asserted/deasserted 1-bit output signals, with no state. There is no feedback loop — the opcode goes in, the signals come out within the same clock phase, before the rising edge that locks in results.
 
-| Signal | 0 (deasserted) | 1 (asserted) |
+| Signal | = 0 | = 1 |
 |---|---|---|
-| `RegDst` | Write register ← `rt` (bits 20:16) | Write register ← `rd` (bits 15:11) |
-| `RegWrite` | No write | Write to register file |
-| `ALUSrc` | Second ALU input ← `Read data 2` | Second ALU input ← sign-extended immediate |
-| `PCSrc` | PC ← PC + 4 | PC ← branch target |
-| `MemRead` | No read | Read from data memory |
-| `MemWrite` | No write | Write to data memory |
-| `MemtoReg` | Write data ← ALU result | Write data ← memory read data |
+| **RegDst** | Write register ← `rt` (bits 20:16) | Write register ← `rd` (bits 15:11) |
+| **RegWrite** | No register written | Latch result into write register |
+| **ALUSrc** | ALU input B ← Read data 2 (register) | ALU input B ← sign-extended immediate |
+| **PCSrc** | PC ← PC + 4 | PC ← branch target |
+| **MemRead** | No memory read | Read data memory at ALU result address |
+| **MemWrite** | No memory write | Write data memory at ALU result address |
+| **MemtoReg** | Write data ← ALU result | Write data ← memory read data |
 
-For `add $t1, $t2, $t3`: `RegDst=1` (destination is `rd`), `ALUSrc=0` (second operand from register), `MemtoReg=0` (result from ALU), `RegWrite=1`, `MemRead=0`, `MemWrite=0`, `PCSrc=0`. Every memory signal is deasserted; the data path is entirely register file → ALU → register file.
+**RegDst** exposes a fundamental asymmetry in the MIPS instruction encoding: R-type instructions encode the destination in `rd` (bits 15:11), but I-type instructions (including `lw`) encode it in `rt` (bits 20:16). The same bit field means "second source" for R-type and "destination" for I-type. A single multiplexer controlled by RegDst resolves this without the register file needing to know which format is in flight.
 
-For `lw $t1, 8($t2)`: `RegDst=0` (destination is `rt`), `ALUSrc=1` (offset from immediate), `MemtoReg=1` (data from memory), `RegWrite=1`, `MemRead=1`, `MemWrite=0`, `PCSrc=0`. The ALU computes the effective address:
+**MemtoReg** is similarly critical: after a `lw`, the value to write back comes from data memory, not the ALU. After an `add`, it comes from the ALU, not memory. These two values are routed to a mux; MemtoReg selects which one reaches the register file's write data input. They cannot both be written simultaneously — the register file has one write port.
 
-$$\text{EA} = \text{R}[t2] + \text{SignExt}(8)$$
+### Buses
 
-and that address feeds directly into data memory — the ALU is repurposed as an address adder.
+In a single-cycle datapath, "bus" usually means a point-to-point bundle of wires carrying a multi-bit value from one functional unit to another. The term "shared bus" (multiple masters contending for the same wires) applies more to memory interconnects and peripheral buses (PCIe, AHB) than to the CPU datapath itself.
 
-### Buses and Multiplexors
-
-A bus is a bundle of wires carrying a multi-bit value. The key constraint is exclusivity: multiple sources may connect to a bus, but only one may drive it at a time. Multiplexors enforce this — the control signal selects which source wins. Letting two sources drive the same bus simultaneously causes a short circuit (or, in CMOS, a logic contention that draws excessive current and produces an undefined voltage). Multiplexors are the hardware equivalent of a mutex.
+The 32-bit **Write data** path into the register file is the datapath's most consequential mux output: the MemtoReg mux sits here, selecting between the ALU result and the memory read data. Getting MemtoReg wrong doesn't raise an exception — it silently writes the wrong value into a register, corrupting program state. The control unit must assert it correctly for every instruction, every cycle.
 
 ---
 
 ## How It Works
 
-### Instruction Execution: Five Stages, One Clock Cycle
-
-In a single-cycle implementation, everything resolves within one clock period. Data flows in causal order:
+### Single-Cycle Execution: R-Type (`add $t1, $t2, $t3`)
 
 ```
-Instruction Memory → Register File (read) → ALU → Data Memory → Register File (write)
+  Encoding: opcode=000000, rs=$t2(25:21), rt=$t3(20:16), rd=$t1(15:11), funct=100000
 ```
 
-The clock period must be long enough for the slowest instruction to complete end-to-end. If data memory access takes $t_{mem}$ and every other stage takes $t_{stage}$, then:
+1. **Fetch**: PC is sent to instruction memory. The memory returns the 32-bit instruction word. Simultaneously, a dedicated adder computes PC+4 and feeds it back to PC (PCSrc=0 selects this path).
+2. **Decode/Read**: Bits 25:21 and 20:16 index the register file's two read ports. `$t2` and `$t3` appear on Read data 1 and Read data 2 combinationally.
+3. **Execute**: ALUSrc=0 routes Read data 2 (not an immediate) to ALU input B. ALUOp=10 combined with funct=`100000` (add) produces ALUcontrol=`010`. The ALU computes `$t2 + $t3`.
+4. **Write back**: RegDst=1 routes bits 15:11 (`$t1`) to the write register index. MemtoReg=0 routes the ALU result to Write data. RegWrite=1 latches the result into `$t1` on the rising clock edge.
 
-$$T_{clock} \geq t_{fetch} + t_{decode} + t_{ALU} + t_{mem} + t_{writeback}$$
+MemRead=0, MemWrite=0: data memory is not touched.
 
-A store instruction skips writeback; a branch skips memory. But the clock period is fixed to the worst case — every instruction, even a fast one, waits. This is the central inefficiency that pipelining solves.
+### Single-Cycle Execution: Load (`lw $t1, 100($t2)`)
 
-**Step 1 — Fetch.** The PC holds the address of the current instruction. Instruction memory is combinational: address in, 32-bit instruction out. Simultaneously, a dedicated adder computes:
-
-$$PC_{next} = PC + 4$$
-
-This adder is hardwired to increment by 4; it is not the ALU. Using the ALU here would create a structural hazard in a pipelined design and would require routing the PC through ALU control logic unnecessarily.
-
-**Step 2 — Decode and register read.** The 32-bit instruction is split by field position:
-
-```
-Bits [31:26]  opcode    → main control unit
-Bits [25:21]  rs        → Read register 1
-Bits [20:16]  rt        → Read register 2 (or Write register if RegDst=0)
-Bits [15:11]  rd        → Write register (if RegDst=1)
-Bits [15:0]   immediate → sign-extend unit → 32-bit value
-Bits [5:0]    funct     → ALU control unit
-```
-
-The register file reads `rs` and `rt` simultaneously and unconditionally. The hardware does not wait to determine whether the instruction actually needs both operands. This is safe because reads are combinational and non-destructive — reading a register that turns out to be irrelevant wastes nothing.
-
-**Step 3 — Execute.** `ALUSrc` selects the second ALU operand: `Read data 2` for R-type and `beq`, or the sign-extended immediate for `lw`, `sw`, and `addi`. The ALU computes its result and asserts `Zero` if the 32-bit output is $0$.
-
-The branch target address is computed by a separate adder — not the main PC+4 adder, not the ALU:
-
-$$PC_{branch} = (PC + 4) + \left(\text{SignExt}(\text{imm}_{15:0}) \ll 2\right)$$
-
-The left shift by 2 (equivalent to multiplication by 4) converts word offsets to byte addresses. Branch offsets are always word-aligned, so the low 2 bits of any valid branch target are always `00` — those bits are implicit and not stored in the instruction encoding, buying 2 bits of extra branch range for free.
-
-**Step 4 — Memory access.** `lw` asserts `MemRead=1`; the ALU result is the byte address; data memory outputs the 32-bit word at that address. `sw` asserts `MemWrite=1`; `Read data 2` is the value written. R-type instructions assert neither — data memory is idle, but it is still present in the datapath and its outputs are simply ignored downstream.
-
-**Step 5 — Write back.** `MemtoReg` selects the source of
+Encoding: opcode=`100011`, rs=

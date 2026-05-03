@@ -12,150 +12,133 @@ resources:
 
 ## Why This Matters
 
-Unix was designed under severe constraints: PDP-7 had 8KB of memory, and the original team was three people. Those constraints forced decisions that proved durable: each tool does one thing, tools communicate through byte streams, and every kernel-managed resource exposes the same four operations. The reason these decisions lasted fifty years is not aesthetic — it is that they minimize the coordination surface between programs. A tool written in 1973 pipes into a tool written in 2024 because neither tool knows anything about the other. They share one contract: bytes in, bytes out, terminated by EOF.
-
-The alternative — Windows NT's early architecture — gave you separate subsystems for files, named pipes, sockets, and devices, each with distinct handles and calling conventions. Power came from learning each API in isolation. Unix power comes from the fact that there is only one API, and it composes.
-
----
+Unix was designed in the early 1970s under severe resource constraints — small memory, slow disks, a tiny team. Those constraints forced decisions that turned out to be profoundly correct: make every tool do one thing well, connect tools through text streams, represent everything as a file. The alternative — what you get without this philosophy — is an operating system where each application invents its own IPC mechanism, its own configuration format, its own logging system, and composing them requires writing glue code for every pair. With the Unix model, `ls | grep | sort | head` works without any of those programs knowing about each other, and your terminal, your hard drive, a network socket, and a random-number generator are all opened with the same `open()` call and read with the same `read()` call. This is not historical context — it is the mental model that makes Linux legible.
 
 ## Core Concepts
 
 ### Everything Is a File
 
-The "file" abstraction is not about disk storage. It is a **uniform dispatch interface**: any resource the kernel manages can be assigned a file descriptor, after which `read()`, `write()`, `close()`, and `select()` work on it without the caller knowing what it is. Terminals, pipes, sockets, block devices, and pseudo-filesystem entries all satisfy this interface.
+The claim is not that everything *is* literally a file on disk. It is that everything *exposes a file-like interface*: you open it, you read and write bytes, you close it. The kernel enforces this uniformity through the **Virtual File System (VFS)**, an abstraction layer that sits between system calls like `read()` and `write()` and the wildly different implementations underneath — ext4, NFS, a pipe, a device driver. The VFS defines a common set of operations (`open`, `read`, `write`, `close`, `seek`, `ioctl`), so userspace code never needs to branch on what kind of object it is talking to.
 
-This is enforced by the **Virtual File System (VFS)** layer. Every filesystem or device driver registers a `file_operations` struct with the VFS. When userspace calls `read(fd, buf, n)`, the kernel dereferences the `file_operations` pointer stored in the open file description and dispatches to whichever driver owns that descriptor. The system call is a single entry point; routing is entirely inside the kernel.
+This is why `/dev/null` discards writes and returns EOF on read, `/dev/urandom` returns kernel-harvested entropy, and `/proc/cpuinfo` returns a dynamically generated text description of your CPU — and all three are opened with identical code:
 
-The significance: you can write one program that operates on a stream, and it works identically whether that stream is a regular file, a FIFO, a socket, or a `/proc` entry — because the kernel routes all four to your single `read()` call.
+```c
+int fd = open("/proc/cpuinfo", O_RDONLY);   // same call for all three
+read(fd, buf, sizeof(buf));                  // same call for all three
+close(fd);                                   // same call for all three
+```
 
-### Text Streams as the Universal Protocol
+The VFS achieves this through a table of function pointers, `struct file_operations`, one instance per file type. When you call `read()`, the kernel dispatches through that table. The uniformity in userspace is purchased by polymorphism in the kernel.
 
-Unix tools communicate through **newline-delimited byte streams**. This is a protocol choice with an explicit trade-off. Binary formats require both sides to agree on struct layout, endianness, alignment, and versioning — any mismatch is silent corruption. Text requires only agreement on field delimiters. The contract is weaker, so it is more durable.
+### File Descriptors Are Handles, Not Files
 
-The cost is real: parsing a text stream requires tokenization, and for high-volume data the CPU overhead is measurable. But the benefit is that any tool — `grep`, `awk`, a Python script, a Rust binary written tomorrow — can consume the output of any other tool with zero coordination. The protocol predates all of them.
+A **file descriptor** (fd) is a small non-negative integer — an index into the kernel's per-process **file descriptor table**. That table entry points to an **open file description** in a system-wide table, which in turn points to an **i-node**. The three-level indirection is not bureaucracy. Each level solves a specific problem:
 
-### Composability Through Pipes
+- The **fd table** is per-process, so fd 3 in process A and fd 3 in process B are independent. It also stores the close-on-exec flag.
+- The **open file description** stores the current file offset and access mode. Two fds can point to the same open file description — they share an offset. This is exactly what `fork()` needs: the child inherits the parent's open files, including their positions.
+- The **i-node** stores the file's actual metadata and data pointers. Multiple open file descriptions can point to the same i-node — they have independent offsets on the same underlying file.
 
-A **pipe** is a unidirectional kernel buffer connecting two file descriptors. The shell wires the `stdout` of one process to the `stdin` of the next. Each process reads from fd 0 and writes to fd 1 and has no visibility into what is on the other end.
+```
+Process A                  Kernel
+┌──────────┐               ┌──────────────────────┐       ┌──────────┐
+│  fd 0    │──────────────▶│ open file description │──────▶│  i-node  │
+│  fd 1    │──┐            │  offset=512, flags    │       │ on disk  │
+│  fd 2    │  │            └──────────────────────┘       └──────────┘
+└──────────┘  │            ┌──────────────────────┐            ▲
+              │            │ open file description │            │
+Process B     └───────────▶│  offset=0,  flags    │────────────┘
+┌──────────┐               └──────────────────────┘
+│  fd 5    │──────────────▶ (its own open file description)
+└──────────┘
+```
 
-Composability follows directly from this ignorance. Because neither process can see the other's internals — only bytes — they cannot accidentally couple. Adding a new stage to a pipeline requires no changes to existing stages.
+When `fork()` returns, parent and child share the same open file descriptions. A `read()` in the child advances the offset seen by the parent. This is intentional — it allows a parent to hand work to a child that continues reading from exactly where the parent left off.
 
-Backpressure is automatic: the kernel pipe buffer is fixed (default 65536 bytes on Linux). If the writer fills the buffer before the reader consumes it, the writer's `write()` call blocks in the kernel. No userspace code implements this. The flow control is a physical consequence of the buffer being full.
+### Text Streams as the Universal Interface
 
-### Process-Centric Isolation
+Unix tools communicate through **byte streams**. By convention those streams carry newline-delimited text, but this is a convention enforced by nothing except the tools themselves. The convention's value is that it eliminates protocol negotiation: any tool that writes lines can feed any tool that reads lines. The cost is that binary data is awkward and wide fields require careful delimiter handling. This is a deliberate trade-off, not an oversight.
 
-Unix's unit of isolation is the **process**, not the thread. Each process has its own address space, file descriptor table, and credential set. This matters because fault boundaries are structural: a crashing process cannot corrupt a neighbor's memory or leave a neighbor's file descriptors in an inconsistent state. Cooperation happens through the file abstraction — pipes, sockets, files — not through shared memory by default.
+The three standard streams are fixed by convention, not by the kernel:
 
-This design also makes resource accounting exact. Every byte of memory, every open file descriptor, every pending signal belongs to exactly one process. The kernel can charge and reclaim cleanly on `exit()`.
+| fd | Name | Convention |
+|---|---|---|
+| 0 | stdin | reads from terminal or pipe input |
+| 1 | stdout | writes primary output |
+| 2 | stderr | writes diagnostics; not captured by `\|` |
 
----
+These are just file descriptors. The shell sets them up before your program starts. You can replace any of them with any open file using `dup2(newfd, targetfd)`, which closes `targetfd` if it is open and makes it point to the same open file description as `newfd`.
+
+### Composability
+
+Composability means the output of one program is a valid input to another without either program being written with the other in mind. The shell `|` operator makes this concrete: it calls `pipe()` to create an anonymous in-kernel byte buffer, then uses `dup2()` to connect the write end to the left program's stdout and the read end to the right program's stdin, then `fork()`s and `exec()`s both programs concurrently. No temporary files, no shared memory, no agreed-upon protocol.
+
+The contract a composable program must satisfy is narrow: read from stdin by default, write primary output to stdout, write errors to stderr, and exit with a meaningful status code. Programs that satisfy this contract compose for free.
+
+### Process-Centric Design
+
+Unix is organized around **processes**, not objects or services. Every running program is a process with its own address space, file descriptor table, and credentials. New processes are created by `fork()` — which clones the calling process — and `exec()` — which replaces the process image with a new program while preserving the file descriptor table. The shell is itself just a process that forks children, manipulates their file descriptors with `dup2()`, and calls `exec()`. There is no special mechanism for "launching" programs; the shell uses the same syscalls available to any process.
 
 ## How It Works
 
-### The Three-Layer File Descriptor Model
+### The VFS Dispatch Path
 
-Opening a file creates three distinct kernel structures:
+When you call `read(fd, buf, n)`, the kernel executes this sequence:
 
-```
-Process fd table          Open file descriptions (system-wide)    i-node table (persistent)
-─────────────────         ────────────────────────────────────    ─────────────────────────
-fd 0 ─────────────────►   { offset=0,  flags=O_RDONLY, f_op→ } ──► i-node 42 (regular file)
-fd 1 ─────────────────►   { offset=0,  flags=O_WRONLY, f_op→ } ──► i-node 7  (tty device)
-fd 2 ─────────────────►   { offset=0,  flags=O_WRONLY, f_op→ } ──► i-node 7  (same tty)
-     per-process                  per open() call                    per file on disk
-```
+1. Validates `fd` and retrieves the `struct file *` from the process's fd table.
+2. Checks the access mode stored in the open file description (`O_RDONLY` or `O_RDWR`).
+3. Calls `file->f_op->read_iter()` — a function pointer in the `struct file_operations` associated with this file type.
+4. That function pointer dispatches to the concrete implementation: ext4's page cache reader, a pipe's ring buffer drain, a character device driver's hardware register reader.
 
-The **fd table** is per-process and holds flags like `FD_CLOEXEC` plus a pointer to the open file description. The **open file description** is system-wide and holds the current file offset and access mode — this is what gets shared when you call `dup()` or `fork()`. The **i-node** is persistent on disk and holds type, permissions, timestamps, and block pointers.
-
-This three-layer split has concrete consequences:
-
-- Two `dup()`'d descriptors share an offset. A `read()` on one advances the position seen by the other.
-- Two independent `open()` calls on the same file create two separate open file descriptions, each with its own offset. Concurrent readers do not interfere.
-- After `fork()`, parent and child share the same open file descriptions. A `read()` by the child advances the parent's offset.
-
-In C, the kernel structures for an open file look roughly like:
+The `struct file_operations` for a pipe looks roughly like:
 
 ```c
-// Simplified from include/linux/fs.h
-struct file {
-    struct path         f_path;       // dentry + vfsmount
-    const struct file_operations *f_op;
-    loff_t              f_pos;        // current file offset
-    unsigned int        f_flags;      // O_RDONLY, O_WRONLY, etc.
-    fmode_t             f_mode;
-    struct fown_struct  f_owner;
-    // ... credentials, rcu, lock ...
-};
-
-struct file_operations {
-    ssize_t (*read)  (struct file *, char __user *, size_t, loff_t *);
-    ssize_t (*write) (struct file *, const char __user *, size_t, loff_t *);
-    int     (*open)  (struct inode *, struct file *);
-    int     (*release)(struct inode *, struct file *);
-    __poll_t (*poll) (struct file *, struct poll_table_struct *);
-    // ... mmap, ioctl, splice, ...
+// fs/pipe.c (simplified)
+const struct file_operations pipefifo_fops = {
+    .read_iter  = pipe_read,
+    .write_iter = pipe_write,
+    .poll       = pipe_poll,
+    .release    = pipe_release,
 };
 ```
 
-Every driver — ext4, the tty layer, the pipe layer, the TCP socket layer — fills in this struct. The VFS calls through the pointer.
+For `/dev/urandom` the same slot holds `urandom_read`. The kernel's call site is identical; only the function pointer differs.
 
-### VFS Dispatch Chain
+### The Three-Table Architecture
 
-The path from a userspace `read()` to driver code:
+The kernel maintains three distinct data structures (from *The Linux Programming Interface*, §5.4):
 
-```
-read(fd, buf, n)
-  → sys_read()                        [kernel entry, arch/x86/entry/syscalls/]
-  → ksys_read()                       [fs/read_write.c]
-  → file->f_op->read_iter()           [dispatch through file_operations]
-       ├─ ext4_file_read_iter()        [fs/ext4/file.c]       regular file
-       ├─ tty_read()                   [drivers/tty/tty_io.c] terminal
-       ├─ pipe_read()                  [fs/pipe.c]            anonymous pipe
-       └─ tcp_recvmsg() via sock_read_iter()  [net/ipv4/tcp.c] TCP socket
-```
+| Structure | Scope | Contains |
+|---|---|---|
+| File descriptor table | Per-process | close-on-exec flag, pointer to open file description |
+| Open file description table | System-wide | file offset, access mode, pointer to i-node |
+| i-node table | System-wide | file type, permissions, size, data block pointers |
 
-The dispatch is entirely invisible to userspace. You call `read()`. The kernel routes it. This is not an abstraction in the software-pattern sense — it is a literal function pointer call inside `ksys_read()`.
-
-### Shell Pipelines: The Exact Mechanism
-
-When the shell executes:
-
-```bash
-ps aux | grep nginx | awk '{print $2}'
-```
-
-it performs this sequence for each `|`:
+The separation between the fd table and the open file description table is what makes `dup()` semantics precise. After `dup(fd1)`, two file descriptors share one open file description, meaning they share the same offset: a `read()` on one advances the position seen by the other.
 
 ```c
-int pipefd[2];
-pipe(pipefd);             // pipefd[0] = read end, pipefd[1] = write end
+int fd1 = open("data.txt", O_RDONLY);
+int fd2 = dup(fd1);       // fd1 and fd2 now index the same open file description
 
-pid_t child = fork();
-if (child == 0) {
-    dup2(pipefd[1], STDOUT_FILENO);  // stdout → pipe write end
-    close(pipefd[0]);
-    close(pipefd[1]);
-    execvp("ps", (char *[]){ "ps", "aux", NULL });
-}
-// parent closes pipefd[1], uses pipefd[0] as stdin of next stage
+char buf[4];
+read(fd1, buf, 4);        // file offset advances to 4
+read(fd2, buf, 4);        // reads bytes 4–7, not 0–3 — offset is shared
 ```
 
-After `execvp()`, the child process has no knowledge of pipes, the parent, or `grep`. It writes to fd 1. That fd happens to be the write end of a pipe. `grep` reads from fd 0. That fd happens to be the read end of the same pipe. The decoupling is not a convention — it is enforced by the fact that each process only sees its own fd table.
+By contrast, two separate `open()` calls on the same file create two independent open file descriptions, each with its own offset, both pointing to the same i-node:
 
-Pipeline throughput is bounded by the slowest stage. If stage $i$ produces at rate $r_i$ bytes per second, total throughput is:
+```c
+int fd3 = open("data.txt", O_RDONLY);
+int fd4 = open("data.txt", O_RDONLY);  // independent offset from fd3
 
-$$\text{throughput} = \min_{1 \le i \le n} r_i$$
+read(fd3, buf, 4);        // offset of fd3 advances to 4
+read(fd4, buf, 4);        // reads bytes 0–3 again — independent offset
+```
 
-Pipe buffer depth adds latency but not throughput. With a buffer of $B = 65536$ bytes and a producer rate of $r$ bytes/second, the maximum latency introduced before blocking is:
+### Pipe Internals and Flow Control
 
-$$t_{\text{buffer}} = \frac{B}{r}$$
+A pipe is a fixed-size kernel ring buffer — 65536 bytes on Linux since kernel 2.6.11, controllable up to `/proc/sys/fs/pipe-max-size` via `fcntl(fd, F_SETPIPE_SZ, size)`. The capacity constraint creates natural flow control without explicit synchronization:
 
-At 100 MB/s, that is $\approx 655\ \mu\text{s}$ — negligible for interactive pipelines, relevant for latency-sensitive streaming.
-
-### /dev/fd: The Abstraction Closing on Itself
-
-Some programs (like `diff`) only accept filename arguments, not file descriptors. The kernel exposes `/dev/fd/N` as a virtual path that resolves to file descriptor $N$ of the calling process. This means:
-
-```bash
-ls | diff - oldfilelist           # diff's "-" convention, tool-specific
-ls | diff /dev/fd/0 oldfilelist   #
+- When the buffer is full, `write()` on the write end **blocks** until the reader consumes data.
+- When the buffer is empty, `read()` on the read end **blocks** until the writer produces data.
+- When all write ends are closed, `read()` returns 0 (EOF).
+- When all read ends are closed and a process writes, the kernel delivers **SIGPIPE** to the writer. If SIGPIPE is ignored, `

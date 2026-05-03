@@ -12,90 +12,115 @@ resources:
 
 ## Why This Matters
 
-Every digital system depends on clocks being correct in two distinct senses: *frequency* (the average rate) and *phase* (when each edge arrives). These are independent failure modes. A clock can have perfect average frequency but still corrupt data through cycle-to-cycle jitter. Two clocks can be identical in frequency but destroy a pipeline through skew. Linux runs on hardware where the kernel must reason about both: `hrtimer` fires based on the hardware counter's frequency accuracy; `clock_gettime(CLOCK_REALTIME)` correctness depends on NTP disciplining a local oscillator whose drift you can directly observe; RDTSC-based timestamps across cores fail silently when TSC skew is nonzero. Understanding the physics of clocks is not background knowledge — it determines which kernel APIs are safe to use and why.
+Every digital system is a state machine that advances on a clock edge. If that edge arrives late, early, or with noise, bits get sampled wrong — not with a clean crash, but with silent data corruption. At 3 GHz, one full cycle is $T = 1/f = 333\text{ ps}$. A 10 ps jitter budget violation is not theoretical: it is 3% of your entire timing margin. The Linux kernel contains a hierarchy of timekeeping abstractions precisely because the hardware underneath is imperfect — crystals drift, PLLs overshoot, and different cores on the same die see the same clock edge at slightly different times. Understanding why, from oscillator physics through kernel clocksource selection, lets you reason about timing bugs, NTP convergence failures, and `clock_gettime()` latency in production systems.
 
 ---
 
 ## Core Concepts
 
-### Oscillators: The Trade-off Between Tunability and Stability
+### Oscillators: Turning Energy into a Periodic Signal
 
-An oscillator sustains a periodic signal by routing its own output back as input through a resonant element that selects one frequency. The resonant element determines everything important:
+An oscillator sustains periodic oscillation by feeding a portion of its output back to its input with the right phase and amplitude. The two ingredients are a **frequency-selective element** (sets the period) and an **amplifying element with positive feedback** (compensates for energy dissipated per cycle).
 
-- **RC oscillators**: Cheap, electrically tunable (useful for PLLs), but frequency shifts with temperature because resistance and capacitance both have temperature coefficients. Drift of hundreds of ppm/°C is normal.
-- **Crystal oscillators**: A quartz crystal's mechanical resonance has a Q factor of $10^4$–$10^6$, versus $10$–$100$ for an LC tank. That high Q means the resonance is sharp — the crystal strongly rejects frequencies even slightly off resonance — which translates directly into frequency stability. Consumer-grade crystals are specified at $\pm 20$–$50\ \text{ppm}$ total over their temperature range; temperature-compensated crystal oscillators (TCXOs) reach $\pm 0.5\ \text{ppm}$; oven-controlled crystal oscillators (OCXOs) reach $\pm 0.01\ \text{ppm}$ by holding the crystal at a fixed temperature.
+The frequency-selective element determines the stability/flexibility tradeoff:
 
-The ppm unit is an absolute frequency error per unit frequency. A $25\ \text{MHz}$ reference with $\pm 20\ \text{ppm}$ stability has a worst-case drift of:
+| Technology | Typical frequency | Stability | Tunable? |
+|---|---|---|---|
+| RC relaxation | 1 Hz – 50 MHz | ±1% | Yes, easily |
+| LC resonator | 1 MHz – GHz | ±0.01–0.1% | Yes (varactor) |
+| Ceramic resonator | 200 kHz – 50 MHz | ±0.3% | Slightly |
+| Quartz crystal | 10 kHz – 250 MHz | ±1–50 ppm | Slightly (VCXO) |
+| SAW resonator | 100 MHz – several GHz | ±10–100 ppm | Limited |
 
-$$\Delta f = 25 \times 10^6\ \text{Hz} \times 20 \times 10^{-6} = 500\ \text{Hz}$$
+A **quartz crystal** works because quartz is piezoelectric: mechanical stress generates voltage, and voltage generates mechanical stress. Driving the crystal electrically forces it to vibrate at its mechanical resonant frequency. That frequency depends on the speed of sound in quartz and the crystal's physical dimensions — not on circuit parasitics, not on supply voltage. The dimensionless **Q factor** quantifies how sharply the resonance peaks:
 
-That $500\ \text{Hz}$ error accumulates. After one second, the clock has deviated by $500\ \text{ns}$. After one day ($86400\ \text{s}$), the deviation is $86400 \times 500\ \text{ns} = 43.2\ \text{ms}$. This is why `ntpd` and `chronyd` exist: without continuous correction, every machine's clock drifts at a rate set by its crystal's ppm rating.
+$$Q = 2\pi \frac{\text{energy stored}}{\text{energy lost per cycle}} = \frac{f_0}{\Delta f_{3\text{dB}}}$$
 
-### Phase-Locked Loops: Frequency Multiplication via Phase Error
+Quartz reaches $Q = 10^4$–$10^6$, versus $\sim$100 for a good LC tank. Higher Q means the resonator resists being pulled away from $f_0$ — the loop gain required to sustain oscillation at any other frequency is unavailable. This is the mechanical origin of crystal frequency stability.
 
-The problem: a $25\ \text{MHz}$ crystal is stable, but a CPU core needs $3\ \text{GHz}$. You cannot fabricate a crystal at $3\ \text{GHz}$; the mechanical dimensions become impossibly small. A PLL synthesizes the high frequency from the stable reference by treating frequency multiplication as a feedback control problem.
+### Temperature Coefficient and Drift
 
-The loop contains three functional blocks:
+No oscillator is perfectly stable. The two primary long-term imperfections are:
 
-1. **Phase Detector (PD):** Produces an output proportional to the phase difference between its two inputs. A bang-bang PD outputs a pulse whose width encodes the sign and magnitude of the phase error.
-2. **Loop Filter:** A low-pass filter. It integrates the phase error signal and presents a smoothed control voltage. Its bandwidth is the most important design parameter of the entire PLL.
-3. **Voltage-Controlled Oscillator (VCO):** An RC or LC oscillator whose free-running frequency shifts in proportion to the control voltage. The gain constant $K_{\text{VCO}}$ has units of Hz/V.
+- **Drift**: slow monotonic frequency change over months/years as the crystal's cut geometry relaxes under mechanical stress and contamination
+- **Tempco** (temperature coefficient): frequency change per °C, expressed in ppm/°C
 
-The feedback path divides the VCO output by $N$ before returning it to the phase detector. At lock:
+A crystal with $1\text{ ppm/°C}$ tempco over a $50°C$ operating range accumulates:
 
-$$f_{\text{VCO}} = N \times f_{\text{ref}}$$
+$$\Delta f = f_0 \times 50\text{ ppm} = 10\text{ MHz} \times 50 \times 10^{-6} = 500\text{ Hz}$$
 
-The loop locks when the phase error is zero — not just the frequency error. A nonzero phase offset would cause the phase detector output to have a nonzero DC component, which shifts the VCO frequency, which changes the phase, until phase error reaches zero. This self-correcting mechanism is why the crystal's long-term stability propagates through to the synthesized $3\ \text{GHz}$ output: any drift in the VCO creates a phase error that the loop cancels.
+For timekeeping, that $50\text{ ppm}$ total error translates to:
 
-The loop filter bandwidth sets a critical trade-off. The VCO's phase noise (intrinsic to any oscillator — see jitter section) is high-pass shaped by the loop: noise *below* the loop bandwidth is suppressed by feedback correction, while noise *above* it passes through uncorrected. The crystal's reference noise is low-pass shaped: it contributes inside the loop bandwidth but is rejected outside it. Therefore:
+$$\text{drift} = 50 \times 10^{-6} \times 86400\text{ s/day} \approx 4.3\text{ s/day}$$
 
-- **Wide loop bandwidth:** VCO noise is well-suppressed; reference noise dominates; loop tracks the crystal closely; responds quickly to disturbance.
-- **Narrow loop bandwidth:** VCO phase noise dominates at high offset frequencies; loop cannot track fast disturbances; but power-supply noise injected into the VCO control path is better rejected.
+This is why NTP is not optional on any server where time matters — the crystal alone cannot hold microsecond accuracy for more than seconds.
 
-CPU PLLs typically use loop bandwidths of $1$–$10\ \text{MHz}$ for a $100\ \text{MHz}$ reference — roughly $f_{\text{ref}}/10$, a standard stability criterion.
+Specialized designs compensate:
 
-### Jitter: Phase Noise in the Time Domain
+- **TCXO** (Temperature-Compensated XO): an analog correction network applies a compensating voltage proportional to temperature, pulling the crystal's frequency back toward nominal. Achieves ~0.1–1 ppm over temperature range.
+- **OCXO** (Oven-Controlled XO): places the crystal in a resistively heated oven held at a temperature above the ambient maximum, so the crystal never experiences a temperature gradient. Achieves ~0.001–0.01 ppm, but requires warm-up time and consumes watts continuously.
 
-Jitter is deviation of a clock edge from its ideal position in time. It is the time-domain manifestation of phase noise. The mechanism is straightforward: a signal crossing a logic threshold has finite slope, and any voltage noise on that signal translates directly into timing uncertainty:
+The choice between TCXO and OCXO is an engineering tradeoff: TCXO is cheaper and draws milliwatts; OCXO is more accurate but costs more, is physically larger, and draws 1–5 W — significant for battery-powered devices and even noticeable on server power budgets when many cards each carry one.
 
-$$\sigma_{t} = \frac{\sigma_{V}}{\left.\dfrac{dV}{dt}\right|_{\text{crossing}}}$$
+### Jitter: Short-Timescale Instability
 
-A clock with a $1\ \text{V/ns}$ edge rate and $10\ \text{mV}_{\text{rms}}$ noise has $10\ \text{ps}_{\text{rms}}$ of jitter. That same noise on a $0.1\ \text{V/ns}$ edge gives $100\ \text{ps}_{\text{rms}}$. This is why clock signals use fast edges, controlled impedance, and differential signaling (LVDS): differential reception rejects common-mode noise and doubles the effective $dV/dt$.
+Drift and tempco describe average frequency over long timescales. A separate problem exists on short timescales: the exact moment a clock edge crosses the logic threshold varies randomly from cycle to cycle. This is **jitter**.
 
-Jitter is categorized by its statistics:
+Jitter originates from noise sources — thermal noise in resistors ($v_n = \sqrt{4kTRB}$), shot noise in transistors, power supply ripple — that perturb the signal voltage near the decision threshold $V_{th}$. The conversion from voltage noise to timing uncertainty is set by the edge rate at the threshold crossing:
 
-- **Random jitter (RJ):** Gaussian-distributed, unbounded in principle; arises from thermal noise and shot noise. Characterized by $\sigma_j$.
-- **Deterministic jitter (DJ):** Bounded, non-Gaussian; arises from specific sources — inter-symbol interference, power supply noise at specific frequencies, crosstalk. Characterized by peak-to-peak amplitude.
-- **Total jitter (TJ):** At a given bit error rate target, $\text{TJ} = \text{DJ} + 2Q \cdot \sigma_j$, where $Q$ is the Q-factor corresponding to the BER (e.g., $Q \approx 7.03$ for BER $= 10^{-12}$).
+$$\tau_{jitter} = \frac{V_n}{dV/dt}\bigg|_{V=V_{th}}$$
 
-Random jitter accumulates as a random walk. After $N$ independent clock cycles each with jitter standard deviation $\sigma_j$, the accumulated phase error is:
+A slow-rising edge (small $dV/dt$) converts the same $V_n$ into proportionally more timing uncertainty. This is why degraded signal integrity — unterminated lines, excessive capacitive load, long FR4 traces — directly increases jitter even if the oscillator itself is perfect.
 
-$$\sigma_{\text{accumulated}} = \sigma_j \sqrt{N}$$
+**Phase noise** is the frequency-domain equivalent for sinusoidal signals. $\mathcal{L}(f)$ in dBc/Hz describes how much power density appears at offset frequency $f$ from the carrier. RMS jitter integrates across an offset band $[f_1, f_2]$:
 
-This unbounded growth is why clock recovery circuits in PCIe and SATA receivers must continuously re-synchronize to the incoming data stream rather than using a free-running local clock.
+$$J_{rms} = \frac{1}{\pi f_0} \sqrt{\int_{f_1}^{f_2} 10^{\mathcal{L}(f)/10} \, df}$$
 
-Jitter directly consumes timing margin. A flip-flop captures data correctly only if data is stable for the setup time $t_s$ before the clock edge and hold time $t_h$ after it. The timing margin for a pipeline stage is:
+where $f_0$ is the carrier frequency. The band limits matter: jitter specified at $[12\text{ kHz}, 20\text{ MHz}]$ versus $[1\text{ Hz}, 100\text{ MHz}]$ can differ by an order of magnitude for the same oscillator. Always check what band a jitter specification uses.
 
-$$\text{margin} = T_{\text{clk}} - t_{\text{propagation}} - t_s - t_h - t_{\text{jitter,clock}} - t_{\text{jitter,data}}$$
+### PLLs: Multiplying and Filtering Frequencies
 
-When this goes negative, the flip-flop input violates setup or hold time and the output voltage resolves to an indeterminate voltage between $V_{IL}$ and $V_{IH}$. This is **metastability**. The probability that the output has not resolved to a valid logic level by time $t$ after the clock edge decays exponentially:
+A **Phase-Locked Loop** solves two problems: multiplying a low-frequency reference to a higher output frequency, and filtering jitter in the process.
 
-$$P(\text{unresolved at } t) \propto e^{-t / \tau}$$
+A phase detector compares the reference frequency $f_{ref}$ against a divided-down copy of the VCO output $f_{out}/N$. Any phase error produces a correction signal; after low-pass filtering, this steers the VCO. At lock:
 
-where $\tau$ is a technology-dependent constant, typically $20$–$100\ \text{ps}$ in modern CMOS. Synchronizers in crossing-clock-domain circuits (including every SoC) rely on this exponential decay.
+$$f_{out} = N \cdot f_{ref}$$
 
-### Clock Skew: The Spatial Dimension of Timing
+```
+                  ┌──────────────────────────────────────┐
+                  │                PLL                   │
+ f_ref ──► [Phase Detector] ──► [Loop Filter] ──► [VCO] ──► f_out = N·f_ref
+                  ▲                                      │
+                  └──────────────── [÷N] ────────────────┘
+```
 
-Skew is the difference in arrival time of the same clock edge at two different registers. It arises from wire length differences, buffer propagation delays, and load capacitance variation. Skew is a systematic, repeatable offset — the same $\delta$ every cycle — which distinguishes it from jitter.
+The **loop filter** bandwidth $f_{BW}$ determines what noise sources dominate the output:
 
-For a register pair where flip-flop A launches data and flip-flop B captures it, with A's clock arriving $\delta$ earlier than B's:
+- For offset frequencies $f < f_{BW}$: the loop tracks the reference, so **reference phase noise** dominates the output
+- For offset frequencies $f > f_{BW}$: the loop cannot respond, so **free-running VCO noise** dominates
 
-$$t_{\text{propagation}} \leq T_{\text{clk}} - t_s + \delta_{\text{skew}}$$
+The optimal loop bandwidth sits at the crossover where reference noise and VCO noise are equal. This is why a clean reference with a well-tuned loop bandwidth can produce output cleaner than either source alone: the loop borrows the reference's long-term stability while the VCO contributes low noise at high offset frequencies.
 
-Positive skew (capturing flop's clock arrives later) adds to the budget — it is "free" setup time. Negative skew reduces it. But skew also creates a hold time constraint that is often more dangerous because it cannot be fixed by slowing the clock:
+On a CPU die, the main PLL takes a 100 MHz or 133 MHz reference from the PCB clock generator and multiplies it to the core frequency ($N = 30$–60 for a modern processor). Each core cluster typically has its own PLL so frequencies can be adjusted independently for P-states and turbo boost without affecting the memory controller clock domain.
 
-$$t_{\text{propagation}} \geq t_h - \delta_{\text{skew}}$$
+### Clock Skew
 
-If $\delta_{\text{skew}}$ is large and positive, data launched by A may arrive at B while B's hold window is still open — a hold violation that causes the flip-flop to capture the *new* value instead of the intended one. Hold violations cause functional failures that cannot be fixed at the system level.
+**Skew** is the spatial counterpart of jitter: the same clock edge arrives at different registers at different times due to different wire lengths, gate delays, and capacitive loads in the distribution network. If skew between two adjacent pipeline stages is $\delta_{skew}$, the cycle time constraint becomes:
 
-FPGA and ASIC place-and-route tools insert **clock tree buffers** to equalize clock arrival times. The result — a balanced H-tree or spine-and-branch distribution network — keeps skew below $50$–$100\ \text{ps
+$$T_{cycle} \geq T_{prop,\max} + T_{setup} + \delta_{skew}$$
+
+and the hold time constraint (which cannot be fixed by slowing the clock) becomes:
+
+$$T_{prop,\min} \geq T_{hold} - \delta_{skew}$$
+
+Positive skew (downstream flop receives clock later) relaxes setup time but tightens hold time. Negative skew does the opposite. **Timing closure** is the process of adjusting wire lengths, buffer insertion, and placement to satisfy both constraints across all process, voltage, and temperature (PVT) corners simultaneously.
+
+At the PCB and system level, clock skew between chips is controlled by matched trace lengths — a motherboard's memory traces are length-matched to within fractions of a millimeter precisely because at DDR5-7200, one UI (unit interval) is $\sim$139 ps, and a 10 mm length mismatch in FR4 introduces $\sim$70 ps of skew, consuming half the timing margin.
+
+---
+
+## How It Works
+
+### Crystal Oscillator Circuit
+
+The Pierce oscillator uses a CMOS inverter as the amplifying element. The inverter is biased into its linear region by feedback resistor $R_f$, making it act as a high-gain inverting amplifier. The crystal, together with load capacitors $C_1$ and $C_2$, forms a $\pi$ network that provides exactly 180° of additional phase shift at the resonant frequency — completing the 360° total required

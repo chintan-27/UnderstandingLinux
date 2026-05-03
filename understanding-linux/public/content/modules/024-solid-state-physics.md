@@ -12,7 +12,9 @@ resources:
 
 ## Why This Matters
 
-Every transistor switch in your CPU, every DRAM cell refresh, every NVM Express wear-leveling decision runs on hardware whose behavior is entirely determined by the physics here. The Linux kernel's `cpufreq` governor chooses operating points on a power-versus-frequency curve that is shaped by carrier mobility. The `thermal` subsystem trips throttling thresholds set by junction temperatures at which leakage current — exponentially dependent on $E_F$ — becomes uncontrollable. If you treat semiconductors as black boxes you will misread performance counters, misattribute thermal throttling, and misunderstand why a cold SSD controller is measurably faster than a hot one.
+Every transistor in your CPU, every bit in your SSD, every sensor in your laptop's touchpad exists because engineers learned to control *which* electrons move and *when*. Band theory explains why silicon conducts only sometimes — why a trace of phosphorus turns an insulator into a switch, and why shining light on a material generates current.
+
+These are not abstractions. When a CPU throttles under load, carriers in a semiconductor junction are scattering off phonons, converting electrical work into heat. When your NVMe drive wears out, electrons tunnel through a gate oxide on each write cycle, eventually trapping charge that shifts the threshold voltage until the cell can no longer be reliably read. The Linux kernel's `cpufreq`, `thermal`, and flash translation layer subsystems exist because of exactly these physical limits.
 
 ---
 
@@ -20,85 +22,94 @@ Every transistor switch in your CPU, every DRAM cell refresh, every NVM Express 
 
 ### Energy Bands
 
-In an isolated atom, electrons occupy discrete energy levels. Pack $N \sim 10^{23}$ atoms into a crystal and the Pauli exclusion principle forces each atomic level to split into $N$ distinct quantum states — a **band**. The splitting is not gradual: it is a direct consequence of the periodicity of the crystal lattice. The periodic ionic potential creates Bragg-reflection conditions for electron wavefunctions at specific wavevectors $k = n\pi/a$ (where $a$ is the lattice constant). At those wavevectors, the wavefunction must be a standing wave, and the two standing-wave solutions (peaking on the ions vs. peaking between the ions) have different electrostatic energies. That energy difference is the **band gap** $E_g$ — a range of energies for which no Bloch wavefunction exists in the bulk crystal.
+In an isolated atom, electrons occupy discrete energy levels. When $N$ atoms assemble into a crystal lattice, quantum mechanical coupling splits each level into $N$ closely-spaced levels. For $N \sim 10^{23}$, the spacing $\sim 10^{-23}\,\text{eV}$ is unresolvable — the levels form a continuous **band**.
 
-The gap is not merely a lack of electrons; it is a lack of *allowed states*. An electron cannot exist at an energy inside the gap for the same reason a waveguide cannot propagate a frequency below cutoff — the dispersion relation has no real solution there.
+The two bands that govern conduction:
 
-### Band Gaps and Material Classification
+- **Valence band**: the highest band fully (or nearly fully) occupied at absolute zero. Every available state is filled, so electrons cannot accelerate in response to an applied field — there is nowhere to scatter into.
+- **Conduction band**: the next band up, mostly empty at absolute zero. Electrons here can respond to fields because vacant states are adjacent in energy.
 
-The **valence band** is the highest fully occupied band at $T = 0$. The **conduction band** is the next band above the gap. Conduction requires electrons to have empty states to scatter into; the gap determines whether that is possible at a given temperature.
+The distinction is not about energy magnitude but about whether vacant states exist nearby.
 
-| Material | $E_g$ (eV) | Classification | Physical reason |
-|---|---|---|---|
-| Diamond | 5.5 | Insulator | C–C bonds too strong; $k_BT \approx 0.026\,\text{eV} \ll E_g$ |
-| Silicon | 1.12 | Semiconductor | Moderate sp³ hybridization |
-| Germanium | 0.67 | Semiconductor | Larger atom, weaker bonds |
-| GaAs | 1.42 | Semiconductor (direct) | Direct gap → efficient photon emission |
-| Copper | 0 (overlap) | Metal | 4s and 3d bands cross at $E_F$ |
+### Band Gaps
 
-In a metal the Fermi level lies inside a band — there are empty states infinitesimally above every occupied state, so any nonzero electric field accelerates electrons. In an insulator the gap is so large that $k_BT$ cannot bridge it and the conduction band is effectively unpopulated. Semiconductors are the interesting middle case: $E_g \sim k_BT$ at some accessible temperature or doping level.
+Between valence and conduction bands lies the **band gap** $E_g$ — a range of energies for which no electron states exist in a perfect crystal. The cause is not electron–electron repulsion or any classical effect: it is Bragg reflection. At the Brillouin zone boundary, electron waves with wavevector $k = \pm\pi/a$ (where $a$ is the lattice constant) satisfy the Bragg condition and form two standing waves. Their probability densities peak at different positions relative to the ion cores, producing different electrostatic energies. The energy difference between these two standing waves is $E_g$. No traveling wave of intermediate energy can propagate — the gap is topological, not energetic.
+
+| Material | $E_g$ (eV) | Classification |
+|---|---|---|
+| Diamond | 5.5 | Insulator |
+| Silicon | 1.12 | Semiconductor |
+| Germanium | 0.67 | Semiconductor |
+| GaAs | 1.42 | Direct-gap semiconductor |
+| Copper | 0 (overlap) | Metal |
+
+A metal has no gap because the Fermi level falls inside a partially filled band — electrons can scatter into arbitrarily nearby states. An insulator's gap is so large that $k_BT \ll E_g$ at any practical temperature. A semiconductor's gap is small enough that doping or thermal energy can populate the conduction band controllably.
 
 ### The Fermi Level
 
-The **Fermi-Dirac distribution** gives the probability that a state at energy $E$ is occupied:
+The **Fermi level** $E_F$ is the electrochemical potential for electrons — the energy at which the probability of occupation is exactly $\frac{1}{2}$, from the Fermi-Dirac distribution:
 
 $$f(E) = \frac{1}{e^{(E - E_F)/k_BT} + 1}$$
 
-$E_F$ is the electrochemical potential — the energy at which $f = \frac{1}{2}$. At $T = 0$ this is a sharp step; at finite $T$ the transition smears over $\sim 4k_BT$ around $E_F$. At room temperature $k_BT \approx 0.026\,\text{eV}$, so the smearing is narrow compared to a 1.12 eV gap.
+At $T = 0$ this is a sharp step. At room temperature, $k_BT \approx 26\,\text{meV}$, so the distribution smears over roughly $4k_BT \approx 100\,\text{meV}$ centered on $E_F$. For silicon with $E_g = 1.12\,\text{eV}$, that smearing is small but not negligible.
 
-**Critical point**: $E_F$ need not coincide with any allowed state. In an intrinsic semiconductor $E_F$ sits near the middle of the gap — there are no states there. It is a thermodynamic potential, not a particle energy. Misidentifying it as "where electrons are" is the single most common conceptual error in semiconductor physics.
+In an intrinsic semiconductor, $E_F$ sits near the middle of the gap — close to the midpoint but shifted slightly toward the band with the lower effective density of states. Doping moves it:
 
-Its precise location within the gap is:
+- **n-type** (phosphorus in Si, five valence electrons): the extra electron is loosely bound to the dopant — the binding energy is only $\sim 45\,\text{meV}$, which thermal energy at room temperature readily supplies. This ionized donor contributes a free electron to the conduction band and pulls $E_F$ up toward that band.
+- **p-type** (boron in Si, three valence electrons): the missing bond creates an acceptor level just above the valence band edge. Electrons from the valence band thermally fill this level, leaving mobile holes and pushing $E_F$ down toward the valence band.
 
-$$E_F = \frac{E_c + E_v}{2} + \frac{k_BT}{2} \ln\frac{N_v}{N_c}$$
+The shift is quantitative. For a donor concentration $N_D$ much larger than the intrinsic concentration $n_i$:
 
-The logarithmic correction is small (a few meV) because $N_v/N_c$ is close to unity for most semiconductors.
+$$E_F - E_i = k_BT \ln\!\left(\frac{N_D}{n_i}\right)$$
+
+where $E_i$ is the intrinsic Fermi level. At $N_D = 10^{17}\,\text{cm}^{-3}$ and $n_i \approx 10^{10}\,\text{cm}^{-3}$ for silicon, this shift is $\approx 0.41\,\text{eV}$ — nearly halfway to the conduction band edge.
 
 ### Carriers: Electrons and Holes
 
-Thermal excitation across the gap leaves an empty state in the valence band. That vacancy — a **hole** — is a legitimate quasiparticle with:
+A **hole** is the absence of an electron in the valence band, treated as a positive charge carrier with its own effective mass $m_h^*$ and mobility $\mu_h$. This is not a convenient fiction: the valence band has a well-defined dispersion relation $E(k)$, and the dynamics of the missing electron are exactly those of a positive particle with mass $m_h^* = -\hbar^2 \left(\partial^2 E / \partial k^2\right)^{-1}$ evaluated at the top of the valence band, where the band curves downward (negative curvature), making $m_h^* > 0$.
 
-- Charge $+q$ (removal of $-q$ electron)
-- Effective mass $m_h^*$ (determined by the curvature of the valence band: $m^* = \hbar^2 / (d^2E/dk^2)$, which is *negative* at the valence band maximum, hence holes have positive effective mass)
-- Its own mobility $\mu_h$
+Intrinsic carrier concentration:
 
-Why does the valence band curvature give a negative effective mass for electrons? Near the band maximum, $d^2E/dk^2 < 0$, so an electron there accelerates *opposite* to the applied force — it behaves as a negative-mass particle. Redefining the absent electron as a hole with positive mass restores Newton's second law for the quasiparticle.
+$$n_i = \sqrt{N_C N_V} \exp\!\left(-\frac{E_g}{2k_BT}\right)$$
 
-**Doping** is controlled impurity introduction:
+where $N_C$ and $N_V$ are the effective density-of-states in the conduction and valence bands respectively, both $\propto (m^* T)^{3/2}$. The exponential dependence on $E_g / 2k_BT$ is why silicon at room temperature has $n_i \approx 10^{10}\,\text{cm}^{-3}$ (barely conducting) while germanium with $E_g = 0.67\,\text{eV}$ has $n_i \approx 2\times10^{13}\,\text{cm}^{-3}$ (more conducting, but more temperature-sensitive — one reason silicon displaced germanium in power electronics).
 
-- **n-type** (donor, e.g., P in Si): Phosphorus has 5 valence electrons; 4 form covalent bonds with neighboring Si atoms. The fifth is bound to the P⁺ core with only $\sim 0.045\,\text{eV}$ binding energy (vs. 1.12 eV for a valence electron) because the electron moves through Si with a screened Coulomb potential and a small effective mass. Room temperature is sufficient to ionize it into the conduction band. $E_F$ shifts upward toward $E_c$.
-- **p-type** (acceptor, e.g., B in Si): Boron has 3 valence electrons. It accepts a fourth from a neighboring Si–Si bond, creating a mobile hole. $E_F$ shifts downward toward $E_v$.
+The temperature sensitivity is exponential, not linear. Doubling the absolute temperature roughly squares $n_i$ through the prefactor but exponentially inflates it through the Boltzmann term. This is why semiconductors can transition from insulators to conductors over a modest temperature range, and why thermal runaway in power devices is a real failure mode.
 
-The carrier concentrations as functions of $E_F$ are:
+### Mobility and Drift
 
-$$n = N_c \, \exp\!\left(-\frac{E_c - E_F}{k_BT}\right), \qquad p = N_v \, \exp\!\left(-\frac{E_F - E_v}{k_BT}\right)$$
+An applied field $\mathcal{E}$ accelerates carriers, but scattering events interrupt the acceleration on a timescale $\tau$ (the mean free time). The net result is a steady **drift velocity**:
 
-where $N_c = 2\left(\frac{2\pi m_e^* k_BT}{h^2}\right)^{3/2}$ and similarly for $N_v$. These are Boltzmann approximations valid when $E_F$ is at least a few $k_BT$ from the band edges (non-degenerate semiconductor).
+$$v_d = \mu \mathcal{E}, \qquad \mu = \frac{e\tau}{m^*}$$
 
-Multiplying these two expressions eliminates $E_F$ entirely:
+Current density follows:
 
-$$np = N_c N_v \, e^{-E_g/k_BT} \equiv n_i^2$$
+$$J = (n e \mu_e + p e \mu_h)\,\mathcal{E} = \sigma \mathcal{E}$$
 
-This **mass-action law** holds in thermal equilibrium regardless of doping level. If you add donors (increasing $n$), $p$ decreases proportionally to maintain $n_i^2$. For silicon at 300 K, $n_i \approx 1.5 \times 10^{10}\,\text{cm}^{-3}$. A phosphorus doping of $N_D = 10^{16}\,\text{cm}^{-3}$ gives $n \approx N_D$ and $p = n_i^2/N_D \approx 2.25 \times 10^4\,\text{cm}^{-3}$ — the minority carrier concentration drops by twelve orders of magnitude relative to majority carriers.
+This is Ohm's law derived from first principles, not postulated. The conductivity $\sigma$ contains both carrier count ($n$, $p$) and carrier speed per unit field ($\mu_e$, $\mu_h$). Doping raises $n$ but lowers $\mu$ — the tradeoff is quantitative.
 
-### Mobility and Scattering
+For silicon at room temperature: $\mu_e \approx 1400\,\text{cm}^2/\text{V·s}$, $\mu_h \approx 450\,\text{cm}^2/\text{V·s}$. Electrons are faster because their effective mass in the conduction band is lower than holes' effective mass in the valence band.
 
-Carriers accelerated by field $\mathcal{E}$ scatter off lattice vibrations (phonons) and ionized impurities, reaching a steady-state drift velocity:
+### Scattering Mechanisms
 
-$$v_\text{drift} = \mu \mathcal{E}$$
+Two mechanisms dominate in real devices and compete differently with temperature:
 
-The mobility $\mu = q\tau/m^*$ where $\tau$ is the mean free time between collisions. The current density from both carrier types is:
+1. **Phonon (lattice) scattering**: Higher temperature → larger amplitude lattice vibrations → shorter mean free path → lower $\tau$ → lower $\mu$. For acoustic phonon scattering:
+$$\mu_\text{phonon} \propto T^{-3/2}$$
+   This is the dominant mechanism above $\sim 100\,\text{K}$ in lightly doped silicon, and explains why your CPU's carrier mobility drops as it heats up.
 
-$$J = (n\mu_e + p\mu_h)\,q\mathcal{E} \equiv \sigma \mathcal{E}$$
+2. **Ionized impurity scattering**: Each dopant atom is a charged center that deflects carriers via Coulomb interaction. Faster carriers deflect less, so impurity scattering *improves* with temperature (faster carriers, shorter interaction time):
+$$\mu_\text{impurity} \propto T^{3/2} / N_\text{dopant}$$
+   More doping always means lower mobility regardless of temperature. In heavily doped source/drain regions of a MOSFET ($N_D \sim 10^{20}\,\text{cm}^{-3}$), mobility can fall below $100\,\text{cm}^2/\text{V·s}$ — a factor of 14 reduction from the lightly doped limit.
 
-giving conductivity $\sigma = q(n\mu_e + p\mu_h)$.
+The total scattering rate is the sum of individual rates (Matthiessen's rule):
 
-Two mechanisms limit $\tau$, and their rates add (Matthiessen's rule):
+$$\frac{1}{\tau} = \frac{1}{\tau_\text{phonon}} + \frac{1}{\tau_\text{impurity}} + \cdots$$
 
-$$\frac{1}{\tau} = \frac{1}{\tau_\text{phonon}} + \frac{1}{\tau_\text{impurity}}$$
+The mobility is therefore limited by whichever mechanism scatters most frequently.
 
-**Why phonon scattering increases with temperature**: The number of phonons (lattice vibration quanta) scales as $\sim k_BT$ at high temperature (equipartition). More phonons means more scattering events per unit time, so $\tau_\text{phonon} \propto T^{-1}$ and $\mu_\text{phonon} \propto T^{-3/2}$.
+The **Einstein relation** connects diffusion to mobility:
 
-**Why impurity scattering decreases with temperature**: A carrier passing an ionized dopant is deflected by the Coulomb potential $V \propto 1/r$. A faster carrier (higher $T$) spends less time near the impurity and is deflected less. More precisely, the scattering cross-section $\sigma_\text{imp} \propto v^{-4} \propto T^{-2}$, giving $\mu_\text{impurity} \propto T^{3/2}$.
+$$D = \mu k_B T / e$$
 
-For silicon at 300 K: $\mu_e \approx 1400\,\text{cm}^2/\text{V·s}$, $\mu_h \approx 450\,\text{cm}^2/\text{V·s}$. Electrons are faster because the conduction band minimum in Si has
+Both $D$ and $\mu$ arise from the same scattering events

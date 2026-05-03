@@ -12,7 +12,7 @@ resources:
 
 ## Why This Matters
 
-Signals are everywhere in computing: audio buffers, network waveforms, CPU clock cycles, display refresh rates, and sensor inputs all behave as oscillations. Without trigonometry, you cannot decompose a sound into frequencies (audio codecs), cannot understand why a PLL (phase-locked loop) locks onto a clock signal, cannot reason about aliasing when sampling ADC data, and cannot read the math behind Fourier transforms that underpin `fft`-based tools in Linux. The sinusoid is the atom of signal processing — every periodic signal is a sum of them, and that fact is not incidental but mathematically provable (Fourier's theorem).
+Every repeating phenomenon in computing — audio samples, clock signals, ADC readings, network jitter profiles — decomposes into sinusoids. This is not a metaphor. The Linux audio stack (`ALSA`, `PulseAudio`, `PipeWire`) fills ring buffers with PCM samples computed from exactly the formula below. The kernel's `clocksource` subsystem and hardware PLLs lock frequencies by minimizing phase error between two sinusoids. `scipy.signal`, `numpy.fft`, and every DSP library you will ever call are manipulating amplitudes, frequencies, and phases. If you do not own this math, you are guessing.
 
 ---
 
@@ -20,143 +20,153 @@ Signals are everywhere in computing: audio buffers, network waveforms, CPU clock
 
 ### The Sinusoid
 
-A sinusoid is the projection of uniform circular motion onto a line. That geometric origin is why it appears wherever rotation or repetition exists — not by coincidence, but because circular motion *is* what these systems are doing in state space.
+$$f(t) = A \sin(2\pi f t + \phi)$$
 
-$$x(t) = A \sin(2\pi f t + \phi)$$
+- $A$ — **amplitude**: peak displacement from zero. Doubling $A$ doubles the energy in the signal (power scales as $A^2$).
+- $f$ — **frequency** in Hz. Determines pitch for audio, color for light, switching rate for a clock line.
+- $\phi$ — **phase** in radians: a horizontal shift. It does not change energy, but it determines how two signals interact when summed.
+- $T = 1/f$ — **period**: time for one complete cycle. A 440 Hz signal has $T = 1/440 \approx 2.27\ \text{ms}$.
 
-- $A$ — **amplitude**: peak displacement from zero. Scales energy by $A^2$ (power is proportional to amplitude squared).
-- $f$ — **frequency** in Hz: cycles per second. Its reciprocal is the **period** $T = 1/f$. A 440 Hz tone has $T \approx 2.27\,\text{ms}$.
-- $\phi$ — **phase** in radians: the cycle position at $t = 0$. It encodes *when* the signal started relative to your time reference.
-- $t$ — time in seconds.
+**Why sine specifically?** Sine and cosine are the only functions satisfying:
 
-These four numbers completely describe any single-frequency sinusoid.
+$$\frac{d^2 y}{dt^2} = -\omega^2 y$$
+
+Any system with a restoring force proportional to displacement — a spring, an LC tank circuit, a vibrating membrane — obeys this equation and therefore oscillates sinusoidally. The math does not prefer sine; nature keeps producing it because this differential equation appears everywhere.
 
 ### Angular Frequency
 
-Angular frequency $\omega = 2\pi f$ has units of radians per second. One full cycle sweeps $2\pi$ radians, so multiplying cycles-per-second by $2\pi$ converts to radians-per-second:
+$$\omega = 2\pi f \quad \text{(radians per second)}$$
 
-$$\omega = 2\pi f \implies x(t) = A\sin(\omega t + \phi)$$
+One full cycle covers $2\pi$ radians, so $\omega$ is the rate at which the phase angle advances. The sinusoid becomes:
 
-The reason $\omega$ appears in DSP headers and kernel timer math rather than $f$ is that differentiation of $\sin(\omega t)$ yields $\omega\cos(\omega t)$ — the frequency falls out directly as a coefficient, which simplifies analysis of rates of change.
+$$f(t) = A \sin(\omega t + \phi)$$
 
-### Phase
+You will see $\omega$ everywhere in DSP and kernel clock code because it eliminates the $2\pi$ factor in derivatives: $\frac{d}{dt}\sin(\omega t) = \omega\cos(\omega t)$.
 
-Phase is a *relative* quantity — it only has meaning with respect to a reference. Given two signals:
+### Cosine Is Not a Separate Concept
 
-$$x_1(t) = \sin(\omega t), \qquad x_2(t) = \sin(\omega t + \phi)$$
+$$\cos\theta = \sin\!\left(\theta + \frac{\pi}{2}\right)$$
 
-the time shift between them is:
+Cosine is sine advanced by a quarter cycle. When you see both in DSP code, one is always derivable from the other. They appear together because real and imaginary components of a complex exponential are cosine and sine respectively — which leads directly to the next point.
 
-$$\Delta t = \frac{\phi}{\omega} = \frac{\phi}{2\pi f}$$
-
-At $f = 1\,\text{kHz}$ and $\phi = \pi/2$, that is $\Delta t = 1/(4 \times 10^3) = 250\,\mu\text{s}$.
-
-Two signals are **in phase** when $\phi = 0$ — they add constructively, doubling amplitude. They are **phase-opposed** when $\phi = \pi$ — they cancel completely. Noise-canceling headphones generate $\phi = \pi$ on captured ambient sound and sum it with the original; the cancellation is not approximate but exact when the phase relationship holds precisely.
-
-A phase shift of $\phi = \pi/2$ converts sine to cosine:
-
-$$\sin\!\left(\omega t + \frac{\pi}{2}\right) = \cos(\omega t)$$
-
-This is why sine and cosine are not two different functions but the same function with a quarter-cycle offset.
-
-### Euler's Formula and Polar Form
-
-Euler's formula connects circular motion to exponential growth in the complex plane:
+### Euler's Formula and Phasors
 
 $$e^{i\theta} = \cos\theta + i\sin\theta$$
 
-The reason this is true follows from comparing the Taylor series of $e^{ix}$, $\cos x$, and $\sin x$ — the real and imaginary parts of the exponential series are exactly those of cosine and sine respectively. The consequence for signal processing is that a sinusoid is the imaginary part of a rotating complex exponential:
+A sinusoid is the projection of a rotating complex number onto the real (or imaginary) axis. A point moving at constant angular velocity $\omega$ on the unit circle traces a sine wave when viewed edge-on. This is not just notational convenience — it is the reason sinusoids are preserved under differentiation, integration, and linear filtering: the only effect is a change in amplitude and phase, never a change in shape.
 
-$$A\sin(\omega t + \phi) = \operatorname{Im}\!\left(A e^{i(\omega t + \phi)}\right)$$
+A **phasor** encodes amplitude and phase as a single complex number:
 
-**Polar form** represents a complex number by magnitude and angle:
+$$\tilde{s} = A e^{i\phi} = A(\cos\phi + i\sin\phi)$$
 
-$$z = r e^{i\theta}, \qquad r = |z|, \quad \theta = \arg(z)$$
+The time-domain signal is recovered as:
 
-In signal processing, $r$ is amplitude and $\theta$ is phase. The key algebraic fact:
+$$s(t) = \operatorname{Re}\!\left[\tilde{s}\cdot e^{i\omega t}\right] = A\cos(\omega t + \phi)$$
 
-$$z_1 z_2 = r_1 r_2\, e^{i(\theta_1 + \theta_2)}$$
+Phasors reduce phase arithmetic to complex multiplication. Adding a phase offset $\Delta\phi$ is multiplication by $e^{i\Delta\phi}$. This is exactly what DSP libraries exploit internally.
 
-Multiplication in polar form multiplies amplitudes and *adds* phases. This is the deep reason why convolution in the time domain (which is expensive: $O(N^2)$) becomes pointwise multiplication in the frequency domain (cheap: $O(N)$ after an $O(N \log N)$ FFT) — the FFT decomposes signals into polar form, where interaction is just multiplication.
+### Phase
 
-### Superposition
+$$s_1(t) = \sin(\omega t), \qquad s_2(t) = \sin(\omega t + \phi)$$
 
-When two sinusoids at the same frequency add, the result is a sinusoid at the same frequency — never a different one:
+When $\phi = 0$: constructive — summing gives $2\sin(\omega t)$.  
+When $\phi = \pi/2$: orthogonal — the signals share no correlated energy.  
+When $\phi = \pi$: destructive — the sum is identically zero.
 
-$$A_1\sin(\omega t + \phi_1) + A_2\sin(\omega t + \phi_2) = A_R\sin(\omega t + \phi_R)$$
+The time delay corresponding to a phase shift is:
 
-The resultant phasor is vector addition in the complex plane:
+$$\Delta t = \frac{\phi}{\omega} = \frac{\phi}{2\pi f}$$
 
-$$A_R e^{i\phi_R} = A_1 e^{i\phi_1} + A_2 e^{i\phi_2}$$
-
-$$A_R = \sqrt{A_1^2 + A_2^2 + 2A_1 A_2 \cos(\phi_2 - \phi_1)}$$
-
-This is why interference is *geometric*: when $\phi_2 - \phi_1 = 0$, the cosine term is $+1$ and $A_R = A_1 + A_2$. When $\phi_2 - \phi_1 = \pi$, the cosine term is $-1$ and $A_R = |A_1 - A_2|$.
+A $\pi$ phase shift at 440 Hz corresponds to $\Delta t = 1/(2\times 440) \approx 1.14\ \text{ms}$ — the travel time difference equivalent to about 39 cm of path length in air.
 
 ---
 
 ## How It Works
 
-### Discretizing a Sinusoid
+### Discrete Sinusoids: The Bridge to Code
 
-Real systems sample continuous signals at discrete time steps. At sample rate $f_s$ samples/second, the $n$-th sample is:
+The continuous formula $A\sin(\omega t)$ becomes, when sampled at rate $f_s$:
 
-$$x[n] = A\sin\!\left(2\pi \frac{f}{f_s} n + \phi\right)$$
+$$s[n] = A \sin\!\left(\frac{2\pi f\, n}{f_s}\right)$$
 
-The quantity $\hat{\omega} = 2\pi f / f_s$ is the **normalized frequency** in radians per sample — the only frequency a digital system actually knows. All DSP operates on this dimensionless ratio; $f_s$ is the bridge back to physical time.
+where $n$ is the sample index and $t = n/f_s$. Every audio driver on Linux fills its DMA buffer with values of this formula (or a sum of them). The index $n$ is an integer; the frequency ratio $f/f_s$ determines how many samples per cycle.
 
-**The Nyquist criterion** requires:
+```python
+import math
 
-$$f_s \geq 2 f_{\max}$$
+SAMPLE_RATE = 44100   # Hz — standard CD quality
+FREQUENCY   = 440.0   # Hz — concert A
+AMPLITUDE   = 0.8     # normalized: 1.0 = full scale
+DURATION    = 1.0     # seconds
 
-The reason is not arbitrary: a sinusoid is uniquely determined by its frequency, amplitude, and phase, but when $f > f_s/2$, the samples of that sinusoid are identical to the samples of a lower-frequency sinusoid. The two are *aliases* of each other and the system cannot distinguish them. Violating Nyquist does not degrade the signal gracefully — it folds energy from $f$ into $f_s - f$, corrupting the entire band irreversibly.
+num_samples = int(SAMPLE_RATE * DURATION)
+omega = 2 * math.pi * FREQUENCY
 
-At $f_s = 48000\,\text{Hz}$ (standard Linux ALSA rate), the Nyquist limit is $24\,\text{kHz}$, covering the audible range with margin.
-
-### Generating a Sine Wave in C
-
-The `phase_increment` $\hat{\omega} = 2\pi f / f_s$ advances the phase by exactly one sample's worth per step. We accumulate phase rather than computing $2\pi f n / f_s$ each iteration because: (1) it avoids multiplying by a growing integer $n$ whose product with a float eventually loses precision, and (2) it makes real-time frequency modulation trivial — change `phase_increment` and the output frequency changes on the next sample.
-
-```c
-#include <math.h>
-#include <stdio.h>
-
-#define SAMPLE_RATE 48000
-#define FREQUENCY   440.0   /* A4 */
-#define AMPLITUDE   0.8
-#define DURATION    0.01    /* seconds -> 480 samples */
-
-int main(void) {
-    double phase           = 0.0;
-    double phase_increment = 2.0 * M_PI * FREQUENCY / SAMPLE_RATE;
-    int    num_samples     = (int)(DURATION * SAMPLE_RATE);
-
-    for (int n = 0; n < num_samples; n++) {
-        double sample = AMPLITUDE * sin(phase);
-        printf("%.6f\n", sample);
-        phase += phase_increment;
-        if (phase >= 2.0 * M_PI)
-            phase -= 2.0 * M_PI;   /* prevent float drift, not overflow */
-    }
-    return 0;
-}
+samples = [
+    AMPLITUDE * math.sin(omega * n / SAMPLE_RATE)
+    for n in range(num_samples)
+]
+# samples[n] is the normalized air pressure at t = n / SAMPLE_RATE
+# For 16-bit PCM: multiply by 32767 and cast to int16
 ```
 
-The modular reduction keeps `phase` in $[0, 2\pi)$, preventing slow accumulation of floating-point error. Without it, after $\sim 10^6$ samples the least-significant bits of `phase` begin to contaminate the sine computation.
+At 44100 Hz, 440 Hz gives exactly $44100/440 = 100.227\ldots$ samples per cycle — not an integer, which is why naive looping introduces phase discontinuities at buffer boundaries. The correct approach is to accumulate phase, not recompute $t$ from scratch each buffer.
 
-### The Recurrence Form
+### Superposition: Waveforms as Sums of Sinusoids
 
-`sin()` is expensive — typically 20–100 ns on modern hardware depending on the FPU implementation. The angle-addition identities give a way to step the sinusoid forward with only multiplications and additions:
+Any periodic signal with period $T$ decomposes as:
 
-$$\sin(\theta + \Delta) = \sin\theta\cos\Delta + \cos\theta\sin\Delta$$
-$$\cos(\theta + \Delta) = \cos\theta\cos\Delta - \sin\theta\sin\Delta$$
+$$x(t) = \sum_{k=0}^{\infty} A_k \sin(k \omega_0 t + \phi_k), \qquad \omega_0 = \frac{2\pi}{T}$$
 
-Precompute $c_\Delta = \cos\hat{\omega}$ and $s_\Delta = \sin\hat{\omega}$ once; then:
+The $k=1$ term is the **fundamental**; $k > 1$ terms are **harmonics**. The waveform *shape* — square, sawtooth, triangle — is entirely determined by which harmonics are present and at what relative amplitudes and phases. This is the Fourier series.
 
-```c
-double s      = 0.0;   /* sin(0) */
-double c      = 1.0;   /* cos(0) */
-double c_d    = cos(phase_increment);
-double s_d    = sin(phase_increment);
+A 440 Hz square wave:
 
-for (int n = 0;
+$$x(t) = \frac{4}{\pi}\sum_{k=1,3,5,\ldots} \frac{1}{k}\sin(2\pi \cdot 440k \cdot t)$$
+
+Only odd harmonics, amplitudes decaying as $1/k$. Truncate the sum at 20 kHz (the hearing limit) and you get the audible approximation. A sawtooth includes all harmonics ($1/k$), which is why it sounds brighter than a square.
+
+### Phase Differences Are Physical Path Differences
+
+Two microphones recording the same point source, mic 2 at distance $d$ further away. Sound travels at $c \approx 343\ \text{m/s}$, so the extra delay is $\Delta t = d/c$:
+
+$$s_2(t) = \sin\!\bigl(\omega(t - \Delta t)\bigr) = \sin(\omega t - \omega \Delta t)$$
+
+The phase difference:
+
+$$\Delta\phi = \omega \Delta t = \frac{2\pi f d}{c}$$
+
+When $d = \lambda/2$ (half a wavelength), $\Delta\phi = \pi$, and summing the two channels gives silence at frequency $f$. This is **comb filtering** — notches at $f = c/(2d),\ 3c/(2d),\ 5c/(2d),\ldots$. It is why placing two microphones at different distances from a speaker causes audible frequency-dependent cancellation, and why JACK session engineers care about microphone placement even in software routing.
+
+### Phasor Arithmetic in Code
+
+```python
+import cmath
+
+def make_phasor(amplitude: float, phase_rad: float) -> complex:
+    """Encode amplitude + phase as a complex number."""
+    return amplitude * cmath.exp(1j * phase_rad)
+
+def shift_phase(phasor: complex, delta_phi: float) -> complex:
+    """Rotate phasor by delta_phi radians — O(1) phase manipulation."""
+    return phasor * cmath.exp(1j * delta_phi)
+
+def to_signal(phasor: complex, omega: float, t: float) -> float:
+    """Recover real time-domain value at time t."""
+    return (phasor * cmath.exp(1j * omega * t)).real
+
+# Example: 1 kHz signal, phase-shifted 90 degrees
+p = make_phasor(1.0, 0.0)
+p_shifted = shift_phase(p, math.pi / 2)
+# p_shifted now represents cos(ωt) instead of sin(ωt)
+```
+
+Multiplying two phasors: amplitudes multiply, phases add — $A_1 e^{i\phi_1} \cdot A_2 e^{i\phi_2} = A_1 A_2\, e^{i(\phi_1+\phi_2)}$. This is the algebraic foundation of every digital filter and mixer.
+
+---
+
+## Linux Connections
+
+### ALSA: Where the Samples Live
+
+ALSA exposes audio hardware through `/dev/snd/`. The userspace API fills a ring buffer; the kernel DMA-transfers

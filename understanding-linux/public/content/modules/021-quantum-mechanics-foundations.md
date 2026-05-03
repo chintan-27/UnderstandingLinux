@@ -12,86 +12,99 @@ resources:
 
 ## Why This Matters
 
-Classical electromagnetism predicts that an orbiting electron continuously radiates energy and spirals into the nucleus in roughly $10^{-11}$ seconds. Metals, treated classically, have no mechanism to resist compression to zero volume. Neither prediction is wrong by a small margin — classical physics gives the completely wrong qualitative answer. Quantum mechanics is not a correction to classical physics; it is a replacement that happens to reproduce classical results at large scales.
+Classical electrodynamics predicts that an accelerating charge radiates energy. An electron in a circular orbit is always accelerating. The classical collapse timescale works out to roughly $16\ \text{ps}$ — every atom on Earth should have imploded before you finished reading this sentence. The fact that atoms are stable is not a minor detail quantum mechanics patches; it is the central explanandum that forces the entire framework into existence.
 
-The concrete consequence for computing: silicon's band gap of $1.12\,\text{eV}$ is not a material property you look up — it is a calculable result of electron wavefunctions in a periodic crystal potential. The transistor threshold voltage, the tunnel oxide thickness in NAND flash, the Johnson noise floor in amplifier circuits — all are quantum mechanical in origin. Every `read()` syscall that returns data from an SSD depends on electrons having tunneled through $\sim 10\,\text{nm}$ of silicon dioxide.
+From that foundation: quantized energy levels give atoms their identity, the Pauli exclusion principle forces electrons into distinct orbitals and builds the periodic table, and quantum tunneling lets electrons cross oxide barriers they cannot classically surmount. CMOS transistors switch because of band structure engineered by controlled doping. Flash memory stores bits by trapping electrons behind a tunnel oxide roughly $10\ \text{nm}$ thick — thin enough that tunneling is probable under an applied field, thick enough that the trapped charge persists for years without one. None of this is a quantum correction to a classical picture. It is the operating mechanism.
 
 ---
 
 ## Core Concepts
 
-### Wavefunctions: Probability Amplitudes, Not Ignorance
+### Wavefunctions: Probability Amplitude, Not Ignorance
 
-Classical mechanics assigns a particle a definite position $x(t)$ and momentum $p(t)$ at every instant. Quantum mechanics replaces both with a single complex-valued **wavefunction** $\psi(x, t)$. The squared magnitude is a probability density:
+A particle in quantum mechanics is described by a **wavefunction** $\psi(\mathbf{r}, t)$, a complex-valued field. The physically meaningful quantity is the probability density:
 
-$$P(x, t) = |\psi(x, t)|^2$$
+$$P(\mathbf{r}, t) = |\psi(\mathbf{r}, t)|^2$$
 
-The wavefunction is not an expression of measurement uncertainty in the engineering sense. There is no hidden variable tracking the "real" position — Bell's theorem and subsequent experiments (Aspect 1982, Hensen 2015) rule out local hidden-variable theories. The probability distribution is the complete physical description.
+The wavefunction is not a description of your ignorance about a definite trajectory. There is no trajectory. The particle has no position between measurements — this is the content of Bell inequality violations, confirmed experimentally to high precision. The wavefunction evolves deterministically under the Schrödinger equation; the randomness enters only at measurement.
 
-The wave behavior follows directly from the linearity of the Schrödinger equation. Because $\psi$ is linear, any two solutions $\psi_1$ and $\psi_2$ can be superposed:
+The wavefunction must be normalized: the particle exists somewhere, so
 
-$$\psi = c_1\psi_1 + c_2\psi_2, \quad c_1, c_2 \in \mathbb{C}$$
+$$\int_{-\infty}^{\infty} |\psi(x, t)|^2\, dx = 1$$
 
-The resulting probability density $|\psi|^2$ contains cross terms $2\,\text{Re}(c_1 c_2^* \psi_1 \psi_2^*)$ — interference. An electron diffracts through a double slit not because it splits in two, but because the wavefunction, which has spatial extent, propagates through both slits simultaneously and the two contributions interfere before any position measurement occurs.
+The complex phase of $\psi$ carries physical content. Two wavefunctions can interfere — add coherently or cancel — which is why electrons passing through a double slit produce an interference pattern even when sent one at a time.
 
-### Quantization: What Confinement Actually Does
+### Quantized States: Boundary Conditions Force Discreteness
 
-A free particle can have any energy. Confine it — impose boundary conditions — and you constrain which wavefunctions are physically valid. The mathematics is identical to standing waves: only wavelengths $\lambda$ satisfying $n(\lambda/2) = L$ fit in a box of length $L$, where $n$ is a positive integer.
+Quantization is not postulated; it emerges from boundary conditions. A wavefunction confined to a finite region must satisfy those boundaries, and only certain wavelengths fit. For a particle in a 1D infinite square well of width $L$, the boundary conditions $\psi(0) = \psi(L) = 0$ require:
 
-Since momentum is related to wavelength by the de Broglie relation $p = h/\lambda = \hbar k$ where $k = 2\pi/\lambda$, and kinetic energy is $p^2/2m$, the allowed energies in a one-dimensional box are:
+$$\psi_n(x) = \sqrt{\frac{2}{L}}\sin\!\left(\frac{n\pi x}{L}\right), \quad n = 1, 2, 3, \ldots$$
 
-$$E_n = \frac{n^2 \pi^2 \hbar^2}{2mL^2}, \quad n = 1, 2, 3, \ldots$$
+The de Broglie relation $p = h/\lambda$ then fixes the momentum, and kinetic energy $E = p^2/2m$ gives:
 
-Three things to notice. First, $n = 0$ is excluded — $\psi = 0$ everywhere is not a physical state. The ground state $n=1$ has nonzero **zero-point energy** $E_1 = \pi^2\hbar^2 / (2mL^2)$; the particle cannot be at rest inside a finite region. Second, the spacing between levels scales as $1/L^2$: smaller boxes mean larger energy gaps, which means more energy required to disturb the system. Atomic electrons are hard to remove not arbitrarily but for this calculable reason. Third, the levels are non-degenerate in 1D; in 3D, multiple quantum number combinations can share the same energy, producing the shell structure of atoms.
+$$E_n = \frac{n^2 \pi^2 \hbar^2}{2mL^2}$$
 
-The Heisenberg uncertainty principle is not a statement about measurement disturbance — it is a theorem about Fourier transforms. A wavefunction well-localized in position space requires a broad superposition of momentum-space components, and vice versa:
+Only integer $n$ — no continuum, no $n = 0$ (that would make $\psi$ identically zero, which is not normalizable). The $n=1$ state has nonzero energy even at absolute zero: the **zero-point energy** $E_1 = \pi^2\hbar^2/2mL^2$. This is a direct consequence of the uncertainty principle — confining the particle to $\Delta x \sim L$ forces $\Delta p \geq \hbar/2L$, which costs kinetic energy. An electron simply cannot be at rest inside a box.
+
+### The Uncertainty Principle: A Property of Waves
+
+Position and momentum are conjugate variables related by a Fourier transform. A wavefunction sharply localized in position ($\Delta x$ small) necessarily spans many spatial frequencies, meaning many momenta ($\Delta p$ large). This is a theorem of Fourier analysis, not a claim about measurement disturbance. Formally:
 
 $$\Delta x \cdot \Delta p \geq \frac{\hbar}{2}$$
 
-where $\Delta x$ and $\Delta p$ are standard deviations of the respective probability distributions. Compressing an electron into a region of width $\Delta x$ forces $\Delta p \geq \hbar / (2\Delta x)$, which raises the expected kinetic energy as $\langle T \rangle \sim (\Delta p)^2 / 2m \sim \hbar^2 / (8m(\Delta x)^2)$. This is precisely the pressure that prevents electron clouds from collapsing, and it scales correctly with atomic radii.
+where $\hbar = h/2\pi \approx 1.055 \times 10^{-34}\ \text{J·s}$.
 
-### Tunneling: Exponential Decay, Not Magic
+Apply this to the hydrogen atom. The electron is bound within a radius $a$, so $\Delta x \sim a$ and $\Delta p \sim \hbar/a$. The total energy is:
 
-Classically, a particle with energy $E < V$ cannot enter a region where the potential is $V$. Quantum mechanically, the Schrödinger equation inside the barrier becomes:
+$$E(a) = \frac{\hbar^2}{2ma^2} - \frac{e^2}{4\pi\epsilon_0 a}$$
 
-$$-\frac{\hbar^2}{2m}\frac{d^2\psi}{dx^2} = (E - V)\psi$$
+Minimizing $dE/da = 0$:
 
-Since $E - V < 0$, the right-hand side has the wrong sign for oscillatory solutions. The solutions are real exponentials, not complex ones:
+$$a_0 = \frac{4\pi\epsilon_0\hbar^2}{me^2} \approx 0.529\ \text{Å}$$
 
-$$\psi(x) \propto e^{\pm\kappa x}, \quad \kappa = \sqrt{\frac{2m(V-E)}{\hbar^2}}$$
+Substituting back:
 
-The physically acceptable solution inside a finite barrier decays as $e^{-\kappa x}$. If the barrier has width $d$, the wavefunction at the far side is suppressed by $e^{-\kappa d}$ in amplitude, giving a transmission probability:
+$$E_1 = -\frac{me^4}{2(4\pi\epsilon_0)^2\hbar^2} \approx -13.6\ \text{eV}$$
 
-$$T \approx e^{-2\kappa d}$$
+This matches the experimentally measured ionization energy of hydrogen. The atom is stable because compressing it further raises the kinetic energy faster than it lowers the potential energy. The ground state is the minimum of that tradeoff.
 
-The exponential sensitivity to both $d$ and $\sqrt{V - E}$ is the key engineering parameter. For a silicon dioxide tunnel oxide with $V - E \approx 3.1\,\text{eV}$ and $d = 10\,\text{nm}$:
+### Tunneling: Exponential Sensitivity to Barrier Width
 
-$$\kappa = \sqrt{\frac{2 \times (9.109 \times 10^{-31}\,\text{kg}) \times (3.1 \times 1.602 \times 10^{-19}\,\text{J})}{(1.055 \times 10^{-34}\,\text{J·s})^2}} \approx 9.0 \times 10^9\,\text{m}^{-1}$$
+Inside a classically forbidden region (where $E < V_0$), the Schrödinger equation gives real exponential solutions rather than oscillating ones. For a rectangular barrier of height $V_0$ and width $d$:
 
-$$T \approx e^{-2 \times 9.0 \times 10^9 \times 10^{-8}} = e^{-180} \approx 10^{-78}$$
+$$\psi(x) \propto e^{-\kappa x}, \quad \kappa = \sqrt{\frac{2m(V_0 - E)}{\hbar^2}}$$
 
-That is essentially zero — data retention under zero field. Apply a voltage that reduces the effective barrier height by $2\,\text{eV}$ to $V - E \approx 1.1\,\text{eV}$ during a write operation:
+If the barrier is thin enough, this decaying wavefunction still has nonzero amplitude at the far side. The transmission probability is:
 
-$$\kappa' = \sqrt{\frac{2 \times (9.109 \times 10^{-31}) \times (1.1 \times 1.602 \times 10^{-19})}{(1.055 \times 10^{-34})^2}} \approx 5.4 \times 10^9\,\text{m}^{-1}$$
+$$T \approx 16\frac{E}{V_0}\!\left(1 - \frac{E}{V_0}\right) e^{-2\kappa d}$$
 
-$$T' \approx e^{-2 \times 5.4 \times 10^9 \times 10^{-8}} = e^{-108} \approx 10^{-47}$$
+For the leading behavior, $T \sim e^{-2\kappa d}$.
 
-Still tiny in absolute terms, but $10^{31}$ times larger than before. With $\sim 10^{15}$ electrons available and nanosecond attempt frequencies, write operations complete in microseconds. The same exponential that ensures retention is what enables writing — it is the ratio that matters, not the absolute value.
+The exponential dependence on $d$ and $\sqrt{m}$ is what makes tunneling device-relevant for electrons but negligible for anything heavier. For a $1\ \text{eV}$ electron hitting a $2\ \text{eV}$ barrier:
 
-### Pauli Exclusion: Why the Periodic Table Has the Shape It Has
+$$\kappa = \sqrt{\frac{2 \times 9.109\times10^{-31} \times 1 \times 1.602\times10^{-19}}{(1.055\times10^{-34})^2}} \approx 5.12 \times 10^9\ \text{m}^{-1}$$
 
-Electrons are **fermions** with spin $s = 1/2$. The many-electron wavefunction must be antisymmetric under exchange of any two identical electrons:
+At $d = 1\ \text{nm}$: $T \sim e^{-2 \times 5.12 \times 10^9 \times 10^{-9}} = e^{-10.24} \approx 3.6 \times 10^{-5}$.  
+At $d = 3\ \text{nm}$: $T \sim e^{-30.7} \approx 2 \times 10^{-14}$.
 
-$$\psi(\ldots, x_i, \ldots, x_j, \ldots) = -\psi(\ldots, x_j, \ldots, x_i, \ldots)$$
+Three nanometers of additional oxide cuts transmission by nine orders of magnitude. This is why gate oxide thickness is one of the most carefully controlled parameters in transistor fabrication — and why below ~1 nm it stops working as an insulator entirely.
 
-This is not a separate postulate layered on top of quantum mechanics — it follows from the spin-statistics theorem in quantum field theory, which connects particle spin to the symmetry character of the multi-particle state. The consequence is immediate: if electrons $i$ and $j$ are in identical states, swapping them changes nothing, so $\psi = -\psi$, forcing $\psi = 0$. The state has zero probability of existing.
+### Pauli Exclusion Principle: Antisymmetry, Not a Rule
 
-The result: each quantum state specified by the tuple $(n, \ell, m_\ell, m_s)$ — principal, azimuthal, magnetic, and spin quantum numbers — can be occupied by at most one electron. The $2p$ subshell ($n=2$, $\ell=1$) has $m_\ell \in \{-1, 0, 1\}$ and $m_s \in \{-1/2, +1/2\}$, giving 6 states. Fill them and you have neon's configuration. The next electron must go into $n=3$, and so on.
+The exclusion principle is not an additional axiom. It follows from a deeper requirement: electrons are indistinguishable, and the laws of physics must be symmetric under exchange. For fermions (half-integer spin), that symmetry is **antisymmetry** — swapping two electrons flips the sign of the total wavefunction:
 
-Without antisymmetry, all electrons would collapse into the $1s$ ground state. Atoms larger than hydrogen would not exist in any chemically meaningful sense.
+$$\psi(\mathbf{r}_1, \mathbf{r}_2) = -\psi(\mathbf{r}_2, \mathbf{r}_1)$$
 
-### Energy Bands: What Happens When $N \to 10^{23}$
+If two electrons occupy identical states, then $\psi(\mathbf{r}_1, \mathbf{r}_2) = \psi(\mathbf{r}_2, \mathbf{r}_1)$. Combined with the antisymmetry requirement: $\psi = -\psi$, so $\psi = 0$. The state does not exist.
 
-Bring two hydrogen atoms together. The $1s$ level of each atom is an energy eigenstate, but once the electron wavefunctions overlap, the system eigenstates are the symmetric and antisymmetric combinations: $(\psi_1 \pm \psi_2)/\sqrt{2}$. These have slightly different energies — one level splits into two.
+A quantum state is labeled $(n, l, m_l, m_s)$. Because $m_s \in \{+\frac{1}{2}, -\frac{1}{2}\}$, each spatial orbital $(n, l, m_l)$ holds exactly two electrons. This fills shells in order, producing the periodic table — not as a fact to memorize but as a consequence of antisymmetry. The chemical differences between carbon (6 electrons) and nitrogen (7 electrons) trace directly to which orbital the 7th electron must occupy given the antisymmetry constraint on the first six.
 
-For $N$ atoms in a periodic lattice, each atomic level splits into $N$ closely-spaced levels. With $N \sim 10^{
+### Energy Bands in Solids: Splitting at Scale
+
+Two quantum wells coupled together split each energy level into two — a bonding and an antibonding state separated by an energy gap proportional to the coupling strength. With $N \sim 10^{23}$ atoms in a crystal, each level splits into $N$ levels spanning an energy range set by the interatomic coupling. The spacing between adjacent levels within a band is of order $\Delta E \sim \text{bandwidth} / N \approx 10^{-23}\ \text{eV}$ — indistinguishable from a continuum. Between bands, the gaps remain.
+
+Conductivity is determined by band filling:
+
+- **Metal:** Highest occupied band partially filled. The Fermi level sits inside a band; electrons can absorb arbitrarily small energies and scatter into nearby empty states. Current flows.
+- **Insulator:** Valence band completely full, conduction band empty, gap $E_g > 5\ \text{eV}$. No available states near the Fermi level; electrons cannot respond to small electric fields.
+- **Semiconductor:** Same topology as insulator, $E_g \sim 1\ \text{eV}$ (silicon: $1.12\ \text{eV}$, GaAs: $1.42\ \text{eV}$). Thermal energy $k_BT \approx 26\ \text{meV}$ at room temperature is insufficient to bridge

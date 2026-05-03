@@ -12,126 +12,142 @@ resources:
 
 ## Why This Matters
 
-Every number your computer stores is a rounded approximation of the true value. This is not a bug; it is a fundamental consequence of representing real numbers in finite binary storage. When you ignore this, errors compound in ways that are invisible until they are catastrophic: a navigation system drifts, a physics simulation diverges, a financial calculation silently accumulates rounding noise into meaningful money. The Linux kernel handles these concerns directly — computing scheduler weights as fixed-point fractions, approximating `jiffies`-to-nanoseconds conversions with integer arithmetic, and using iterative Newton steps inside `__ieee754_sqrt`. Understanding how approximations behave — how errors grow, shrink, or stay bounded — separates code that works once from code that works under all inputs.
+Every number your program stores is a lie. Floating-point arithmetic operates on a finite subset of the reals, so every operation introduces rounding error, and those errors compound. Without understanding approximation and stability, you write code that silently returns wrong answers — not crashes, not exceptions, just subtly incorrect results that pass most tests. The Linux kernel contains carefully chosen approximations: integer square roots in `lib/int_sqrt.c`, fixed-point exponentials in the scheduler's load-average calculation (`kernel/sched/loadavg.c`), Newton-Raphson reciprocals in some hardware math libraries. These choices exist because the authors understood *which errors are acceptable and why*, and encoded that understanding explicitly.
 
 ---
 
 ## Core Concepts
 
-### Absolute vs. Relative Error
+### Approximation and Error
 
-Given a true value $v$ and an approximation $\hat{v}$:
+Every practical computation replaces an exact value with a tractable one. Two measurements matter:
 
-$$\text{absolute error} = |v - \hat{v}|$$
+**Absolute error** is the raw difference:
 
-$$\text{relative error} = \frac{|v - \hat{v}|}{|v|}$$
+$$\text{abs\_err}(x, \hat{x}) = |x - \hat{x}|$$
 
-Absolute error measures displacement on the number line. Relative error measures the fraction of the answer that is wrong — equivalently, it counts how many significant figures are correct. They are not interchangeable, and choosing the wrong one causes you to misdiagnose your own accuracy.
+**Relative error** normalizes by the true value:
 
-When computing the millionth prime $p_{10^6} \approx 15{,}631{,}363$ from an asymptotic formula, the absolute error may be in the thousands while the relative error is $10^{-4}$. Whether that is acceptable depends entirely on what you are doing with the result. A scheduler computing a CPU weight from a relative formula tolerates large absolute magnitudes; a protocol computing a checksum does not tolerate any absolute error at all.
+$$\text{rel\_err}(x, \hat{x}) = \frac{|x - \hat{x}|}{|x|}$$
 
-### Big-O as an Error Budget
+Use absolute error when you care about a fixed-scale tolerance (a sensor reading within $\pm 0.01$ volts). Use relative error when you care about significant figures — which is almost always the right question in floating-point work, because IEEE 754 represents numbers with a fixed number of *significant* bits, not a fixed number of decimal places after the point.
 
-$O(f(n))$ means "bounded in magnitude by $C \cdot f(n)$ for some constant $C$ and all sufficiently large $n$." In the context of approximation, the $O$ term is not a placeholder — it is an *error budget*. When Concrete Mathematics writes:
+When approximating $H_n$ (the $n$-th harmonic number):
 
-$$H_n = \ln n + \gamma + \frac{1}{2n} - \sum_{k=1}^{m} \frac{B_{2k}}{2k \cdot n^{2k}} + O\!\left(n^{-2m-2}\right)$$
+$$H_n = \ln n + \gamma + \frac{1}{2n} - \sum_{k=1}^{m} \frac{B_{2k}}{2k \cdot n^{2k}} + R_m$$
 
-the $O(n^{-2m-2})$ term is the remainder after truncating at $m$ Bernoulli correction terms. You choose $m$ based on how much accuracy you need, then include exactly enough terms. Carrying fewer introduces uncontrolled error; carrying more is wasted computation — and for asymptotic series, actively harmful (see below).
+the remainder $R_m$ has a known bound. You stop adding terms when $|R_m|$ drops below your target precision. The critical discipline: never approximate without a bound on what you are discarding.
+
+### Big-O as a Precision Budget
+
+$O(f(n))$ in numerical work is not algorithm analysis — it is a calculus for tracking accumulated error. Writing:
+
+$$H_n = \ln n + \gamma + \frac{1}{2n} + O(n^{-2})$$
+
+asserts that the omitted terms are bounded by $C \cdot n^{-2}$ for some fixed $C$. This lets you propagate errors through chains of operations without losing the bound. Two rules that appear constantly:
+
+$$e^{O(f(n))} = 1 + O(f(n)) \quad \text{when } f(n) = O(1)$$
+
+$$\ln(1 + O(f(n))) = O(f(n)) \quad \text{when } f(n) \prec 1$$
+
+The reason these are useful: you can substitute approximations into larger expressions and immediately read off the order of the resulting error, without expanding every term.
 
 ### Floating-Point Representation
 
-A 64-bit IEEE 754 double stores:
+IEEE 754 double precision encodes:
 
-$$x = (-1)^s \cdot (1 + m) \cdot 2^{e - 1023}$$
+$$x = (-1)^s \cdot 1.m \cdot 2^e$$
 
-where $s \in \{0,1\}$ is the sign bit, $m$ is a 52-bit fractional mantissa $m \in [0, 1)$, and $e$ is an 11-bit biased exponent. Three consequences follow directly from this layout:
+where $s$ is 1 sign bit, $m$ is a 52-bit mantissa (the leading 1 is implicit), and $e$ is an 11-bit biased exponent (bias = 1023). The spacing between adjacent representable values near $x$ is $|x| \cdot 2^{-52}$, so **machine epsilon** is:
 
-**1. Density is not uniform.** The interval $[2^k, 2^{k+1})$ contains exactly $2^{52}$ representable values regardless of $k$. The gap between adjacent doubles near $x = 1$ is $\epsilon_{\text{mach}} = 2^{-52} \approx 2.2 \times 10^{-16}$; near $x = 10^{15}$ it is $2^{-52} \cdot 2^{50} = 2^{-2} = 0.25$. Adding $0.1$ to $10^{15}$ in double precision changes nothing.
+$$\varepsilon_{\text{mach}} = 2^{-52} \approx 2.22 \times 10^{-16}$$
 
-**2. Every operation rounds.** Each `+`, `-`, `*`, `/` introduces a relative rounding error of at most $\frac{1}{2}\epsilon_{\text{mach}}$. One operation is harmless; a chain of $n$ operations accumulates error that can grow as $O(n \epsilon_{\text{mach}})$ in the best case and exponentially in the worst.
+This is the worst-case relative rounding error for a single operation. Every `+`, `-`, `*`, `/` on a correctly rounded IEEE 754 implementation produces a result with relative error at most $\frac{1}{2}\varepsilon_{\text{mach}}$.
 
-**3. Machine epsilon is measurable.** The smallest $\epsilon$ such that $1.0 + \epsilon \neq 1.0$ in floating-point arithmetic is $\epsilon_{\text{mach}} = 2^{-52}$. This is not the smallest representable positive number (that is $2^{-1074}$ for subnormals); it is the precision of the significand.
+You can verify the mantissa width directly:
 
-The memory layout of a double, reading from MSB to LSB:
+```python
+import struct, math
 
-```
-bit 63   : sign (1 bit)
-bits 62–52: exponent, biased by 1023 (11 bits)
-bits 51–0 : mantissa fraction (52 bits)
-```
-
-You can inspect any double's bit pattern directly:
-
-```c
-#include <stdio.h>
-#include <stdint.h>
-#include <string.h>
-
-void print_double_bits(double x) {
-    uint64_t bits;
-    memcpy(&bits, &x, 8);   // strict-aliasing–safe byte copy
-    printf("sign=%llu  exp=%llu  mantissa=%llu\n",
-           (bits >> 63) & 0x1,
-           (bits >> 52) & 0x7FF,
-           bits & 0x000FFFFFFFFFFFFFULL);
-}
-
-int main(void) {
-    print_double_bits(1.0);
-    print_double_bits(0.1);   // not exactly representable
-    print_double_bits(1e15);
-    return 0;
-}
+x = 1.0
+# The next representable double above 1.0
+eps = 0.0
+p = 1.0
+while 1.0 + p != 1.0:
+    eps = p
+    p /= 2.0
+print(f"machine epsilon: {eps:.2e}")   # 2.22e-16
+print(f"2^-52 =          {2**-52:.2e}")
 ```
 
-```bash
-gcc -o bits bits.c && ./bits
-```
-
-For `0.1`, the mantissa bits will not be all zeros — that alone tells you `0.1` is irrational in base 2.
-
-### Catastrophic Cancellation
-
-When two nearly equal floating-point numbers are subtracted, their leading significant bits cancel exactly, and what remains is dominated by rounding noise from earlier operations. The relative error of the *result* can be orders of magnitude larger than the relative error of either *operand*.
-
-Concretely: if $a$ and $b$ each have relative error $\epsilon_{\text{mach}}$, then $a - b$ has absolute error $\approx 2\epsilon_{\text{mach}} \cdot |a|$, but the relative error of $a - b$ is:
-
-$$\frac{2\epsilon_{\text{mach}} \cdot |a|}{|a - b|}$$
-
-When $|a - b| \ll |a|$, this ratio is enormous. For $a = b$ in floating-point, it is infinite — the result is zero with 100% relative error.
-
-The remedy is algebraic reformulation to avoid the subtraction. $\sqrt{x+1} - \sqrt{x}$ cancels catastrophically for large $x$; multiplying and dividing by the conjugate gives the equivalent $\frac{1}{\sqrt{x+1} + \sqrt{x}}$, which is a sum of nearly equal numbers rather than a difference — no cancellation occurs.
+Single precision (`float` in C) uses a 23-bit mantissa, giving $\varepsilon_{\text{mach}} = 2^{-23} \approx 1.19 \times 10^{-7}$. This matters when you use `float` for performance and wonder why your answers are wrong at the seventh digit.
 
 ### Numerical Stability
 
-An algorithm is *numerically stable* if rounding errors introduced at each step do not amplify through subsequent steps. Stability is a property of the *algorithm*, not the *problem*. The same linear system $Ax = b$ can be solved stably (LU decomposition with partial pivoting) or unstably (Gaussian elimination without pivoting, which can multiply errors by a factor exponential in matrix size for adversarial inputs).
+An algorithm is **numerically stable** if rounding errors in the input (and at each step) produce output errors that are small relative to the problem's inherent sensitivity. Instability means rounding errors are amplified by the algorithm itself — not the problem, the *algorithm*.
 
-The *condition number* $\kappa(A) = \|A\| \cdot \|A^{-1}\|$ measures the problem's inherent sensitivity: a relative perturbation $\delta$ in $b$ causes a relative change of at most $\kappa(A) \cdot \delta$ in $x$. If $\kappa(A) = 10^{12}$, you lose 12 decimal digits of accuracy regardless of algorithm. No stable algorithm can recover information the problem itself destroyed.
+**Catastrophic cancellation** is the most common instability: subtracting two nearly equal numbers. Each input may be accurate to 15 significant digits, but if they agree in the first 14, the result has only 1 significant digit.
 
-The relationship between condition number, algorithm stability, and achievable accuracy:
+$$f(x) = \sqrt{x+1} - \sqrt{x}$$
 
-$$\text{digits lost} \approx \log_{10}(\kappa) + \log_{10}(\text{amplification factor of algorithm})$$
+As $x \to \infty$, both terms approach $\sqrt{x}$ and you lose all precision in their difference. The fix: rationalize to eliminate the subtraction:
 
-For a well-conditioned problem ($\kappa \approx 1$) with a stable algorithm, you lose almost nothing. For an ill-conditioned problem with an unstable algorithm, the result may be pure noise.
+$$f(x) = \frac{(\sqrt{x+1} - \sqrt{x})(\sqrt{x+1} + \sqrt{x})}{\sqrt{x+1} + \sqrt{x}} = \frac{1}{\sqrt{x+1} + \sqrt{x}}$$
 
-### Iterative Methods and Convergence
+Now for large $x$, $f(x) \approx \frac{1}{2\sqrt{x}}$, and there is no cancellation. Same mathematical function, completely different numerical behavior — the reformulation is numerically stable because addition of nearly equal numbers is benign; subtraction is not.
 
-When no closed form exists, construct a sequence $x_0, x_1, x_2, \ldots$ converging to the true answer. Newton's method for $f(x) = 0$:
+A second classic: evaluating $e^x - 1$ near $x = 0$. Use `expm1(x)` from `<math.h>`, which computes this directly without cancellation. Similarly, $\ln(1+x)$ near $x = 0$ should use `log1p(x)`. These are in the C standard library precisely because the naive forms are unstable.
+
+### Iterative Methods
+
+When no closed form exists, you iterate. **Newton-Raphson** finds roots of $f(x) = 0$ by linearizing $f$ at the current guess:
 
 $$x_{n+1} = x_n - \frac{f(x_n)}{f'(x_n)}$$
 
-Near a simple root where $f'$ does not vanish, this converges *quadratically*:
+Near a simple root, convergence is **quadratic**: if the error at step $n$ is $\delta_n$, then $\delta_{n+1} \approx C \delta_n^2$. The number of correct decimal digits roughly doubles each iteration. Starting from a guess with 1 correct digit, you reach 15 (double precision) in about 4 iterations.
 
-$$|e_{n+1}| \leq C \cdot |e_n|^2, \qquad C = \frac{|f''(x^*)|}{2|f'(x^*)|}$$
+For $\sqrt{a}$, solve $f(x) = x^2 - a = 0$, giving $f'(x) = 2x$:
 
-Each step roughly doubles the number of correct digits. Starting with 1 correct digit: after 5 Newton steps you have $\sim 2^5 = 32$ correct digits — more than double precision can represent. This is why `libm` implementations use a polynomial approximation to get within $2^{-10}$, then apply one or two Newton steps to reach full precision rather than iterating from scratch.
+$$x_{n+1} = \frac{1}{2}\left(x_n + \frac{a}{x_n}\right)$$
 
-Contrast with *linear* convergence where $|e_{n+1}| \leq r \cdot |e_n|$ for fixed $r < 1$. To gain 16 decimal digits from a method with $r = 0.5$ requires $\log_2(10^{16}) \approx 53$ iterations. Newton needs 4–5. The cost per iteration must be weighed against convergence rate, but for smooth functions Newton's $O(\log(1/\epsilon))$ iterations is almost always worth it.
+This is the Babylonian method. The derivation via Newton-Raphson explains *why* it converges quadratically, which the historical algorithm statement does not.
 
 ---
 
 ## How It Works
 
-### Euler's Summation Formula and Controlled Approximation
+### Euler-Maclaurin and Controlled Approximation
 
-$H_n = \sum_{k=1}^{n}
+The Euler-Maclaurin formula connects discrete sums to integrals with explicit error terms. For smooth $f$:
+
+$$\sum_{k=a}^{b} f(k) = \int_a^b f(x)\,dx + \frac{f(a)+f(b)}{2} + \sum_{k=1}^{m} \frac{B_{2k}}{(2k)!}\left[f^{(2k-1)}(b) - f^{(2k-1)}(a)\right] + R_m$$
+
+where $B_{2k}$ are Bernoulli numbers ($B_2 = \frac{1}{6}$, $B_4 = -\frac{1}{30}$, ...). Applying this to $f(k) = 1/k$ with $a=1$, $b=n$ yields the asymptotic expansion for $H_n$.
+
+The practical point: the remainder $R_m$ satisfies
+
+$$|R_m| \leq \frac{2}{(2\pi)^{2m}} \int_a^b |f^{(2m)}(x)|\,dx$$
+
+so you can compute how many correction terms you need before writing a single line of code. This is the mathematical backbone of numerical integration: you are not guessing at precision, you are purchasing it at a known rate.
+
+Note that the Euler-Maclaurin series is typically asymptotic — adding more terms eventually makes things *worse* because the Bernoulli numbers grow faster than factorials can suppress them. The optimal truncation point depends on $n$.
+
+### Floating-Point Error Accumulation
+
+Summing $n$ floating-point numbers naively:
+
+```python
+def naive_sum(values):
+    total = 0.0
+    for x in values:
+        total += x
+    return total
+```
+
+Each addition introduces relative error up to $\frac{1}{2}\varepsilon_{\text{mach}}$, and the errors accumulate. After $n$ additions, the absolute error is bounded by roughly:
+
+$$\text{error} \leq n \cdot \varepsilon_{\text{mach}} \cdot \max_i |x_i|$$
+
+For $n = 10^6$ and values of order 1, the error is $\sim 10^6 \times 2.2 \times 10^{-16} \approx 2.2 \times 10^{-10}$ — you have lost 6 decimal digits compared to a single operation.
+
+**Kahan compensated summation** tracks the

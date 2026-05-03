@@ -12,7 +12,7 @@ resources:
 
 ## Why This Matters
 
-Every resistor, voltage regulator, current source, and power rail in a computer obeys three laws without exception. When a Linux kernel driver miscalculates a pull-up resistor value, a GPIO line floats and reads garbage. When a power supply designer ignores current summation at a node, the board overheats or fails to start under load. Ohm's law and Kirchhoff's laws are not approximations — they are exact constraints enforced by charge conservation and energy conservation. Without them, you cannot read a schematic, size a resistor, understand why a voltage rail droops under load, or make sense of how a current-sense circuit works.
+Every circuit you will analyze — from the voltage regulator powering a CPU core to the pull-up resistor on an I²C bus — obeys three laws. Without Ohm's law you cannot predict current through a resistor, which means you cannot size a current-limiting resistor for an LED, cannot explain why a GPIO pin burns out when driven into a short, and cannot derive why a linear regulator's heat output scales with input-output voltage difference. Without Kirchhoff's laws you cannot track current at a junction or enforce voltage consistency around a loop — which means you cannot analyze a voltage divider, a feedback network, or a power rail. These laws are not approximations for simple circuits: they are the constraints that make any circuit analysis deterministic.
 
 ---
 
@@ -20,149 +20,132 @@ Every resistor, voltage regulator, current source, and power rail in a computer 
 
 ### Ohm's Law
 
-The voltage across a resistor is proportional to the current through it:
+A resistor is defined by a linear relationship between voltage and current:
 
 $$V = IR$$
 
-This holds because resistance is a material property: more electrons per second attempting to pass through the same cross-section of resistive material produce proportionally more collisions, requiring proportionally more driving force (voltage). Double the current, double the required voltage — the ratio is fixed by the material and geometry at constant temperature. Rearranged:
+The linearity is the key property. It means resistance is a *constant* — independent of $V$ and $I$ — which is what distinguishes a resistor from a diode or a transistor. If you apply 5 V across a 1 kΩ resistor, you get exactly 5 mA. If you double the voltage, you get exactly 10 mA. Any deviation from this linearity means the device is not behaving as a resistor.
 
-$$I = \frac{V}{R} \qquad R = \frac{V}{I}$$
+The physical origin of resistance is electron-lattice scattering. Electrons moving through a conductor collide with atoms; each collision transfers kinetic energy to the lattice as heat. More scattering per unit length means higher resistance. This gives the macroscopic formula:
 
-Power dissipated follows directly from the definition of power as $P = IV$, substituted with Ohm's law:
+$$R = \rho \frac{L}{A}$$
+
+where $\rho$ is resistivity (units: $\Omega \cdot \text{m}$, a material constant), $L$ is conductor length, and $A$ is cross-sectional area. Doubling the length doubles the scattering path; doubling the area provides two parallel scattering paths, halving resistance. This is why PCB trace resistance matters: a long, thin trace on a high-current rail creates a measurable voltage drop.
+
+Power dissipated in a resistor — energy delivered to the lattice per second — is:
 
 $$P = IV = I^2 R = \frac{V^2}{R}$$
 
-The $I^2 R$ form is the critical one for hardware: current is the dangerous quantity. A resistor carrying $100\,\text{mA}$ through $10\,\Omega$ dissipates $100\,\text{mW}$, but carrying $1\,\text{A}$ through the same resistor dissipates $10\,\text{W}$ — one hundred times more power for ten times the current. This is why high-current PCB traces are wide (lower $R$) and why motor driver ICs run hot even with low resistance MOSFETs.
+All three forms follow from substituting $V = IR$ into $P = IV$. Use whichever form matches what you know: if you know current and resistance, use $I^2 R$; if you know voltage and resistance, use $V^2/R$.
 
 ### Kirchhoff's Current Law (KCL)
 
-At any node in a circuit, charge cannot accumulate (absent a capacitor, which stores charge deliberately). Therefore:
-
-$$\sum I_{\text{in}} = \sum I_{\text{out}}$$
-
-With a sign convention (positive into node, negative out):
+At any node in a circuit, charge cannot accumulate:
 
 $$\sum_{k} I_k = 0$$
 
-If $5\,\text{mA}$ flows in on one wire and $3\,\text{mA}$ flows in on another, exactly $8\,\text{mA}$ must leave on the third. This is not a guideline — any deviation would require charge to appear or disappear at the node, which violates conservation of charge.
+where currents entering the node are positive and currents leaving are negative (or vice versa, as long as you are consistent). This is charge conservation, not an approximation — it holds at every node, at every instant, in DC and in AC circuits (with the caveat that at high frequencies, displacement current in capacitors must be accounted for, but the generalized form still holds).
+
+The practical consequence: in a series circuit, current is identical at every point. There are no branch nodes, so there is nowhere else for current to go. In a parallel circuit, the source current splits among branches, and KCL tells you exactly how.
 
 ### Kirchhoff's Voltage Law (KVL)
 
-Around any closed loop, a charge carrier that returns to its starting point has the same potential energy it started with. Therefore all voltage rises and drops must cancel:
+Around any closed loop, the signed sum of all voltage differences is zero:
 
 $$\sum_{k} V_k = 0$$
 
-Every source adds potential energy; every resistor and load converts it. They must balance because potential is a state function — path doesn't matter, only position. This is why you can choose any loop in any direction and KVL holds: you are just accounting for energy at each element along a closed path.
+This is energy conservation. A charge carrier traversing a complete loop returns to its starting point, so the net work done on it is zero. Every volt gained through a source must be lost across loads. The sign convention: voltage rises (moving from − to + through a source) are positive; voltage drops (moving through a resistor in the direction of current) are negative.
+
+KVL is what makes "voltage" a well-defined concept — it guarantees that the potential at a node has a single value regardless of which path you took to get there. If KVL were violated, node voltages would be path-dependent and circuit analysis would be impossible.
 
 ---
 
 ## How It Works
 
-### Ohm's Law in a Resistor Divider
+### Resistor-Based Current Source and Its Fundamental Limit
 
-Two resistors $R_1$ and $R_2$ in series across $V_{in}$:
+The simplest way to source a constant current is a resistor in series with a supply. If the supply is $V_S$ and the total series resistance is $R$, the current into a load $R_L$ is:
+
+$$I = \frac{V_S}{R + R_L}$$
+
+For the current to be approximately constant as $R_L$ varies, you need $R \gg R_L$, so that $R_L$ contributes negligibly to the denominator. The fractional change in current for a change $\Delta R_L$ in load is:
+
+$$\frac{\Delta I}{I} \approx \frac{\Delta R_L}{R + R_L} \approx \frac{\Delta R_L}{R}$$
+
+**Example**: You need 10 mA ±1% into a load that swings 0–10 V (i.e., $R_L$ swings 0–1 kΩ).
+
+The load voltage swing of 10 V at 10 mA represents a $\Delta R_L$ of 1 kΩ. For 1% regulation:
+
+$$\frac{\Delta R_L}{R} < 0.01 \implies R > \frac{1\,\text{k}\Omega}{0.01} = 100\,\text{k}\Omega$$
+
+At 10 mA through 100 kΩ, the supply must be at least:
+
+$$V_S = I \cdot R = 0.01\,\text{A} \times 100\,\text{k}\Omega = 1000\,\text{V}$$
+
+and the resistor dissipates:
+
+$$P_R = I^2 R = (0.01)^2 \times 100{,}000 = 10\,\text{W}$$
+
+This is the fundamental problem with resistor-based current sources: tight regulation requires enormous headroom voltage, and that headroom is entirely dissipated as heat. A transistor current source (or a dedicated IC like the LT3092) decouples regulation quality from supply voltage by using active feedback instead of a large passive impedance.
+
+### Voltage Divider via KVL + KCL
+
+Two resistors in series across supply $V_S$:
 
 ```
-    +Vin
-     |
-    [R1]
-     |
-     +--- Vout
-     |
-    [R2]
-     |
-    GND
+    Vs
+    |
+   [R1]
+    |---- Vout
+   [R2]
+    |
+   GND
 ```
 
-KCL at the middle node: with nothing else connected, the same current $I$ flows through both resistors. KVL around the outer loop:
+KVL around the outer loop: $V_S - V_{R1} - V_{R2} = 0$
 
-$$V_{in} - IR_1 - IR_2 = 0 \implies I = \frac{V_{in}}{R_1 + R_2}$$
+KCL at the middle node (with no current drawn from $V_{out}$): the current through $R_1$ equals the current through $R_2$, call it $I$.
 
-The output voltage is the drop across $R_2$ only:
+Ohm's law for each resistor: $V_{R1} = IR_1$, $V_{R2} = IR_2$.
 
-$$V_{out} = IR_2 = V_{in} \cdot \frac{R_2}{R_1 + R_2}$$
+Substituting into KVL: $V_S = I(R_1 + R_2)$, so $I = V_S/(R_1 + R_2)$.
 
-This equation silently assumes zero load current. The moment a load $R_L$ is connected to $V_{out}$, it appears in parallel with $R_2$, replacing $R_2$ with $R_2 \| R_L$:
+Therefore:
 
-$$R_2 \| R_L = \frac{R_2 R_L}{R_2 + R_L}$$
+$$V_{out} = IR_2 = V_S \cdot \frac{R_2}{R_1 + R_2}$$
 
-Since $R_2 \| R_L < R_2$, the output voltage drops. For the divider to be load-tolerant, choose $R_1$ and $R_2$ such that $R_L \gg R_2$ — the "stiff" divider condition. A common rule of thumb is $R_L \geq 10 R_2$, which limits the output droop to under 10%.
+The ratio $R_2/(R_1+R_2)$ is always less than 1, so $V_{out} < V_S$. The divider only works as derived when negligible current is drawn from the output — any load resistance in parallel with $R_2$ changes $R_2$ to $R_2 \| R_L = R_2 R_L/(R_2+R_L)$, lowering $V_{out}$.
 
-### KCL at a Node: The Op-Amp Summing Junction
+This equation directly controls the LM317 output voltage. The LM317 regulates the voltage between its OUT and ADJ pins to a fixed 1.25 V reference. With $R_1$ from OUT to ADJ and $R_2$ from ADJ to GND:
 
-In an inverting summing amplifier, two inputs $V_1$ and $V_2$ connect through $R_1$ and $R_2$ to the inverting input of an op-amp, which is held at virtual ground by negative feedback:
+$$V_{out} = 1.25\,\text{V} \cdot \left(1 + \frac{R_2}{R_1}\right)$$
 
-$$I_1 = \frac{V_1}{R_1}, \qquad I_2 = \frac{V_2}{R_2}$$
+Changing $R_2$ programs the output. The derivation is pure KVL plus the definition of what the LM317 regulates.
 
-KCL demands the total current entering the node must leave through the feedback resistor $R_f$ (the op-amp's input draws negligible current):
+### KCL at a Switching Node: Buck Converter Output
 
-$$I_f = I_1 + I_2 = \frac{V_1}{R_1} + \frac{V_2}{R_2}$$
+In a buck converter's output stage, $I_L$ is the inductor current, $I_{out}$ is the load current, and $I_C$ is the current into the output capacitor. KCL at the output node:
 
-The output voltage is:
+$$I_L = I_{out} + I_C$$
 
-$$V_{out} = -I_f R_f = -R_f\left(\frac{V_1}{R_1} + \frac{V_2}{R_2}\right)$$
+Rearranging: $I_C = I_L - I_{out}$
 
-With $R_1 = R_2 = R_f$, this is a unity-gain inverting summer. KCL is the entire derivation — the op-amp's job is only to enforce virtual ground at the node.
+When $I_L > I_{out}$, $I_C > 0$ — the capacitor is charging and the output voltage is rising. When $I_L < I_{out}$, $I_C < 0$ — the capacitor is discharging and the output voltage is falling. The converter's control loop adjusts the switching duty cycle to keep the average $I_L = I_{out}$, maintaining the output voltage. KCL is the mechanism by which this bookkeeping works at every instant.
 
-### KVL: Sizing an LED Current-Limiting Resistor
+### KVL + Ohm's Law: Linear Regulator Heat Dissipation
 
-A 3.3 V GPIO output drives an LED with forward voltage $V_f \approx 2.0\,\text{V}$. The desired current is $5\,\text{mA}$ (visible brightness without stressing the GPIO driver, which typically sources 8–16 mA maximum).
+A linear regulator passes the full load current through a series pass transistor. The transistor drops the excess voltage. With 12 V input, 5 V output, 500 mA load:
 
-KVL around the loop:
+KVL around the series path: $V_{in} = V_{drop} + V_{out}$
 
-$$V_{GPIO} - V_R - V_f = 0 \implies V_R = 3.3 - 2.0 = 1.3\,\text{V}$$
+$$V_{drop} = 12\,\text{V} - 5\,\text{V} = 7\,\text{V}$$
 
-By Ohm's law:
+KCL says the same current passes through the transistor and the load (it's a series path). Power in the transistor:
 
-$$R = \frac{V_R}{I} = \frac{1.3\,\text{V}}{0.005\,\text{A}} = 260\,\Omega$$
+$$P = V_{drop} \cdot I = 7\,\text{V} \times 0.5\,\text{A} = 3.5\,\text{W}$$
 
-The nearest standard E24 value is $270\,\Omega$, giving:
+The efficiency is:
 
-$$I = \frac{1.3}{270} \approx 4.8\,\text{mA}$$
+$$\eta = \frac{P_{out}}{P_{in}} = \frac{V_{out}}{V_{in}} = \frac{5}{12} \approx 42\%$$
 
-This is exactly the calculation embedded in GPIO LED driver documentation and device tree LED node properties. Get it wrong and you either starve the LED (too dim) or exceed the SoC's GPIO current rating.
-
-### Resistor Current Sources and Their Power Cost
-
-An LM317 voltage regulator holds exactly $V_{ref} = 1.25\,\text{V}$ between its output and adjust pins. Placing a resistor $R$ between those pins forces a fixed current regardless of load:
-
-$$I = \frac{V_{ref}}{R} = \frac{1.25}{R}$$
-
-For $I = 10\,\text{mA}$:
-
-$$R = \frac{1.25}{0.010} = 125\,\Omega \implies \text{use } 124\,\Omega \text{ (E96 series)}$$
-
-The power cost is real. If the supply is $12\,\text{V}$ and the load drops $2\,\text{V}$, the LM317 itself dissipates:
-
-$$P_{LM317} = (V_{supply} - V_{load} - V_{ref}) \cdot I = (12 - 2 - 1.25) \times 0.010 = 87.5\,\text{mW}$$
-
-That heat must go somewhere — the LM317 package thermal resistance $\theta_{JA} \approx 50\,°\text{C/W}$ in free air means a junction temperature rise of about $4.4\,°\text{C}$ above ambient for this load, which is manageable, but scale to 100 mA and you need a heatsink.
-
----
-
-## Linux Connection
-
-### Pull-up Resistors and GPIO State
-
-Every GPIO pin configured as input must be tied to a defined voltage when floating, or the Linux input subsystem reads metastable garbage. A pull-up resistor connects the pin to $V_{cc}$; when the pin is driven low externally (e.g., by a button to GND), the current through the pull-up is:
-
-$$I_{pullup} = \frac{V_{cc}}{R_{pullup}}$$
-
-For a $3.3\,\text{V}$ rail with a $10\,\text{k}\Omega$ internal pull-up:
-
-$$I = \frac{3.3}{10000} = 330\,\mu\text{A}$$
-
-This current flows continuously as long as the pin is held low. On a design with 64 such pins all held low simultaneously:
-
-$$P = 64 \times 3.3\,\text{V} \times 330\,\mu\text{A} \approx 69.7\,\text{mW}$$
-
-That is not negligible on a battery-powered embedded system. Linux exposes pull configuration through the `gpiolib` character device interface. Using `libgpiod`:
-
-```bash
-# Read pin 17 with pull-up bias enabled
-gpioget --bias=pull-up gpiochip0 17
-
-# Read pin 18 with pull-down bias enabled
-gpioget --bias=pull-down gpiochip0 18
-
-# Set pin 17 as output
+The remaining 58% is heat. This is intrinsic to the linear topology — you cannot improve it without changing $V

@@ -12,7 +12,11 @@ resources:
 
 ## Why This Matters
 
-When a CPU writes to a memory-mapped register, the write is a voltage edge propagating down a PCB trace at finite speed into a load with finite impedance. If that load is mismatched, the edge reflects back toward the driver. If two address lines run parallel for 10 cm, switching one couples energy into the other. If the decoupling capacitor for a DDR PHY is on the wrong side of the board, the inductance of the via cancels its effect at 1 GHz. These failures show up as: a driver that works on rev A hardware but not rev B, a device that passes at room temperature but fails at 85°C, a PCIe link that trains at Gen2 but not Gen3. The Linux kernel contains `udelay()`, `rmb()`, `writel_relaxed()`, and `__iomem` annotations not as defensive programming but because specific hardware behaviors — propagation delay, write-buffer reordering, metastability windows — demand them. Understanding what the hardware physically does is what makes those primitives legible.
+Digital logic works because voltages represent bits — but voltages are physical quantities riding on physical wires, and physics imposes hard constraints. A signal traveling down a PCB trace or cable propagates as an electromagnetic wave. When that wave hits an impedance discontinuity — a connector, a via, a mismatched terminator — part of it reflects. The reflected wave superimposes on incoming signals, corrupting logic levels. Adjacent wires couple energy into each other, clocks radiate into neighboring nets, and ground planes develop voltage gradients that shift the reference every circuit depends on.
+
+These effects are negligible at 1 MHz and catastrophic at 1 GHz — because the physical wavelength at 1 GHz in FR4 is roughly 15 cm, which is comparable to trace lengths on a real board. At that point, lumped-circuit assumptions break down entirely.
+
+Modern Linux systems sit on hardware where this matters daily: DDR5 memory buses run at 4800–6400 MT/s, PCIe 5.0 runs at 32 GT/s per lane, and USB 3.2 Gen 2×2 hits 20 Gbps. When signal integrity fails, the kernel doesn't receive a tidy error — it gets bit flips, CRC failures, enumeration timeouts, or silent data corruption. Understanding the physics explains why the kernel and hardware both implement the mitigations they do.
 
 ---
 
@@ -20,97 +24,82 @@ When a CPU writes to a memory-mapped register, the write is a voltage edge propa
 
 ### Transmission Lines
 
-Any conductor carrying a signal whose wavelength is comparable to or shorter than the conductor length must be treated as a **transmission line** — a distributed structure characterized by inductance per unit length $L'$ (H/m) and capacitance per unit length $C'$ (F/m). A PCB trace is not a wire with resistance; it is a transmission line at frequencies above roughly:
-
-$$f_{critical} \approx \frac{v}{10 \cdot \ell}$$
-
-where $v$ is propagation velocity and $\ell$ is trace length. For a 10 cm trace on FR4 this is approximately 150 MHz — well within DDR4, PCIe, USB3, and MIPI signaling rates.
-
-**Characteristic impedance** is the voltage-to-current ratio for a forward-traveling wave:
+Any two conductors carrying a signal and its return path form a transmission line: a PCB trace over a ground plane, a coaxial cable, a twisted pair. The critical quantity is **characteristic impedance** $Z_0$, determined entirely by geometry:
 
 $$Z_0 = \sqrt{\frac{L'}{C'}}$$
 
-$Z_0$ depends only on geometry, not on line length. For a PCB microstrip (trace over ground plane):
+where $L'$ is inductance per unit length (H/m) and $C'$ is capacitance per unit length (F/m). $Z_0$ is not a function of frequency (for lossless lines) and is not the same as DC resistance — it is the ratio of voltage to current for a wave traveling in one direction. Standard coax and controlled-impedance PCB traces target $Z_0 = 50\,\Omega$. Differential pairs (USB, PCIe, LVDS) target $Z_{0,\text{diff}} = 100\,\Omega$, which is simply $2 \times 50\,\Omega$ for each trace in the pair referenced to ground.
 
-$$Z_0 \approx \frac{87}{\sqrt{\epsilon_r + 1.41}} \ln\left(\frac{5.98 h}{0.8 w + t}\right)$$
+Signals propagate at a velocity set by the dielectric:
 
-where $h$ is the dielectric thickness, $w$ is trace width, $t$ is trace thickness, and $\epsilon_r$ is the dielectric constant. Narrower trace or thicker dielectric → higher $Z_0$. Wider trace or thinner dielectric → lower $Z_0$. This is why controlled-impedance PCBs specify trace widths and stackup precisely: a 6 mil trace on a 4 mil dielectric with $\epsilon_r = 4.2$ hits 50 Ω, but 5 mil on the same stackup is 58 Ω.
+$$v_p = \frac{c}{\sqrt{\varepsilon_r}}$$
 
-**Propagation velocity** is set by the dielectric, not the conductor:
+FR4 PCB material has $\varepsilon_r \approx 4$, giving $v_p \approx c/2 \approx 15\,\text{cm/ns}$. The propagation delay per unit length is therefore:
 
-$$v = \frac{c}{\sqrt{\epsilon_r}}$$
+$$t_{pd} = \frac{1}{v_p} = \frac{\sqrt{\varepsilon_r}}{c} \approx 67\,\text{ps/cm}$$
 
-On FR4 ($\epsilon_r \approx 4.2$), $v \approx 1.46 \times 10^8$ m/s, so signals travel roughly **15 cm/ns**. A 30 cm trace between a CPU and a DDR4 DIMM slot introduces approximately 2 ns of propagation delay — relevant when the memory interface runs at 3200 MT/s and the setup window is under 100 ps.
+A 30 cm trace introduces approximately 2 ns of delay. When a DDR5 clock period is $1/3200\,\text{MHz} \approx 312\,\text{ps}$, that 2 ns delay is more than six clock cycles and must be accounted for in timing closure. This is why DDR layout rules enforce matched trace lengths on address and data lines to within tens of mils.
 
 ### Reflections
 
-At any impedance discontinuity — a connector, a via, a stub, an unterminated load — the wave partially reflects. The **reflection coefficient** at a load $Z_L$ on a line of impedance $Z_0$ is:
+When a traveling wave reaches a load impedance $Z_L \neq Z_0$, continuity of voltage and current at the junction forces a reflected wave. The amplitude of the reflected wave relative to the incident wave is:
 
 $$\Gamma = \frac{Z_L - Z_0}{Z_L + Z_0}$$
 
-The transmitted fraction is $1 + \Gamma = \frac{2Z_L}{Z_L + Z_0}$.
+The transmitted wave amplitude is $1 + \Gamma$. The consequences are direct:
 
-Boundary cases are exact, not approximate:
-
-| Load condition | $\Gamma$ | Consequence |
+| Load condition | $\Gamma$ | Effect |
 |---|---|---|
-| $Z_L = Z_0$ | $0$ | No reflection; all energy absorbed |
-| $Z_L \to \infty$ (open) | $+1$ | Full reflection; voltage doubles at the open end |
-| $Z_L = 0$ (short) | $-1$ | Full reflection with polarity inversion |
-| $Z_L = 2Z_0$ | $+1/3$ | Partial reflection; first overshoot is 33% of incident amplitude |
+| $Z_L = Z_0$ (matched) | $0$ | No reflection |
+| $Z_L = \infty$ (open circuit) | $+1$ | Full reflection; voltage at the open end doubles |
+| $Z_L = 0$ (short circuit) | $-1$ | Full reflection; voltage inverts |
+| $Z_L = 25\,\Omega$ | $-1/3$ | Partial reflection; voltage dips by one third |
 
-The doubling at an open end is not an approximation — it follows directly from the boundary condition that current must be zero at an open, so the reflected wave must have the same polarity as the incident wave to cancel the current. This is why an unterminated DDR data line can briefly see $2 \times V_{DD}$ — which can exceed the absolute maximum rating of the IO cell.
+An unconnected stub — say, a via that was drilled but not connected, or a connector pin with no device attached — presents an open circuit. The incident wave reflects at $\Gamma = +1$, the total voltage at that node briefly doubles, and the reflected wave travels back toward the source. If the source is also mismatched, it re-reflects, and the signal rings. A 3.3 V signal can momentarily reach 6 V at an open via. That voltage spike can exceed the absolute maximum ratings of an input buffer.
 
-Multiple reflections produce ringing. The settling time depends on both $\Gamma$ values (load and source) and the round-trip delay $T_{RT} = 2\ell / v$. For a CMOS output with $Z_S \approx 10\ \Omega$ driving a 50 Ω trace with an open-circuit input ($\Gamma_L = +1$):
+The time for a reflection to travel the round trip on a trace of length $l$ is:
 
-$$\Gamma_S = \frac{10 - 50}{10 + 50} = -\frac{2}{3}$$
+$$t_{\text{round trip}} = \frac{2l}{v_p}$$
 
-The signal bounces with alternating-sign reflections of amplitude $\Gamma_L \Gamma_S = -2/3$ per round trip, eventually settling. Each bounce takes $T_{RT}$; the signal may not be valid until 3–4 round trips have decayed, which is why adding a series termination resistor ($R_S = Z_0 - Z_{driver}$) near the source is the standard fix: it makes $\Gamma_S = 0$ at the source, eliminating re-reflection after the first round trip.
+If the source rise time is shorter than $t_{\text{round trip}}$, the line must be treated as a transmission line — the reflection arrives back at the source before the edge has settled, causing visible ringing. The threshold is roughly:
 
-The input impedance of a lossless transmission line of length $\ell$ is:
+$$l_{\text{critical}} \approx \frac{v_p \cdot t_r}{2}$$
 
-$$Z_{in} = Z_0 \cdot \frac{Z_L + jZ_0 \tan(\beta \ell)}{Z_0 + jZ_L \tan(\beta \ell)}, \quad \beta = \frac{2\pi}{\lambda}$$
+where $t_r$ is the signal rise time. A 200 ps rise time on FR4 gives $l_{\text{critical}} \approx 1.5\,\text{cm}$ — shorter than many PCB traces on a modern board.
 
-Special cases:
+### Transmission Line Input Impedance
 
-| Length | Load | $Z_{in}$ |
-|---|---|---|
-| $\lambda/4$ | $Z_L$ | $Z_0^2 / Z_L$ (impedance inverter) |
-| $\lambda/2$ | $Z_L$ | $Z_L$ (transparent) |
-| $\lambda/4$ | short | $\infty$ (open at the input) |
-| $\lambda/4$ | open | $0$ (short at the input) |
+A mismatched line of length $l$ presents an input impedance that is a function of frequency:
 
-The $\lambda/4$ transformer is used in RF matching networks and in PCB PDN (power delivery network) stubs deliberately cut to resonate at a noise frequency.
+$$Z_{\text{in}} = Z_0 \frac{Z_L + jZ_0 \tan\!\left(\frac{2\pi l}{\lambda}\right)}{Z_0 + jZ_L \tan\!\left(\frac{2\pi l}{\lambda}\right)}$$
 
-### Skin Effect and Signal Loss
+Four cases worth knowing cold:
 
-At DC, current fills a conductor uniformly. At AC, the magnetic field generated by the current itself pushes it toward the surface — the **skin effect**. The skin depth is:
+- **Quarter-wave transformer** ($l = \lambda/4$, $\tan \to \infty$): $Z_{\text{in}} = Z_0^2 / Z_L$. A short circuit becomes an open circuit. A 50 Ω line with a short at the end looks like an open at its input — infinite impedance at that frequency. This is the principle behind quarter-wave stubs used as RF chokes.
+- **Half-wave line** ($l = \lambda/2$): $Z_{\text{in}} = Z_L$. The input impedance equals the load, regardless of $Z_0$. The line is invisible at this frequency.
+- **Short open stub** ($l \ll \lambda$, open end): $Z_{\text{in}} \approx -j/(\omega C' l)$ — purely capacitive. A 1 cm unpopulated component pad at 1 GHz looks like a capacitor and introduces a reflection.
+- **Short shorted stub** ($l \ll \lambda$, shorted end): $Z_{\text{in}} \approx j\omega L' l$ — purely inductive. A via through a PCB layer looks like a series inductor; its inductance is typically 0.5–1 nH, which at 1 GHz is $j3\,\Omega$ to $j6\,\Omega$ — enough to cause measurable reflections on a 50 Ω system.
 
-$$\delta = \sqrt{\frac{2\rho}{\omega \mu}} = \frac{1}{\sqrt{\pi \sigma \mu f}}$$
+These arise accidentally everywhere in hardware: connector pins, test points, via stubs, unpopulated resistor pads. High-speed PCB designs back-drill vias to remove the stub below the signal layer.
 
-For copper ($\sigma = 5.8 \times 10^7$ S/m, $\mu \approx \mu_0$):
+### Skin Effect and Lossy Lines
 
-$$\delta_{Cu} \approx \frac{66\ \text{mm}}{\sqrt{f\ [\text{Hz}]}}$$
+Real conductors attenuate signals, and the attenuation is frequency-dependent. AC current does not distribute uniformly through a conductor — it concentrates in a surface layer. The skin depth is:
 
-| Frequency | Skin depth in copper |
-|---|---|
-| 1 MHz | 66 µm |
-| 100 MHz | 6.6 µm |
-| 1 GHz | 2.1 µm |
-| 10 GHz | 0.66 µm |
+$$\delta = \sqrt{\frac{1}{\pi \sigma \mu f}}$$
 
-A 1 oz copper trace (35 µm thick) carries current through its full thickness at 1 MHz but through only 2 µm of surface layer at 10 GHz. The effective cross-sectional area shrinks, so resistance increases as $\sqrt{f}$. Attenuation in dB/m scales as $\sqrt{f}$, which means **quadrupling the data rate doubles the dB loss per unit length**. This is the dominant reason 100G SerDes links require equalization (FFE/CTLE/DFE) while 1G links do not: the high-frequency components of the bit transitions arrive attenuated relative to the low-frequency content, closing the eye.
+where $\sigma$ is conductivity (S/m), $\mu$ is permeability (H/m), and $f$ is frequency. For copper ($\sigma = 5.8 \times 10^7\,\text{S/m}$):
 
-Dielectric loss adds a second mechanism. The imaginary part of $\epsilon_r$ (loss tangent $\tan\delta$) causes energy absorption that scales linearly with $f$, not $\sqrt{f}$. At 28 GHz and above, dielectric loss dominates over skin-effect loss, which is why 400G/800G designs use low-loss laminates (Megtron 6, PTFE-based) rather than standard FR4.
+$$\delta_{\text{Cu}} \approx \frac{66\,\text{mm}}{\sqrt{f\,[\text{Hz}]}}$$
+
+At 1 GHz, $\delta \approx 2\,\mu\text{m}$. A typical PCB trace is 35 µm thick — the current occupies only the top 2 µm. Since the effective conducting cross-section shrinks proportionally to $\delta$, resistance scales as $1/\delta \propto \sqrt{f}$. Attenuation in dB therefore scales as $\sqrt{f}$: doubling the frequency increases loss by a factor of $\sqrt{2} \approx 1.41$, so a trace with 3 dB loss at 1 GHz has approximately 6 dB loss at 4 GHz.
+
+The consequence: a fast digital edge contains high-frequency harmonics. Those harmonics are attenuated more than the fundamental, so the edge slows down as it travels. A 50 ps rise time at the transmitter can become a 200 ps rise time at the receiver after 10 cm of trace. This is **dispersion**, and it is why high-speed serial links (PCIe, SATA, USB 3.x) require equalization — the receiver boosts high-frequency content to compensate, using either a passive CTLE (Continuous Time Linear Equalizer) or an active DFE (Decision Feedback Equalizer) in silicon.
 
 ### Crosstalk
 
-Two adjacent parallel conductors share mutual inductance $M$ and mutual capacitance $C_m$. When the aggressor switches, it induces noise on the victim through both:
+Two parallel signal lines couple energy through mutual capacitance $C_m$ (F/m) and mutual inductance $M$ (H/m). The coupled current and voltage are:
 
-$$V_{inductive} = M \frac{dI_a}{dt}, \qquad I_{capacitive} = C_m \frac{dV_a}{dt}$$
+$$i_{\text{cap}} = C_m \cdot \frac{dV}{dt}, \qquad v_{\text{ind}} = M \cdot \frac{dI}{dt}$$
 
-These two mechanisms produce noise components that travel in both directions on the victim. On a PCB (a non-TEM structure), the forward and backward coupling are not equal. The **backward crosstalk coefficient** (NEXT) is:
-
-$$K_b = \frac{1}{4}\left(\frac{C_m}{C'} + \frac{M}{L'}\right) T_{RT}$$
-
-where $T_{RT}$ is the coupled-region round-trip time. NEXT amplitude grows until the aggressor edge has traversed the full coupled length; after that it saturates at $K_b$ and holds for one round-trip time. **Forward crosstalk (FEXT)** on a homogeneous line is zero if $M/L' = C_m/C'$ (which holds for a perfectly embedded stripline in a uniform dielectric). In microstrip, the asymmetry in field distribution between the conductor side and the air
+Capacitive coupling injects a current pulse into the victim with the same polarity on both ends. Inductive coupling induces a voltage with opposite polarity at each end. When the two mechanisms add in the same direction on the near end and subtract on the far end (or vice versa

@@ -12,7 +12,7 @@ resources:
 
 ## Why This Matters
 
-When two separately compiled object files link together, they share no source-level context — the linker sees only symbols and relocations. A calling convention is the binary contract that makes interoperation possible: it specifies exactly which register holds the first argument, which registers the callee must preserve, and where the return address lives. Violate it in one function and the rest of the program silently computes garbage, because the CPU has no notion of "argument" or "return" — it only executes instructions. The stack is not merely convenient storage; it is the mechanism that gives recursion its semantics. Without per-call save/restore of `$ra`, each recursive invocation would overwrite the previous return address and the call chain would collapse to a single level. Every tool that reconstructs call chains — `gdb` backtraces, `perf record`, Linux's `DWARF` unwinder, `libunwind` — depends on these conventions being followed precisely and consistently.
+Every `SIGSEGV` from a corrupted stack, every `gdb` backtrace you've read, every ROP gadget in a CVE write-up — these trace back to one mechanism: the calling convention. It is the contract that lets code compiled by `gcc` call code compiled by `clang`, lets the kernel invoke a user-space signal handler without corrupting the process state, and lets `printf` trust that `$a0` contains a valid pointer. Without it, there is no reliable way to pass arguments, recover register state after a call, or find the return address. This module explains the mechanism, not just the rules.
 
 ---
 
@@ -20,107 +20,135 @@ When two separately compiled object files link together, they share no source-le
 
 ### Arithmetic in Assembly
 
-Each instruction performs exactly one ALU operation with no implicit coercion, no precedence, and no hidden side effects on unrelated state. On MIPS:
+MIPS uses a three-operand register format for all arithmetic:
 
 ```asm
-add  $t0, $t1, $t2    # $t0 = $t1 + $t2  (traps on signed overflow via OverflowException)
-addu $t0, $t1, $t2    # $t0 = $t1 + $t2  (wraps mod 2^32; no trap)
-addi $t0, $t1, 42     # $t0 = $t1 + 42   (16-bit immediate, sign-extended to 32)
-sub  $t0, $t1, $t2    # $t0 = $t1 - $t2  (traps on signed overflow)
-mul  $t0, $t1, $t2    # $t0 = low 32 bits of $t1 * $t2 (high 32 bits discarded)
+add  $t0, $t1, $t2    # $t0 = $t1 + $t2
+sub  $t0, $t1, $t2    # $t0 = $t1 - $t2
+addi $t0, $t1, 42     # $t0 = $t1 + 42  (sign-extended immediate)
 ```
 
-`add` vs `addu` is not about signedness of the operands — both interpret bits identically. The difference is the overflow trap. C compilers emit `addu` for `int` arithmetic because C defines signed integer overflow as undefined behavior; generating a trap would be valid, but silently wrapping is cheaper and the standard does not require the trap. The compiler is exploiting the UB license, not making a correctness guarantee.
+The three-operand design makes every read and every write explicit — no implicit source/destination aliasing. This simplifies both hardware (the register file has three ports: two read, one write) and compiler dataflow analysis.
 
-For multiplication, the full 64-bit product goes into the `HI:LO` register pair; `mul` is a pseudoinstruction that discards `HI`. If you need the high word — for example, to implement 64-bit multiply on a 32-bit machine — you use `mult` and then `mfhi`/`mflo`:
+Contrast with x86's two-operand form: `add eax, ebx` encodes `eax = eax + ebx`, destroying one source. This compresses the instruction encoding but forces compilers to emit extra `mov` instructions to preserve values. The tradeoff is encoding density vs. dataflow clarity.
 
-```asm
-mult $t1, $t2         # HI:LO = $t1 * $t2 (signed 64-bit product)
-mflo $t0              # $t0 = low 32 bits
-mfhi $t3              # $t3 = high 32 bits
-```
+**Overflow is not uniform.** `add` triggers a trap on signed overflow; `addu` silently wraps modulo $2^{32}$. The C compiler emits `addu` for `unsigned int` arithmetic and `add` for `int`, because the C standard defines unsigned overflow as well-defined wrap-around and signed overflow as undefined behavior.
 
-The full 64-bit product satisfies $t_1 \times t_2 = \texttt{HI} \cdot 2^{32} + \texttt{LO}$.
+For a 32-bit signed addition, the overflow condition is:
 
-### Branches and Jumps
+$$\text{overflow} \iff (a > 0 \land b > 0 \land s < 0) \lor (a < 0 \land b < 0 \land s \geq 0)$$
 
-MIPS has no flags register. There is no carry bit, no zero bit, no negative bit updated as a side effect of every instruction. Instead, comparisons write a boolean integer into a general-purpose register, which a branch then tests:
+where $s = a + b$ computed in 32-bit arithmetic. The hardware detects this by checking whether the carry into the sign bit differs from the carry out of it.
+
+### Branches and Control Flow
+
+MIPS branches compare two registers directly:
 
 ```asm
 beq  $t0, $t1, label  # branch if $t0 == $t1
 bne  $t0, $t1, label  # branch if $t0 != $t1
-slt  $t2, $t0, $t1    # $t2 = ($t0 < $t1) ? 1 : 0   (signed)
-sltu $t2, $t0, $t1    # same, unsigned comparison
-bne  $t2, $zero, label
-j    label             # unconditional jump (PC-relative 26-bit target)
-jr   $ra               # jump to address in $ra (used for return)
-jal  target            # $ra = PC+4; jump to target (call)
+slt  $t2, $t0, $t1    # $t2 = ($t0 < $t1) ? 1 : 0
+bne  $t2, $zero, label # branch on that boolean
 ```
 
-The regularity pays off in pipeline design: the branch decision always comes from a register comparison, never from implicit flag state written several instructions earlier. The cost is one extra instruction for any `<` branch. For a tight inner loop that branches on a less-than condition, this extra `slt` adds measurable overhead; x86's flag-based branches avoid this at the cost of making out-of-order flag dependencies more complex to track.
+`slt` exists because a single compare-and-branch-less-than instruction would need to encode three register fields plus a branch target — too many bits for a 32-bit instruction word. MIPS resolves this by materializing the boolean into a general-purpose register, then branching on zero/non-zero. This is a direct consequence of the fixed-width instruction constraint:
 
-The branch offset is encoded as a signed 16-bit word offset from `PC+4`, giving a reach of $\pm 2^{15}$ instructions $= \pm 131072$ bytes. `j` uses a 26-bit word address, reaching any target in the same 256 MB region as the instruction. When neither suffices, the assembler synthesizes a longer sequence.
+$$32 \text{ bits} = 6 \text{ (opcode)} + 5 \text{ (rs)} + 5 \text{ (rt)} + 16 \text{ (immediate/offset)}$$
+
+There is no room for a third register operand and a branch offset simultaneously.
+
+x86 avoids this by writing condition codes into `EFLAGS` as a side effect of arithmetic, then testing flags in a separate `jcc` instruction. The cost is implicit state: the flags belong to no named register, so any intervening instruction that modifies `EFLAGS` silently invalidates a pending branch condition. Compilers handle this carefully; humans debugging assembly often do not.
+
+`jr $ra` — jump to the address held in `$ra` — is the universal procedure return. There is no dedicated `ret` instruction in MIPS; `jr $ra` makes the mechanism explicit.
 
 ### The Stack
 
-The stack grows **downward**: higher addresses are older frames, lower addresses are newer ones. `$sp` points to the **last used** word — the current top of the stack — not to the next free slot. The invariant:
+The stack is a LIFO region of memory with one defining property: **it grows toward lower addresses**. On MIPS:
 
-$$\text{push: } sp_{\text{new}} = sp_{\text{old}} - 4N, \quad \text{then store at } [sp_{\text{new}}]$$
+$$\text{push:} \quad sp \leftarrow sp - 4, \quad M[sp] \leftarrow \text{value}$$
 
-$$\text{pop: } \text{load from } [sp_{\text{old}}], \quad \text{then } sp_{\text{new}} = sp_{\text{old}} + 4N$$
+$$\text{pop:} \quad \text{value} \leftarrow M[sp], \quad sp \leftarrow sp + 4$$
 
-This ordering is not stylistic. Storing before decrementing leaves a window where an interrupt or signal handler that uses the stack could corrupt the value you just wrote, because `$sp` still points above it and the handler considers that space free. Decrement first, then store — the value is always below `$sp` and therefore protected.
+The reason for downward growth is address space layout: historically, the heap was placed at the low end of the virtual address space and the stack at the high end, growing toward each other. The collision point — stack pointer meets program break — is detectable and signals exhaustion. Linux preserves this layout exactly. On a 64-bit process, the stack starts just below `0x7fffffffffff` and grows down; the heap starts above the BSS segment and grows up via `brk(2)`.
 
-The stack exists because the register file is finite. MIPS has 32 registers. Any live value that must survive a function call — and that call uses all available caller-saved registers — must be written to memory. The stack is the designated area for this **register spilling**, because it provides automatic reclamation (restoring `$sp` releases the whole frame) and its LIFO structure matches call/return nesting exactly.
+`$sp` (register 29) points to the **last written word** — the top of the occupied region, not the next free slot. When you allocate a frame of $N$ bytes, you execute `subu $sp, $sp, N`, and the frame occupies $[sp,\ sp+N)$. Individual slots are addressed as `offset($sp)` where $0 \leq \text{offset} < N$.
 
-### The Call/Return Mechanism
+Frame size must remain a multiple of 8 bytes on MIPS (16 bytes on many 64-bit ABIs) to satisfy alignment constraints for double-precision loads/stores. A misaligned `$sp` causes an address exception on the first 64-bit memory access.
 
-`jal target` atomically sets `$ra = PC + 4` and jumps to `target`. "Atomically" here means in one pipeline stage — there is no intermediate state where `$ra` is updated but the jump has not happened, which matters for interrupt safety. `jr $ra` returns by treating the register contents as a jump target.
+### The Activation Record
 
-The return address `$ra` is an ordinary register. A leaf function (one that issues no `jal`) can return without touching the stack. A non-leaf must save `$ra` before its first `jal`, because that instruction overwrites `$ra` unconditionally. The requirement cascades: saving `$ra` means writing it to the stack, which requires having already allocated a frame.
+Every procedure invocation owns a contiguous slice of the stack called its **activation record** (or stack frame). It must hold:
+
+1. The return address (`$ra`), if this procedure makes any call
+2. Any caller-saved registers the caller wants preserved across the call
+3. Any callee-saved registers this procedure modifies
+4. Local variables that don't fit in registers
+5. Outgoing arguments beyond the first four (which go in `$a0–$a3`)
+
+```
+Higher addresses
+  ┌──────────────────┐  ← caller's $sp before call
+  │  caller's frame  │
+  ├──────────────────┤
+  │  saved $ra       │  ← $fp (if frame pointer used)
+  │  saved $fp       │
+  │  saved $s0–$s7   │  (only those this function modifies)
+  │  local variables │
+  │  arg 5, arg 6…   │  (spilled outgoing args, if any)
+  └──────────────────┘  ← $sp  (after subu $sp, $sp, N)
+Lower addresses
+```
+
+The **frame pointer** `$fp` (register 30) holds the value of `$sp` at function entry and does not change for the life of the call. Its purpose is stability: if a function uses `alloca(3)` or a variable-length array, `$sp` moves during execution, making `$sp`-relative offsets for locals non-constant. With `$fp` fixed, every local has a constant offset regardless of dynamic allocation. Compilers omit `$fp` when no dynamic allocation occurs (controlled by `-fomit-frame-pointer`), recovering one general-purpose register.
 
 ### Calling Conventions
 
-The MIPS O32 convention assigns specific roles to every register:
+The MIPS O32 calling convention divides registers into caller-saved and callee-saved, assigning responsibility based on who loses if the value is clobbered:
 
-| Class | Registers | Who is responsible |
-|---|---|---|
-| Arguments | `$a0–$a3` | Caller places args; values undefined after call |
-| Return values | `$v0–$v1` | Callee places result |
-| Caller-saved temporaries | `$t0–$t9` | Callee may destroy freely; caller saves if needed |
-| Callee-saved | `$s0–$s7` | Callee must save before use and restore before return |
-| Return address | `$ra` | Callee saves if it issues any `jal` |
-| Stack pointer | `$sp` | Callee must restore to entry value before return |
-| Frame pointer | `$fp` / `$s8` | Callee-saved; optional but required if `$sp` moves mid-function |
-| Global pointer | `$gp` | Points to the middle of the global data segment; callee-saved |
+| Register | Name | Saver | Purpose |
+|---|---|---|---|
+| `$a0–$a3` | Arguments | Caller | First 4 integer arguments |
+| `$v0–$v1` | Values | — | Return value(s) |
+| `$t0–$t9` | Temporaries | Caller | Scratch; callee may overwrite |
+| `$s0–$s7` | Saved | Callee | Must survive any call |
+| `$ra` | Return address | Callee (non-leaf) | Set by `jal`; must be saved before recursive call |
+| `$sp` | Stack pointer | Both | Must equal entry value on return |
+| `$fp` | Frame pointer | Callee | Stable base when used |
 
-The caller-saved/callee-saved split is a performance contract. Callee-saved registers (`$s0–$s7`) let the compiler allocate long-lived variables there and issue calls without generating save/restore code around every call site — the callee guarantees preservation. Caller-saved registers (`$t0–$t9`) give the callee free scratch space without overhead — but the caller must save them if their values are needed after a call, and often they are not, so no save is needed at all. The split is tuned so that the common case generates minimal memory traffic.
+**Caller-saved** means: if the caller needs `$t3` after a `jal`, the caller saves it before the call and restores it after. The callee makes no promise.
 
-Arguments 5 and beyond go on the stack at `$sp + 16` through `$sp + 4(N-1)` — the first 16 bytes of the caller's stack frame are reserved as the **argument home area** even for the first four arguments, which lets a callee that takes its own address (or uses varargs) spill `$a0–$a3` there without needing to know the caller's layout.
+**Callee-saved** means: if the callee wants to use `$s2`, it saves `$s2` at entry and restores it before returning. The caller makes no save/restore effort.
+
+The split exists to minimize unnecessary saves. A leaf function that uses only `$t` registers and never calls anything touches neither `$ra` nor any `$s` register — zero stack traffic for register preservation. A non-leaf function only saves the `$s` registers it actually uses, not all eight.
+
+The fifth and later arguments are placed on the stack at `0($sp)`, `4($sp)`, etc. — allocated by the caller — before the `jal`. The callee reads them from these known offsets.
 
 ---
 
 ## How It Works
 
-### A Leaf Procedure
+### A Concrete Procedure Call: Recursive Factorial
 
-A leaf procedure issues no `jal`, so `$ra` is untouched and no stack frame is needed unless local variables overflow the register file:
-
-```asm
-# int square(int x) { return x * x; }
-# Caller places x in $a0; result returned in $v0.
-square:
-    mul  $v0, $a0, $a0    # $v0 = x * x (low 32 bits)
-    jr   $ra
+```c
+int fact(int n) {
+    if (n <= 0) return 1;
+    return n * fact(n - 1);
+}
 ```
 
-Zero stack operations. The function is three bytes of machine code on a 32-bit MIPS. Any optimization that avoids a stack frame pays off in tight loops — one `subu`/`addiu` pair per call saves two memory operations plus the latency of the cache hit.
-
-### A Non-Leaf Procedure: Factorial
-
-`fact(n)` calls itself, so the `jal fact` inside the body will overwrite `$ra`. It also needs `n` after the recursive call returns, but `$a0` is caller-saved — the recursive call is free to destroy it. Both `$ra` and `$a0` must be spilled:
+This is non-leaf: it calls itself, which means `jal` will overwrite `$ra`, and the recursive call will overwrite `$a0`. Both must be saved before the call.
 
 ```asm
-# int fact(int n) { return n <= 1 ? 1 : n * fact(n-1); }
 fact:
-    subu  $sp, $sp
+        subu  $sp, $sp, 24      # allocate 24-byte frame (8-byte aligned, room for $ra + $a0)
+        sw    $ra, 20($sp)       # save return address — jal will overwrite it
+        sw    $a0, 16($sp)       # save n — recursive call will overwrite $a0
+
+        # base case: if n <= 0, return 1
+        bgt   $a0, $zero, recurse
+        li    $v0, 1
+        j     done
+
+recurse:
+        subu  $a0, $a0, 1        # $a0 = n - 1
+        j

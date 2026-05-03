@@ -12,119 +12,150 @@ resources:
 
 ## Why This Matters
 
-Every real circuit has multiple interconnected nodes, and predicting what voltage or current appears where requires a systematic method. Without nodal or mesh analysis you are reduced to guessing or simulating blindly. Without Thévenin and Norton equivalents you cannot reason about how adding a load *changes* a circuit — which means you cannot predict whether a GPIO pin will sink enough current to drive an LED, whether a sensor's output will sag when you connect it to a microcontroller input, or whether two cascaded filter stages will interact destructively. These theorems let you collapse an arbitrarily complex sub-circuit into a single source and a single resistor, after which every load interaction reduces to a voltage divider.
+Every circuit you will ever analyze — from a voltage divider biasing a transistor to the output impedance of a signal driver — is a network of sources and impedances. Systematic methods matter because circuit topology alone does not tell you voltages or currents; you need a disciplined way to write equations that a solver — human or machine — can resolve unambiguously.
+
+Thévenin and Norton equivalents matter for a specific reason: they let you separate a source network from its load and reason about each independently. When you connect a sensor to an ADC input, a driver to a transmission line, or a bench meter to a resistive divider, the load perturbs the source. Thévenin analysis makes that perturbation exact and predictable rather than a surprise.
 
 ---
 
 ## Core Concepts
 
-### Nodal Analysis
+### Nodes and Kirchhoff's Current Law (KCL)
 
-Every junction where two or more components meet is a **node**. Nodal analysis applies Kirchhoff's Current Law (KCL) at each node: the algebraic sum of currents leaving a node is zero. This is not a convention — it is a statement that charge cannot accumulate at a node in DC steady state, because if it did, the node voltage would be changing.
+A **node** is any point where two or more elements share a terminal. KCL states that the algebraic sum of currents at a node is zero — a direct consequence of charge conservation; charge cannot accumulate at an ideal node.
 
-You assign a voltage variable to each unknown node referenced to ground, express each branch current as $(V_n - V_k)/R_{nk}$, and solve the resulting linear system. For a node $n$ connected to $K$ other nodes and driven by net injected current $I_n$:
+Choose one node as reference (ground, 0 V). Every other node gets one KCL equation whose unknown is the node voltage. For a circuit with $N$ total nodes, you write $N-1$ equations in $N-1$ unknowns.
 
-$$\sum_{k=1}^{K} \frac{V_n - V_k}{R_{nk}} = I_n$$
+The standard KCL stamp for a resistor between nodes $n$ and $k$:
 
-$N$ unknown nodes yield $N$ equations. The method scales directly to matrix form, which is exactly what SPICE-family simulators do internally.
+$$\frac{V_n - V_k}{R_{nk}}$$
 
-### Mesh Analysis
+contributes $+G_{nk}$ to row $n$, column $n$ of the conductance matrix and $-G_{nk}$ to row $n$, column $k$, where $G_{nk} = 1/R_{nk}$. This mechanical stamping is exactly what SPICE does.
 
-A **mesh** is a loop in a planar circuit that contains no smaller loops. Mesh analysis applies Kirchhoff's Voltage Law (KVL): the sum of voltage drops around any closed loop is zero, because voltage is a path-independent potential and you return to the starting point. You assign a circulating current $I_m$ to each mesh; shared branches carry the algebraic difference of their two mesh currents.
+### Meshes and Kirchhoff's Voltage Law (KVL)
 
-$$\sum_{k} R_{mk} \cdot I_k = V_{\text{source},m}$$
+A **mesh** is a loop in a planar circuit that encloses no smaller loops. KVL states that the sum of voltage drops around any closed loop is zero — conservation of energy; a charge carrier returning to its starting point cannot have net work done on it.
 
-Mesh analysis is preferable when a circuit has many series components and few loops. Nodal analysis is preferable when there are many parallel branches or current sources. Both produce the same answer; the choice is computational convenience.
+Each mesh gets one assigned circulating current. Shared branches carry the algebraic difference of adjacent mesh currents. For $M$ independent meshes you write $M$ equations.
+
+$$\sum_{k} V_k = 0 \quad \text{around any closed loop}$$
+
+### Choosing Nodal vs. Mesh
+
+The choice is computational, not philosophical:
+
+- **Nodal**: fewer equations when nodes $\ll$ meshes; preferred when you need node voltages directly; handles current sources trivially (they appear as known RHS terms).
+- **Mesh**: fewer equations when meshes $\ll$ nodes; handles voltage sources trivially (they appear as known loop voltages).
+
+A voltage source between two non-reference nodes in nodal analysis creates a **supernode** — treat the two nodes as one unit, write their KCL together with the constraint $V_a - V_b = V_s$.
 
 ### Thévenin's Theorem
 
-Any linear two-terminal network — regardless of how many resistors, independent sources, and dependent sources it contains — is externally equivalent to a single voltage source $V_T$ in series with a single resistance $R_T$.
+Any linear two-terminal network — regardless of internal complexity — presents to an external load exactly as a single voltage source $V_T$ in series with a resistance $R_T$. Linearity is the prerequisite; superposition must hold.
 
-- $V_T = V_{OC}$: the open-circuit voltage across the terminals with no load attached.
-- $R_T$: the resistance seen looking back into the terminals with all **independent** sources killed — voltage sources replaced by short circuits (their internal resistance is zero), current sources replaced by open circuits (their internal conductance is zero). Dependent sources are left active; they can only be found by injecting a test source.
+**Procedure:**
+1. **$V_T = V_{OC}$**: Remove the load, measure (or compute) the open-circuit terminal voltage.
+2. **$R_T$**: Kill all independent sources (voltage sources → short circuit, current sources → open circuit). Compute resistance looking into the terminals. If dependent sources are present, you cannot simply kill them — instead, drive the terminals with a test source $V_x$ and measure $I_x$; then $R_T = V_x / I_x$.
 
-This equivalence follows directly from the superposition principle, which holds for any linear network. Because the Thévenin model is linear, it remains valid only as long as the actual network is operating in its linear region — a transistor biased into saturation, for example, breaks the equivalence.
+For the standard 10k–10k voltage divider driven by a stiff 20 V source:
+
+$$V_T = 20 \cdot \frac{10\text{k}}{10\text{k} + 10\text{k}} = 10\ \text{V}$$
+
+$$R_T = R_1 \| R_2 = \frac{10\text{k} \cdot 10\text{k}}{10\text{k} + 10\text{k}} = 5\ \text{k}\Omega$$
+
+The parallel combination arises because with the 20 V source shorted, the two 10 kΩ resistors share a node at each end — they are in parallel from the terminal's perspective.
+
+$$R_1 \| R_2 = \frac{R_1 R_2}{R_1 + R_2}$$
 
 ### Norton's Theorem
 
-The Norton equivalent is the current-source dual of Thévenin:
+The Norton equivalent replaces the same network with a current source $I_N$ in parallel with $R_N = R_T$:
 
-$$I_N = I_{SC}, \qquad R_N = R_T, \qquad V_T = I_N R_N$$
+$$I_N = I_{SC} = \frac{V_{OC}}{R_T} = \frac{V_T}{R_T}$$
 
-$I_{SC}$ is the short-circuit current — what flows when you place a wire directly across the terminals. The Thévenin-to-Norton conversion is a source transformation and carries no new information; use whichever form matches the topology of the downstream circuit (Norton is natural when the load is in parallel, Thévenin when it is in series).
+Norton is preferred when the load connects in parallel with a current source — it avoids the algebraic overhead of converting to series form first.
+
+### Source Transformation
+
+Thévenin and Norton are duals. The conversion is exact and reversible for linear networks:
+
+$$V_T = I_N R_N, \qquad I_N = \frac{V_T}{R_T}, \qquad R_T = R_N$$
+
+Source transformation is useful for circuit simplification: a chain of Thévenin stages can be collapsed left-to-right by repeatedly converting and combining.
 
 ---
 
 ## How It Works
 
-### Nodal Analysis: Worked Example
+### Nodal Analysis: Conductance Matrix Construction
 
-A 20 V source drives two 10 kΩ resistors to ground and one 5 kΩ resistor connecting the two internal nodes $V_1$ and $V_2$. Apply KCL at each node, choosing currents-leaving-equal-zero:
+Consider the following circuit:
 
-At $V_1$:
+```
+          R1            R2
+  N1 ---/\/\/--- N2 ---/\/\/--- N3 (GND = 0 V)
+  |               |
+ I_s             R3
+  |               |
+ GND            GND
+```
 
-$$\frac{V_1 - 20}{10\text{k}} + \frac{V_1}{10\text{k}} + \frac{V_1 - V_2}{5\text{k}} = 0$$
+Unknowns: $V_1$, $V_2$ (N3 is reference).
 
-At $V_2$:
+**KCL at N1** — current injected by source equals current leaving through $R_1$:
 
-$$\frac{V_2 - V_1}{5\text{k}} + \frac{V_2}{10\text{k}} = 0$$
+$$I_s = \frac{V_1 - V_2}{R_1}$$
 
-Multiply through by 10 kΩ to clear denominators (note: $10\text{k}/5\text{k} = 2$):
+**KCL at N2** — current entering from N1 equals current leaving through $R_2$ and $R_3$:
 
-$$\begin{cases} (V_1 - 20) + V_1 + 2(V_1 - V_2) = 0 \\[4pt] 2(V_2 - V_1) + V_2 = 0 \end{cases}$$
+$$\frac{V_1 - V_2}{R_1} = \frac{V_2 - 0}{R_2} + \frac{V_2 - 0}{R_3}$$
 
-$$\begin{cases} 4V_1 - 2V_2 = 20 \\[4pt] -2V_1 + 3V_2 = 0 \end{cases}$$
+Rearranging into conductance matrix form, where $G_k = 1/R_k$:
 
-From the second equation $V_1 = \tfrac{3}{2}V_2$. Substituting:
+$$\begin{bmatrix} G_1 & -G_1 \\ -G_1 & G_1 + G_2 + G_3 \end{bmatrix} \begin{bmatrix} V_1 \\ V_2 \end{bmatrix} = \begin{bmatrix} I_s \\ 0 \end{bmatrix}$$
 
-$$4 \cdot \tfrac{3}{2}V_2 - 2V_2 = 20 \implies 4V_2 = 20 \implies V_2 = 5\text{ V}, \quad V_1 = 7.5\text{ V}$$
+The diagonal entry for node $n$ is the sum of all conductances connected to $n$. The off-diagonal entry $(n, k)$ is the negative of the conductance between nodes $n$ and $k$. This pattern — the **nodal admittance matrix** — applies mechanically to any resistive network and extends directly to AC circuits by replacing $G$ with complex admittance $Y = 1/Z$.
 
-The 5 kΩ coupling resistor transfers current from the higher-potential node to the lower one; its presence pulls $V_1$ down from the 10 V it would be without the coupling path.
+Solving by Cramer's rule:
 
-### Thévenin Equivalent: The Resistive Divider
+$$V_1 = \frac{I_s (G_1 + G_2 + G_3)}{G_1(G_2 + G_3) + G_1 G_1} \quad \text{(expand the determinant)}$$
 
-A 20 V source with a 10 kΩ upper resistor and a 10 kΩ lower resistor to ground. The output terminal is the junction between them.
+In practice you solve numerically. SPICE assembles exactly this matrix and calls a sparse LU decomposition.
 
-**Step 1 — Open-circuit voltage.** With the output unloaded, no current flows through any branch except the divider chain:
+### Thévenin Reduction: RC Time Constant
 
-$$V_T = V_{OC} = 20 \cdot \frac{10\text{k}}{10\text{k} + 10\text{k}} = 10\text{ V}$$
+Given a resistive network driving a capacitor:
 
-**Step 2 — Thévenin resistance.** Kill the 20 V source (short it). Looking into the output terminal, the upper 10 kΩ connects to the short (previously the source) and the lower 10 kΩ connects to ground — both are now in parallel between the terminal and ground:
+```
+Vin ---[R1]---+---[R2]--- GND
+              |
+             [C]
+              |
+             GND
+```
 
-$$R_T = 10\text{k} \| 10\text{k} = \frac{10\text{k} \cdot 10\text{k}}{10\text{k} + 10\text{k}} = 5\text{ k}\Omega$$
+**Without Thévenin**: writing the node equation at the junction directly yields a first-order ODE with $R_1 \| R_2$ as the effective resistance, but you have to carry the full divider ratio through the algebra.
 
-**Step 3 — Norton equivalent.** Short the terminals. The full 20 V drives both resistors in parallel to ground, so:
+**With Thévenin**: remove $C$, compute $V_T$ and $R_T$ of the resistive part, then replace the entire left side with a single voltage source $V_T$ in series with $R_T$. The result is a canonical RC circuit:
 
-$$I_N = I_{SC} = \frac{V_T}{R_T} = \frac{10\text{ V}}{5\text{ k}\Omega} = 2\text{ mA}$$
+$$V_T = V_{in} \cdot \frac{R_2}{R_1 + R_2}, \qquad R_T = R_1 \| R_2 = \frac{R_1 R_2}{R_1 + R_2}$$
 
-This is consistent: $I_{SC}$ also equals $V_{20}/(R_1 \| R_2)$... but computing it via the Thévenin values confirms both are consistent.
+$$\tau = R_T C = \frac{R_1 R_2}{R_1 + R_2} \cdot C$$
 
-**Step 4 — Load prediction.** Attach a 5 kΩ load. Without Thévenin you must re-solve the full three-resistor network. With Thévenin, it is one voltage divider:
+The voltage across $C$ as a function of time (step input):
 
-$$V_{load} = V_T \cdot \frac{R_L}{R_T + R_L} = 10 \cdot \frac{5\text{k}}{5\text{k} + 5\text{k}} = 5\text{ V}$$
+$$V_C(t) = V_T \left(1 - e^{-t/\tau}\right)$$
 
-The loaded voltage is exactly half the open-circuit voltage because $R_L = R_T$. This is also the condition of **maximum power transfer** — a result that follows immediately from the Thévenin model and is otherwise non-obvious.
+This approach generalizes: anytime you add a reactive element to an existing resistive network, Thévenin-reduce the resistive part first and you immediately have $\tau = R_T C$ or $\omega_0 = 1/\sqrt{L_T C}$ without re-solving the full network.
 
-Maximum power delivered to $R_L$:
+### Numerical Example: Meter Loading
 
-$$P_{max} = \frac{V_T^2}{4 R_T} \quad \text{when } R_L = R_T$$
+A 20,000 Ω/V meter on its 1 V scale has input resistance $R_m = 20{,}000\ \Omega$. It is connected to a 10k–10k voltage divider driven by a stiff 1 V source.
 
-### Why Stage Loading Matters
+Thévenin equivalent of the divider (before meter is attached):
 
-Cascading two identical RC low-pass sections does not simply square the single-stage transfer function, because the second stage loads the first. The Thévenin resistance of the first stage appears in series with the second stage's input impedance, forming a frequency-dependent voltage divider that shifts the pole location.
+$$V_T = 1\ \text{V} \cdot \frac{10\text{k}}{20\text{k}} = 0.5\ \text{V}, \qquad R_T = 10\text{k} \| 10\text{k} = 5\ \text{k}\Omega$$
 
-For a single RC section with $R = 10\text{ k}\Omega$ and $C = 10\text{ nF}$, the pole is at:
+With the meter attached, $R_m$ loads the Thévenin source:
 
-$$f_c = \frac{1}{2\pi R C} = \frac{1}{2\pi \cdot 10^4 \cdot 10^{-8}} \approx 1591\text{ Hz}$$
-
-When you cascade an identical second stage directly, the Thévenin resistance seen by the second capacitor is $R + (R \| R_{\text{in,2}})$, not just $R$. The combined $-3\text{ dB}$ frequency is no longer $f_c$ but is shifted downward — you need the full two-pole transfer function to find it.
-
-The design solution is a **buffer stage** — an op-amp voltage follower or emitter follower — which presents $R_T \approx 0$ to the load and $Z_{in} \gg R_T$ of the source. The Thévenin model makes this requirement explicit: if $Z_{load} \gg R_T$, the loaded voltage approaches $V_{OC}$; if $Z_{load} \sim R_T$, you lose half your signal.
-
----
-
-## Linux Connection
-
-### ngspice: SPICE Nodal Analysis on Linux
-
-**ngspice** performs nodal analysis internally. At each operating point (DC), frequency step (AC), or time step (transient), it assembles the **modified nod
+$$V_{read} = V_T \cdot \frac{R_m}{R_T + R_m}

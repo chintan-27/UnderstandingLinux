@@ -12,104 +12,119 @@ resources:
 
 ## Why This Matters
 
-Every physical system you interact with — the RAM in your computer, the disk beneath your filesystem, the thermal throttling logic in your CPU — behaves the way it does because of statistics applied to enormous numbers of particles. Without statistical mechanics, you cannot explain why a resistor generates noise, why a CPU heats up and slows down, why flash memory wears out, or why the Boltzmann distribution governs which energy states electrons occupy in a semiconductor. These are not engineering approximations — they are the mechanism. The randomness is the physics.
+Every hardware subsystem you interact with through the Linux kernel is operating inside a thermal noise floor. That floor is not an engineering limitation to be overcome — it is a direct consequence of thermodynamics, and it sets hard bounds on what software can observe, measure, or control. The scheduler makes probabilistic decisions because cache miss latency is a distribution, not a constant. `/dev/random` harvests entropy from interrupt timing jitter because that jitter is thermally driven. DRAM refresh intervals exist because thermal fluctuations spontaneously flip stored charge. If your mental model of a CPU core is a deterministic state machine, you will misread `perf` output, misattribute thermal throttling, and have no framework for why a system behaves differently at 90°C than at 40°C.
 
 ---
 
 ## Core Concepts
 
-### Microstates and Macrostates
+### Microscopic Randomness vs. Macroscopic Regularity
 
-A **macrostate** is what you can measure: temperature, pressure, average current. A **microstate** is one specific configuration of all the constituent particles — positions and momenta of every atom at one instant. The key insight: an enormous number of microstates map to the same macrostate. Temperature is not a property of any single particle; it is a statistical summary of a distribution of particle energies across $\sim 10^{23}$ of them. This is why "temperature of a single electron" is meaningless.
+Each conduction electron in a copper trace is undergoing roughly $10^{13}$ collisions per second, each in a random direction. No individual collision is predictable. Yet the bulk resistivity of copper is stable to parts per million. This is the operational content of statistical mechanics: the law of large numbers converts microscopic randomness into macroscopic reproducibility. Hardware specifications are possible precisely because $N \sim 10^{22}$ particles average out. When that averaging breaks down — at nanometer feature sizes, at cryogenic temperatures, in single-electron transistors — deterministic hardware specs stop working and you need the full distribution.
 
-Entropy $S$ quantifies how many microstates correspond to a given macrostate:
+### Temperature as Mean Kinetic Energy
 
-$$S = k_B \ln \Omega$$
+Temperature is a derived quantity, not a primitive one. It parameterizes the average kinetic energy per quadratic degree of freedom in a system at thermal equilibrium:
 
-where $\Omega$ is the number of accessible microstates. A system evolves toward higher entropy not because nature "prefers" disorder, but because there are vastly more high-entropy microstates than low-entropy ones. The second law is a statement about counting, not about physics having a direction.
+$$\langle E_k \rangle = \frac{1}{2} k_B T$$
 
-### The Boltzmann Factor
+where $k_B = 1.380 \times 10^{-23}\ \text{J/K}$. At 300 K:
 
-The probability that a system in contact with a thermal reservoir at temperature $T$ occupies a state with energy $E$ is:
+$$k_B T = (1.380 \times 10^{-23})(300) \approx 4.14 \times 10^{-21}\ \text{J} \approx 26\ \text{meV}$$
+
+This $26\ \text{meV}$ is the natural energy unit for every room-temperature semiconductor calculation. Every time you see an exponential in device physics, the exponent is measured in units of $k_B T$.
+
+### The Boltzmann Distribution
+
+For a system at thermal equilibrium at temperature $T$, the probability of occupying a state with energy $E$ is:
 
 $$P(E) \propto e^{-E / k_B T}$$
 
-where $k_B = 1.38 \times 10^{-23}\ \text{J/K}$. This follows directly from counting: when a subsystem takes energy $E$ from a reservoir, the reservoir loses entropy $E/T$, reducing its accessible microstates by $e^{-E/k_BT}$. The exponential suppression is not a postulate — it is the consequence of the reservoir having far fewer ways to arrange itself when it is missing energy $E$.
+The ratio between occupation probabilities of two states separated by $\Delta E$ is:
 
-The product $k_B T$ sets the energy scale of thermal fluctuations. At room temperature ($T = 300\ \text{K}$):
+$$\frac{P(E + \Delta E)}{P(E)} = e^{-\Delta E / k_B T}$$
 
-$$k_B T \approx 4.1 \times 10^{-21}\ \text{J} \approx 25.7\ \text{meV}$$
+This is not an approximation for large systems. It follows from a single axiom: at equilibrium, the total system (your subsystem plus the thermal reservoir) maximizes entropy. The exponential form is the unique solution to that constraint. Everything downstream — reaction rates, leakage currents, DRAM retention, flash endurance — is a specific application of this ratio.
 
-Any process with an energy barrier $\Delta E \gg k_B T$ is exponentially suppressed. Any barrier $\Delta E \lesssim k_B T$ is routinely overcome by thermal fluctuations. The $26\ \text{meV}$ figure is the single number that tells you whether a physical process will spontaneously occur at room temperature.
+### The Fermi-Dirac Distribution
 
-### The Equipartition Theorem
+Electrons are fermions: the Pauli exclusion principle forbids two electrons from occupying the same quantum state. Boltzmann statistics, which assume states can be multiply occupied, are wrong for electrons. The correct occupation probability is:
 
-In thermal equilibrium, every quadratic degree of freedom in the Hamiltonian contributes exactly $\frac{1}{2} k_B T$ to the mean energy. A translational mode $\frac{1}{2}mv_x^2$ contributes $\frac{1}{2}k_BT$; so does a spring mode $\frac{1}{2}kx^2$. A monatomic ideal gas has 3 translational DOFs:
+$$f(E) = \frac{1}{e^{(E - E_F)/k_B T} + 1}$$
 
-$$\langle E \rangle = \frac{3}{2} k_B T$$
+$E_F$ is the **Fermi energy** — the energy at which occupation probability is exactly $\frac{1}{2}$, at any temperature. At $T = 0$, $f(E)$ is a perfect step function: every state below $E_F$ is filled, every state above is empty. At 300 K, the step blurs over an energy width of roughly $k_B T \approx 26\ \text{meV}$.
 
-This is why temperature *is* mean kinetic energy per DOF (scaled by $k_B$). It also explains the heat capacity of solids: each atom in a crystal has 3 kinetic and 3 potential DOFs, giving $\langle E \rangle = 3 k_B T$ per atom and a molar heat capacity of $3R$ (the Dulong-Petit law). Equipartition breaks down when $k_B T$ drops below the spacing between quantum energy levels — which is why diamond has a low heat capacity at room temperature and why the quantum corrections matter.
+Why does this matter for silicon? The Fermi energy sits near the middle of the 1.1 eV bandgap. The number of electrons thermally excited into the conduction band depends on how far the band edge is from $E_F$ relative to $k_B T$. Doping a semiconductor moves $E_F$ closer to one band edge — that is the entire mechanism by which you engineer conductivity.
 
-### The Maxwell-Boltzmann Speed Distribution
+### Entropy and Irreversibility
 
-For an ideal gas at temperature $T$, the fraction of particles with speeds in $[v, v+dv]$ is:
+The entropy of a macrostate is:
 
-$$f(v) = 4\pi n \left(\frac{m}{2\pi k_B T}\right)^{3/2} v^2 \, e^{-mv^2 / 2k_B T}$$
+$$S = k_B \ln \Omega$$
 
-The $v^2$ prefactor counts how many momentum-space states exist at speed $v$ (the surface area of a sphere of radius $mv$ in momentum space grows as $v^2$). The exponential kills high energies. The peak — the **most probable speed** — is:
-
-$$v_p = \sqrt{\frac{2 k_B T}{m}}$$
-
-The mean speed and RMS speed are slightly higher:
-
-$$\langle v \rangle = \sqrt{\frac{8 k_B T}{\pi m}}, \qquad v_\text{rms} = \sqrt{\frac{3 k_B T}{m}}$$
-
-The distribution has a long high-energy tail. Chemical reaction rates and evaporation rates are dominated by particles in that tail — particles with $E \gg k_B T$ that have enough energy to cross a barrier. This is why reaction rates are so sensitive to temperature: a small increase in $T$ significantly populates the tail.
-
-### Fermi-Dirac and Bose-Einstein Statistics
-
-Classical Boltzmann statistics treat particles as distinguishable. Quantum mechanics forbids this for identical particles. For electrons (spin-$\frac{1}{2}$ fermions obeying the Pauli exclusion principle), the occupation probability of a state with energy $\varepsilon$ is:
-
-$$f(\varepsilon) = \frac{1}{e^{(\varepsilon - \mu)/k_B T} + 1}$$
-
-At $T = 0$, this is a perfect step function: every state below the **Fermi energy** $E_F$ is occupied, every state above is empty. At finite $T$, thermal fluctuations smear the edge over a width of roughly $4 k_B T$. For copper, $E_F \approx 7\ \text{eV}$, while $k_B T \approx 26\ \text{meV}$ at room temperature — the smearing is less than 0.4% of $E_F$. This is why metals' electrical properties are nearly temperature-independent: almost all conduction electrons are deep in the Fermi sea and irrelevant; only those within $\sim k_B T$ of $E_F$ participate in transport.
-
-For bosons (photons, phonons), the $+1$ becomes $-1$:
-
-$$n(\varepsilon) = \frac{1}{e^{\varepsilon/k_B T} - 1}$$
-
-This is the **Bose-Einstein distribution** (with $\mu = 0$ for photons, since photon number is not conserved). It produces the Planck blackbody spectrum and the phonon contribution to heat capacity, and diverges as $\varepsilon \to 0$ — the reason bosons can macroscopically condense into a single ground state.
+where $\Omega$ is the number of distinct microstates consistent with that macrostate. The second law — entropy increases spontaneously — is a counting argument: disordered states have vastly larger $\Omega$ than ordered ones, so a randomly evolving system will almost certainly move toward higher $\Omega$. This is why heat flows from hot to cold (more microstates available), why diffusion is irreversible, and why erasing a bit in DRAM (a logically irreversible operation) must dissipate at least $k_B T \ln 2$ of energy — the **Landauer limit**.
 
 ---
 
 ## How It Works
 
-### Why Randomness Produces Predictable Macroscopic Laws
+### The Boltzmann Factor: Rates Across Energy Barriers
 
-Relative fluctuations in any extensive quantity scale as $1/\sqrt{N}$. For $N \sim 10^{23}$ particles, relative fluctuations are $\sim 10^{-12}$. The macroscopic world looks deterministic because the probability of observing a significant deviation from the mean is not small — it is effectively zero. Entropy increase looks like a law because the ratio of high-entropy to low-entropy microstates is something like $e^{10^{23}}$ to 1. There is no microscopic arrow of time; the arrow emerges from this counting.
+Any process that requires crossing an energy barrier $\Delta E$ — a transistor switching, a charge leaking from a DRAM cell, a defect migrating in a dielectric — has a rate that scales as:
 
-### Thermal Noise: Johnson-Nyquist
+$$r \propto \nu_0\, e^{-\Delta E / k_B T}$$
 
-A resistor of resistance $R$ at temperature $T$ contains electrons in thermal equilibrium. By equipartition, their random thermal motion generates fluctuating currents, which appear as a fluctuating voltage across the terminals. The **power spectral density** of this voltage noise is:
+where $\nu_0$ is an attempt frequency (typically $\sim 10^{12}\ \text{Hz}$ for atomic vibrations). At 300 K:
+
+| $\Delta E$ | $\Delta E / k_B T$ | $e^{-\Delta E/k_B T}$ | Meaning |
+|---|---|---|---|
+| $26\ \text{meV}$ | 1 | $0.37$ | Barrier crossed freely |
+| $260\ \text{meV}$ | 10 | $4.5 \times 10^{-5}$ | Rare but finite rate |
+| $1.0\ \text{eV}$ | 38 | $3 \times 10^{-17}$ | Negligible at room temp |
+| $0.6\ \text{eV}$ | 23 | $10^{-10}$ | Flash storage retention scale |
+
+DRAM retention time is finite because the charge barrier is intentionally thin (for write speed); the retention time $\tau \propto e^{+\Delta E / k_B T}$ shrinks exponentially as temperature rises. Flash storage uses a thicker oxide barrier ($\sim 0.6$–$0.9\ \text{eV}$) for long retention, but that same barrier is what limits erase speed and causes endurance degradation when oxide traps accumulate.
+
+### The Fermi-Dirac Step and Leakage Current
+
+In intrinsic silicon at $T = 0$, the valence band is full, the conduction band is empty, and conductivity is exactly zero. At finite temperature, the fraction of electrons excited across the bandgap $E_g = 1.1\ \text{eV}$ is:
+
+$$n_i \propto T^{3/2}\, e^{-E_g / 2k_B T}$$
+
+The $T^{3/2}$ prefactor comes from the density of available states; the exponential dominates. At 300 K:
+
+$$e^{-E_g/2k_BT} = e^{-1.1/(2 \times 0.026)} = e^{-21.2} \approx 6 \times 10^{-10}$$
+
+At 360 K (just 60°C hotter):
+
+$$e^{-1.1/(2 \times 0.031)} = e^{-17.7} \approx 2 \times 10^{-8}$$
+
+That is a factor of ~33 increase in intrinsic carrier density from a 60 K temperature rise. Transistor leakage current tracks this exponential. This is why the power envelope of a CPU at high temperature is dominated by leakage rather than switching: leakage scales as $e^{-E_g/2k_BT}$ while dynamic power scales only linearly with frequency. Past roughly 80–90°C, leakage can exceed 30% of total power in high-density CMOS.
+
+### Diffusion and the Einstein Relation
+
+A particle subject to a force $F$ drifts with velocity $v = \mu F$, where $\mu$ is the mobility. The same particle undergoes random thermal motion characterized by diffusion coefficient $D$. These are not independent — at thermal equilibrium, drift and diffusion must exactly cancel under any conservative potential. The condition for self-consistency yields the **Einstein relation**:
+
+$$D = \mu k_B T$$
+
+This is exact, not empirical. It connects:
+
+- **Dopant diffusion during chip fabrication**: higher $T$ raises $D$, so anneal time and temperature are controlled to nm-precision
+- **Minority carrier diffusion in a PN junction**: sets the ideality factor and junction capacitance
+- **Johnson-Nyquist noise in resistors**: the same electron mobility that determines resistance also determines how much noise power the resistor emits
+
+### Johnson-Nyquist Noise
+
+A resistor $R$ at temperature $T$ generates voltage noise with power spectral density:
 
 $$S_V(f) = 4 k_B T R \quad [\text{V}^2/\text{Hz}]$$
 
-This is white noise (flat spectrum) up to frequencies where $hf \sim k_B T$, i.e., into the terahertz range at room temperature. The RMS noise over bandwidth $\Delta f$ is:
+This is flat (white) up to frequencies where $h f \ll k_B T$ — true for all practical electronics below terahertz. The RMS noise over bandwidth $B$ is:
 
-$$V_\text{rms} = \sqrt{4 k_B T R \,\Delta f}$$
+$$V_{\text{rms}} = \sqrt{4 k_B T R B}$$
 
-For a $1\ \text{k}\Omega$ resistor at $T = 300\ \text{K}$ over $\Delta f = 1\ \text{MHz}$:
+For a $1\ \text{k}\Omega$ resistor at 300 K over a 1 MHz bandwidth:
 
-$$V_\text{rms} = \sqrt{4 \times 1.38 \times 10^{-23} \times 300 \times 10^3 \times 10^6} \approx 4\ \mu\text{V}$$
+$$V_{\text{rms}} = \sqrt{4 \times (1.38 \times 10^{-23}) \times 300 \times 10^3 \times 10^6} = \sqrt{1.66 \times 10^{-11}} \approx 4.1\ \mu\text{V}$$
 
-This floor is fundamental — it cannot be reduced by better circuit design, only by lowering $R$ or lowering $T$. Cryogenic amplifiers used in radio telescopes and quantum computing readout circuits operate at $4\ \text{K}$ or below precisely to push this floor down by a factor of $\sqrt{300/4} \approx 9$.
-
-The Johnson-Nyquist formula follows from the **fluctuation-dissipation theorem**: any system that dissipates energy (any resistor) must also fluctuate. Dissipation and noise are two faces of the same microscopic coupling.
-
-### The Arrhenius Equation and Hardware Failure
-
-Many rate processes — chemical reactions, ion migration, defect formation — require crossing an energy barrier $E_a$. The rate is:
-
-$$r = A \, e^{-E_a / k_B T}$$
-
-This is the **Arrhenius equation**. The prefactor $A$ sets the attempt frequency; the exponential gives the fraction of attempts that succeed (the Boltzmann probability of having enough energy). Doubling a reaction rate by raising temperature requires only a modest increase because the exponential is so sensitive: if $E_a / k_B T = 30$ at $300\ \text{K}$, raising to $310\ \text{K}$ reduces the
+This is not reducible by better circuit design — it is a thermal

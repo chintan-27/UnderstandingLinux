@@ -12,126 +12,145 @@ resources:
 
 ## Why This Matters
 
-Every time Linux reports a CPU usage percentage, a network latency, or a disk throughput number, that number is an estimate derived from a sample. If you don't understand variance, you misread those numbers — you treat noise as signal, conclude a system is broken when it isn't, or miss a real performance regression because your measurement technique was too noisy to detect it. Tools like `perf`, `iostat`, and `ftrace` don't just collect data; they compute statistics over it. Understanding what those statistics *mean* — and what can go wrong — is the difference between debugging a system and guessing at one.
+Every time Linux reports a CPU load average, a disk latency percentile, or a network throughput estimate, it is making a statistical claim about a process it can only partially observe. Without variance analysis, you cannot tell whether two benchmark runs differ because of a real performance difference or random noise. Without understanding estimation error, you will misread `/proc` data, draw false conclusions from `perf stat`, and write kernel patches that appear to improve performance but are actually measuring measurement artifacts. The math here is not decoration — it is the difference between knowing something and thinking you know something.
 
 ---
 
 ## Core Concepts
 
-### Expected Value
+### Random Variables and Expected Value
 
-The **expected value** $EX$ of a random variable $X$ is its probability-weighted average:
+A random variable $X$ is a function from a sample space to $\mathbb{R}$. Its **expected value** is the probability-weighted average:
 
 $$EX = \sum_{x} x \cdot \Pr(X = x)$$
 
-For a fair die, $EX = 7/2 = 3.5$ — a value the die never shows, but the right anchor for reasoning about long runs. In systems terms: if a syscall takes 1 µs with probability 0.9 and 100 µs with probability 0.1 (a cache miss), its expected cost is $0.9 \cdot 1 + 0.1 \cdot 100 = 10.9$ µs. The common case dominates probability, but the rare case dominates cost.
+$E$ is **linear**: $E(aX + bY) = a\,EX + b\,EY$ for any constants $a, b$, regardless of whether $X$ and $Y$ are independent. This is not a special case — it holds always. Independence is only required when you want to factor products: $E(XY) = (EX)(EY)$ iff $X \perp Y$.
 
-### Variance
+### Variance: The Spread of a Distribution
 
-Variance measures how spread out a distribution is around its mean:
+$$VX = E\left[(X - EX)^2\right]$$
 
-$$VX = E\!\left[(X - EX)^2\right]$$
-
-The computational identity — mean of the square minus square of the mean — is:
+Expanding via linearity of $E$ gives the computationally useful identity:
 
 $$VX = E(X^2) - (EX)^2$$
 
-This is more than algebraic convenience. It separates two independent contributions to spread: the raw magnitude of $X^2$ and the centering effect of $(EX)^2$. A distribution with all mass at a single point has $E(X^2) = (EX)^2$, so $VX = 0$. A distribution centered at zero has $EX = 0$, so $VX = E(X^2)$ directly — the variance *is* the mean squared value.
+"Mean of the square minus square of the mean." This matters because it decomposes variance into two expectations you can often compute separately or accumulate in a single pass over data, without first computing the mean.
 
-Standard deviation $\sigma = \sqrt{VX}$ restores units. If latency is in microseconds, variance is in µs² and standard deviation is in µs — the quantity you can directly compare to the mean.
+The **standard deviation** $\sigma = \sqrt{VX}$ has the same units as $X$, which is why it appears in confidence intervals rather than variance.
 
 ### Independence and Variance Addition
 
-When $X$ and $Y$ are **independent**:
+If $X \perp Y$:
 
 $$V(X + Y) = VX + VY$$
 
-This works because independence eliminates the covariance term: $V(X+Y) = VX + VY + 2\,\text{Cov}(X,Y)$, and $\text{Cov}(X,Y) = 0$ when $X \perp Y$. When they're *not* independent — high CPU load causing I/O to spike, for instance — the covariance term is nonzero and the additive decomposition breaks. This is exactly why correlating `%iowait` with `%user` in `iostat` output requires more than summing their individual variances.
+*Why:* $V(X+Y) = E[(X+Y)^2] - (E[X+Y])^2$. Expanding and using $E(XY) = (EX)(EY)$ under independence collapses the cross terms. When they are not independent, the cross terms survive as $2\,\text{Cov}(X,Y)$.
 
-### Sampling and Estimation
+The practical consequence: averaging $n$ i.i.d. measurements each with variance $\sigma^2$ yields a sample mean with variance $\sigma^2/n$. Doubling your sample size shrinks the standard error by $1/\sqrt{2}$, not $1/2$. This is why going from 4 to 16 benchmark runs halves your uncertainty, not from 4 to 8.
 
-The sample mean $\bar{X} = \frac{1}{n}\sum_{i=1}^n X_i$ estimates $EX$. Its variance:
+### Estimation and Sampling
 
-$$V\bar{X} = \frac{VX}{n}$$
+An **estimator** is a function of your sample that approximates a population parameter. Quality dimensions:
 
-This follows directly from variance addition applied to independent, identically distributed samples: $V\!\left(\frac{1}{n}\sum X_i\right) = \frac{1}{n^2}\cdot n\cdot VX$. The standard error $\sigma/\sqrt{n}$ is what shrinks when you average more measurements. To halve the error, you need four times as many samples — a $\sqrt{n}$ law you will hit repeatedly in benchmarking.
+- **Bias**: $\text{Bias}(\hat\theta) = E\hat\theta - \theta$. Bias cannot be reduced by collecting more data. It is a property of your estimator's structure, not your sample size.
+- **Variance**: fluctuation across different samples. Reducible by increasing $n$.
+- **MSE** (mean squared error): $\text{MSE}(\hat\theta) = \text{Bias}^2 + V\hat\theta$. The full cost of using an estimator.
 
-### Confidence Intervals
+The sample mean $\bar{X} = \frac{1}{n}\sum_{i=1}^n X_i$ is unbiased for $EX$, with variance $\sigma^2/n$ under i.i.d. sampling.
 
-A 95% confidence interval $[\bar{X} - \delta,\, \bar{X} + \delta]$ is constructed so that, under repeated sampling, 95% of such intervals contain the true mean. The half-width:
+The sample variance $s^2 = \frac{1}{n-1}\sum_{i=1}^n (X_i - \bar{X})^2$ divides by $n-1$, not $n$, because $\bar{X}$ is computed from the same data — one degree of freedom is consumed. Dividing by $n$ gives a biased estimator that systematically underestimates $\sigma^2$.
 
-$$\delta = z_{0.025} \cdot \frac{\sigma}{\sqrt{n}}$$
+### Measurement Error
 
-where $z_{0.025} \approx 1.96$ for a normal distribution. If you don't know $\sigma$, you substitute the sample standard deviation $s$ and use a $t$-distribution with $n-1$ degrees of freedom — which matters when $n < 30$.
+$$x_\text{measured} = x_\text{true} + \epsilon_\text{systematic} + \epsilon_\text{random}$$
+
+- **Systematic error** (bias): a consistent offset. Averaging more samples does not help — you are averaging toward the wrong value.
+- **Random error**: zero-mean noise, reducible by averaging.
+
+In systems work, clock resolution, context-switch jitter, CPU frequency scaling, and cache thermal state all introduce *structured* error that does not average away cleanly. A benchmark that reports 10 ns latency on a system with 4 ns clock resolution is reporting noise, not signal.
 
 ---
 
 ## How It Works
 
-### The Shortcut Variance Formula
+### The Variance Computation in Detail
 
-Expanding from the definition with $\mu = EX$:
+Starting from the definition:
 
-$$VX = E\!\left[(X - \mu)^2\right] = E\!\left[X^2 - 2X\mu + \mu^2\right] = E(X^2) - 2\mu \cdot \mu + \mu^2 = E(X^2) - \mu^2$$
+$$VX = E\left[(X - \mu)^2\right] = E\left[X^2 - 2\mu X + \mu^2\right] = E(X^2) - 2\mu^2 + \mu^2 = E(X^2) - \mu^2$$
 
-**Example — lottery:** Win \$0 with probability 0.98, \$100M with probability 0.02.
+**Example — fair die:** $EX = 7/2$ and:
 
-$$EX = 0.98 \cdot 0 + 0.02 \cdot 10^8 = 2 \times 10^6$$
+$$E(X^2) = \frac{1}{6}(1 + 4 + 9 + 16 + 25 + 36) = \frac{91}{6}$$
 
-$$E(X^2) = 0.98 \cdot 0 + 0.02 \cdot 10^{16} = 2 \times 10^{14}$$
+$$VX = \frac{91}{6} - \left(\frac{7}{2}\right)^2 = \frac{91}{6} - \frac{49}{4} = \frac{182 - 147}{12} = \frac{35}{12}$$
 
-$$VX = 2\times10^{14} - (2\times10^6)^2 = 2\times10^{14} - 4\times10^{12} = 1.96\times10^{14}$$
+Standard deviation $\sigma \approx 1.708$. On a hardware performance counter, this is the kind of spread you would see if syscall latency were uniformly distributed over a 6-value range.
 
-$$\sigma = \sqrt{1.96\times10^{14}} = 1.4\times10^7$$
+### Variance of a Sum — The Covariance Term
 
-The standard deviation is $14M — seven times the mean. The expected value says "buy the ticket"; the standard deviation says "but understand you almost certainly get nothing." Both are true simultaneously, which is exactly the kind of reasoning you need when interpreting tail latency in production systems.
+For arbitrary $X, Y$:
 
-### Variance of the Sample Mean
+$$V(X + Y) = VX + VY + 2\,\text{Cov}(X, Y)$$
 
-If latency observations $X_1, \ldots, X_n$ are i.i.d. with mean $\mu$ and variance $\sigma^2$:
+where $\text{Cov}(X,Y) = E(XY) - (EX)(EY)$.
 
-$$\bar{X} = \frac{1}{n}\sum_{i=1}^{n} X_i, \qquad V\bar{X} = \frac{\sigma^2}{n}, \qquad \text{SE} = \frac{\sigma}{\sqrt{n}}$$
+In systems: CPU time and wall-clock time measured on the same benchmark run are positively correlated. If you form a metric like $T_\text{wall} - T_\text{cpu}$ to measure I/O wait, the variance is:
 
-Running `perf stat` once gives you one sample. Running it ten times and averaging gives you a standard error $\sqrt{10}\approx 3.16\times$ smaller. The variance of the underlying syscall doesn't change — you're just estimating its mean more precisely.
+$$V(T_\text{wall} - T_\text{cpu}) = V T_\text{wall} + V T_\text{cpu} - 2\,\text{Cov}(T_\text{wall}, T_\text{cpu})$$
 
-### Hashing: Variance in Expected Probe Count
+The covariance term *reduces* variance here, because when the CPU is slow, wall time also tends to be slow. Ignoring this and treating them as independent *overestimates* the noise in your I/O wait estimate.
 
-For a hash table with $m$ slots and $n$ elements, uniform search probability $s_k = 1/n$, the variance of the average successful search time across all possible hash tables is:
+### Hashing: A Concrete Variance Analysis
+
+The *Concrete Mathematics* analysis of hash table probes gives a clean model for why variance matters in performance analysis. With $n$ keys inserted into a table of $m$ slots using linear probing, the variance of average successful search time is:
+
+$$V_A = \frac{m-1}{m^2} \sum_{k=1}^{n} s_k^2\, k(k-1)$$
+
+where $s_k$ is the probability that a random lookup targets the $k$-th inserted key. For uniform access ($s_k = 1/n$):
 
 $$V_A = \frac{(m-1)(n-1)}{2m^2 n}$$
 
-This is a nontrivial cancellation — terms involving $\sum k^2$, $\sum k$, and constants collapse into three factors. The intuition is exact: $m$ large means fewer collisions per slot, directly reducing spread; $n$ large means more elements contributing to the average, reducing variance through the $1/n$ factor.
-
-For non-uniform search — you look up some keys far more often than others — the general form is:
-
-$$V_A = \frac{m-1}{m^2} \sum_{k=1}^{n} s_k^2 \cdot k(k-1)$$
-
-The $s_k^2$ term is what hurts. If one key has $s_k = 0.9$ and the rest share $0.1$, that one term dominates the sum quadratically. This is the formal statement of why hot-key skew in hash tables degrades performance: it's not just that the hot key is slow, it's that it inflates the variance of *every* lookup's expected cost.
-
-### Simple Regression
-
-Given pairs $(x_i, y_i)$, linear regression finds $\hat{a}, \hat{b}$ minimizing the sum of squared residuals:
-
-$$\sum_{i=1}^{n}(y_i - \hat{a} - \hat{b}\, x_i)^2$$
-
-Setting partial derivatives to zero and solving yields the least-squares estimates:
-
-$$\hat{b} = \frac{\sum_{i=1}^n(x_i - \bar{x})(y_i - \bar{y})}{\sum_{i=1}^n(x_i - \bar{x})^2}, \qquad \hat{a} = \bar{y} - \hat{b}\,\bar{x}$$
-
-The numerator of $\hat{b}$ is the sample covariance (unnormalized); the denominator is the sample variance of $x$ (unnormalized). So $\hat{b} = \hat{\text{Cov}}(x,y) / \hat{V}x$ — the slope is exactly how much $y$ co-varies with $x$, normalized by $x$'s own spread.
-
-In performance analysis, $x$ might be request concurrency and $y$ latency in milliseconds. The slope $\hat{b}$ tells you the marginal latency cost of one additional concurrent request. The residual variance — the variance the linear model does *not* explain — tells you whether you're missing a nonlinear term (e.g., a queuing knee) or a confounding variable.
+*Why does non-uniform access increase variance?* The $s_k^2$ weighting means that high-probability keys contribute quadratically to variance. A single key accessed with probability $p \gg 1/n$ dominates the sum. This is exactly the hot-key problem in kernel hash tables (e.g., the dentry cache).
 
 ```python
-import numpy as np
+def hash_probe_variance(m, n, s=None):
+    """
+    Variance of average successful search time under linear probing.
+    m: number of slots, n: number of keys
+    s: search probabilities s_k (uniform if None)
+    """
+    if s is None:
+        s = [1.0 / n] * n
+    assert abs(sum(s) - 1.0) < 1e-9, "probabilities must sum to 1"
 
-# Latency vs. concurrency: synthetic but realistic shape
-concurrency = np.array([1, 2, 4, 8, 16, 32], dtype=float)
-latency_ms  = np.array([2.1, 2.3, 2.9, 4.5, 8.1, 15.9])
+    total = sum(s[k-1]**2 * k * (k - 1) for k in range(1, n + 1))
+    return ((m - 1) / m**2) * total
 
-x_bar = concurrency.mean()
-y_bar = latency_ms.mean()
+m, n = 10, 100
+va_uniform  = hash_probe_variance(m, n)
+va_formula  = (m - 1) * (n - 1) / (2 * m**2 * n)
 
-b_hat = (np.sum((concurrency - x_bar) * (latency_ms - y_bar)) /
-         np.sum((concurrency - x_bar)**2))
-a_hat = y_
+# Hot-key: first key accessed 50% of the time
+s_hot = [0.5] + [0.5 / (n - 1)] * (n - 1)
+va_hot = hash_probe_variance(m, n, s_hot)
+
+print(f"uniform (pgf):      {va_uniform:.6f}")
+print(f"uniform (formula):  {va_formula:.6f}")
+print(f"hot-key:            {va_hot:.6f}")
+print(f"variance ratio:     {va_hot / va_uniform:.1f}x")
+```
+
+### Confidence Intervals from First Principles
+
+Given $n$ i.i.d. samples, by the Central Limit Theorem:
+
+$$\frac{\bar{X} - \mu}{\sigma / \sqrt{n}} \xrightarrow{d} \mathcal{N}(0,1)$$
+
+A 95% confidence interval for $\mu$:
+
+$$\bar{X} \pm 1.96 \cdot \frac{\sigma}{\sqrt{n}}$$
+
+**Critical interpretation:** this does *not* mean there is a 95% chance $\mu$ lies in this specific interval. $\mu$ is a fixed unknown. The interval is random — it is a function of your sample. The correct reading: if you ran this sampling procedure repeatedly, 95% of the resulting intervals would contain $\mu$.
+
+In practice $\sigma$ is unknown;

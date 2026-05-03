@@ -12,14 +12,7 @@ resources:
 
 ## Why This Matters
 
-Every transistor switching in your CPU right now depends on a deliberate impurity — one foreign atom per million silicon atoms — introduced during fabrication. That impurity controls whether a region conducts via electrons or holes, and the boundary between two such regions (the p-n junction) is the physical primitive beneath every diode, BJT, MOSFET, and logic gate ever built.
-
-This has direct consequences for systems programming:
-
-- **CMOS power**: Gates consume dynamic power only during switching because both NMOS and PMOS transistors are never simultaneously on — a consequence of complementary doping. Static power leakage is a tunneling and subthreshold conduction problem rooted in junction physics.
-- **Thermal throttling**: Carrier mobility falls with temperature ($\mu \propto T^{-3/2}$ in the phonon-scattering regime), increasing resistance and reducing drive current. The kernel's `cpufreq` and thermal governors exist to manage this degradation.
-- **Flash wear**: Each write to a NAND cell tunnels electrons through a ~10 nm oxide. The oxide accumulates trapped charge over cycles, shifting the threshold voltage until the cell fails. The kernel's MTD subsystem and wear-leveling in flash translation layers are compensating for this physics.
-- **Voltage scaling**: The Linux `cpufreq` driver reduces $V_{dd}$ at lower frequencies because MOSFET switching energy scales as $CV_{dd}^2$, and leakage current through reverse-biased junctions sets a floor on how low you can go.
+Every CPU, RAM chip, and storage controller in your Linux machine is built from semiconductors. The transistors switching inside your processor only work because engineers can precisely control electron flow through doped silicon — a material that can be made to behave as either a conductor or insulator on demand. Without the p-n junction, there are no diodes, no transistors, no MOSFETs, no DRAM cells. The entire computational substrate the kernel manages disappears. Understanding how charge carriers drift under electric fields and diffuse down concentration gradients is not abstract physics — it is the operating principle of every piece of hardware Linux talks to.
 
 ---
 
@@ -27,94 +20,105 @@ This has direct consequences for systems programming:
 
 ### Intrinsic Semiconductors
 
-Silicon forms a covalent lattice with four valence electrons per atom. At absolute zero, every electron is bound — silicon is a perfect insulator. At finite temperature, phonons (quantized lattice vibrations) carry thermal energy $k_B T$. When a phonon interaction transfers enough energy to break a covalent bond (the bandgap energy $E_g = 1.12$ eV for silicon at 300 K), it produces two carriers: a free electron in the conduction band and a **hole** — a missing electron in the valence band that behaves as a particle with positive charge $+q$ and its own effective mass.
+Pure silicon forms a covalent lattice with four valence electrons per atom. At absolute zero, every electron is bound in a covalent bond and silicon is a perfect insulator. At room temperature, thermal energy promotes a small number of electrons across the **band gap** into the conduction band:
 
-The hole is not a metaphor. It has a well-defined momentum, drifts in applied fields, and carries current. The distinction matters because hole mobility differs from electron mobility, and that asymmetry propagates all the way up to CMOS circuit design.
+$$E_g \approx 1.1\ \text{eV} \quad \text{(Si, 300 K)}$$
 
-Intrinsic carrier concentration at 300 K:
+Each promoted electron leaves behind a **hole** — a vacancy in the valence band that behaves as a positive charge carrier because neighboring electrons can fall into it, propagating the vacancy in the direction opposite to electron motion. In a pure (intrinsic) semiconductor, every promoted electron creates exactly one hole:
 
-$$n_i \approx 1.5 \times 10^{10} \text{ cm}^{-3}$$
+$$n = p = n_i$$
 
-Silicon atom density is $5 \times 10^{22}$ cm$^{-3}$, so roughly one bond in $3 \times 10^{12}$ is broken at room temperature. The conductivity is correspondingly poor.
+The intrinsic carrier concentration at 300 K:
 
-The **mass action law** holds at equilibrium regardless of doping:
+$$n_i \approx 1.5 \times 10^{10}\ \text{cm}^{-3}$$
 
-$$n \cdot p = n_i^2$$
+Compare this to copper: $n_{\text{Cu}} \approx 8.5 \times 10^{22}\ \text{cm}^{-3}$. Pure silicon has roughly $10^{12}$ times fewer free carriers than copper. This is why it is useless as either a conductor or a controllable switch in its intrinsic state.
 
-This is a consequence of detailed balance: the rate of electron-hole generation equals the rate of recombination. Increasing $n$ by doping suppresses $p$ proportionally, and vice versa. This constraint is what makes doped semiconductors predictable — you cannot independently set both carrier concentrations.
+The temperature dependence of $n_i$ is exponential in the band gap:
+
+$$n_i(T) = \sqrt{N_c N_v}\, \exp\!\left(-\frac{E_g}{2k_B T}\right)$$
+
+where $N_c$ and $N_v$ are the effective density of states in the conduction and valence bands. This exponential sensitivity means a 10 °C temperature rise approximately doubles $n_i$, which matters for leakage current in real devices.
 
 ### Extrinsic Semiconductors and Doping
 
-**N-type**: A Group V atom (phosphorus, arsenic, antimony) substitutes into the silicon lattice. Four of its five valence electrons participate in covalent bonds; the fifth is bound to the donor nucleus by only ~45 meV — far less than $E_g$. At room temperature ($k_B T \approx 26$ meV), virtually all donors are ionized. Each donor atom contributes one free electron and leaves behind a fixed positive ion. Majority carriers: electrons.
+Doping introduces impurity atoms to break the $n = p$ symmetry, making one carrier type dominate.
 
-**P-type**: A Group III atom (boron, aluminum) has three valence electrons. It accepts an electron from a neighboring bond to complete its four bonds, leaving a free hole. Each acceptor becomes a fixed negative ion. Majority carriers: holes.
+**N-type:** Substitute Group V atoms (phosphorus, arsenic) into the Si lattice. Phosphorus brings five valence electrons; four participate in covalent bonds, and the fifth sits in a shallow donor level just $\sim 0.045\ \text{eV}$ below the conduction band — compared to $1.1\ \text{eV}$ for the band gap. At 300 K, $k_B T \approx 0.026\ \text{eV}$, so virtually all donor atoms are ionized, each contributing a free electron without creating a hole. The ionized donor ($\text{P}^+$) is fixed in the lattice and cannot move.
 
-Typical doping: $N_D$ or $N_A$ from $10^{14}$ to $10^{20}$ cm$^{-3}$. Since $n_i = 1.5 \times 10^{10}$ cm$^{-3}$, even $10^{14}$ cm$^{-3}$ doping increases the majority carrier density by four orders of magnitude over intrinsic. The minority carrier density drops by the same factor (mass action law).
+**P-type:** Substitute Group III atoms (boron). Boron's three valence electrons leave an incomplete bond — a shallow acceptor level just above the valence band ($\sim 0.045\ \text{eV}$). At room temperature, valence electrons are readily promoted into this level, leaving mobile holes behind.
 
-At doping $N_D = 10^{16}$ cm$^{-3}$ in n-type silicon:
+Typical doping concentrations range from $10^{14}$ to $10^{20}\ \text{cm}^{-3}$, which overwhelms $n_i$ by 4–10 orders of magnitude. The majority carrier concentration equals the dopant concentration to excellent approximation:
 
-$$n \approx N_D = 10^{16} \text{ cm}^{-3}, \quad p = \frac{n_i^2}{N_D} = \frac{(1.5\times10^{10})^2}{10^{16}} = 2.25 \times 10^4 \text{ cm}^{-3}$$
+$$n \approx N_D \quad \text{(n-type)}, \qquad p \approx N_A \quad \text{(p-type)}$$
 
-Minority hole concentration is 12 orders of magnitude below majority electron concentration.
+The minority carrier concentration follows from the **law of mass action**, which holds at thermal equilibrium because carrier generation and recombination rates must balance:
+
+$$np = n_i^2$$
+
+So in n-type silicon with $N_D = 10^{16}\ \text{cm}^{-3}$:
+
+$$p = \frac{n_i^2}{N_D} = \frac{(1.5 \times 10^{10})^2}{10^{16}} = 2.25 \times 10^4\ \text{cm}^{-3}$$
+
+Doping with donors suppresses hole concentration by twelve orders of magnitude. This asymmetry is exactly what gives a p-n junction its rectifying behavior.
 
 ### Drift
 
-Apply an electric field $E$. A free carrier accelerates under force $qE$, but the crystal lattice is not empty — phonons and ionized dopant atoms scatter carriers stochastically. The mean free time between collisions $\tau$ is on the order of 0.1–1 ps. Between collisions, a carrier accelerates; each collision randomizes its momentum. The net result is a steady **drift velocity** proportional to field:
+An applied electric field $\mathcal{E}$ exerts force $q\mathcal{E}$ on free carriers. Electrons accelerate opposite to $\mathcal{E}$; holes accelerate along $\mathcal{E}$. But carriers do not accelerate indefinitely — they scatter off lattice vibrations (phonons) and ionized impurity atoms at a mean interval $\tau$ (the **mean free time**). Each collision randomizes momentum, so the carrier starts fresh and re-accelerates. The average velocity gained between collisions is:
 
-$$v_d = \mu E$$
+$$v_d = \frac{q\mathcal{E}}{m^*}\tau = \mu\mathcal{E}$$
 
-The **mobility** $\mu$ is:
+where $\mu = q\tau/m^*$ is the **carrier mobility** ($\text{cm}^2/\text{V·s}$). This is structurally the same as terminal velocity under drag: the field accelerates, scattering dissipates, and a steady state emerges.
 
-$$\mu = \frac{q\tau}{m^*}$$
+In silicon at 300 K:
 
-where $m^*$ is the carrier's effective mass (which accounts for band curvature — it is not the free electron mass). Electrons have lower effective mass and longer mean free time than holes in silicon:
+| Carrier | Mobility | Reason for difference |
+|---------|----------|-----------------------|
+| Electron | $\mu_n \approx 1400\ \text{cm}^2/\text{V·s}$ | Lower effective mass $m^*$ |
+| Hole | $\mu_p \approx 450\ \text{cm}^2/\text{V·s}$ | Higher effective mass, complex valence band |
 
-$$\mu_n \approx 1400 \text{ cm}^2/\text{V·s}, \quad \mu_p \approx 450 \text{ cm}^2/\text{V·s}$$
+Mobility degrades with temperature (more phonon scattering, $\mu \propto T^{-3/2}$) and with doping concentration (more ionized impurity scattering). This is why heavily doped silicon has lower electron mobility than lightly doped silicon — relevant when sizing resistive poly-silicon structures in CMOS.
 
-This 3:1 ratio is why NMOS transistors deliver ~3× the drive current of PMOS at identical geometry and bias — and why high-performance logic uses NMOS for pull-down networks where speed is critical.
+The total **drift current density** sums both carrier contributions:
 
-Drift current density:
+$$J_{\text{drift}} = (nq\mu_n + pq\mu_p)\mathcal{E} = \sigma\mathcal{E}$$
 
-$$J_\text{drift} = q(n\mu_n + p\mu_p)E$$
-
-At high fields (above ~$10^4$ V/cm in silicon), $v_d$ saturates at $v_\text{sat} \approx 10^7$ cm/s because carriers emit optical phonons faster than the field can re-accelerate them. This velocity saturation is the reason simply shrinking transistor dimensions stops improving speed past a point — the channel field increases but $v_d$ does not.
+This is Ohm's Law derived from first principles. The conductivity $\sigma = nq\mu_n + pq\mu_p$ is controllable over many orders of magnitude by adjusting $n$ and $p$ through doping — the fundamental reason silicon is useful.
 
 ### Diffusion
 
-A concentration gradient drives net carrier flow even with no applied field. This is not a force — it is a consequence of random thermal motion: carriers in a high-concentration region have more neighbors to collide with and statistically migrate toward lower concentration. The flux is:
+Carriers also move in response to **concentration gradients**, with no electric field required. Random thermal motion is isotropic, but if more carriers exist on the left than the right, more random steps cross the boundary leftward-to-rightward than the reverse. The net flux is down the gradient — diffusion.
 
-$$J_{\text{diff},n} = qD_n \frac{dn}{dx}, \quad J_{\text{diff},p} = -qD_p \frac{dp}{dx}$$
+The diffusion current densities are:
 
-The sign difference: both equations describe flux from high to low concentration, but electrons ($-q$) and holes ($+q$) produce opposite current directions for the same particle flow.
+$$J_n^{\text{diff}} = qD_n \frac{dn}{dx}, \qquad J_p^{\text{diff}} = -qD_p \frac{dp}{dx}$$
 
-Drift and diffusion are linked. In thermal equilibrium, no net current flows anywhere — the drift and diffusion components must cancel exactly. Enforcing this cancellation yields the **Einstein relation**:
+The sign difference: electrons diffusing down a concentration gradient (positive $dn/dx$ meaning carriers move in $-x$) produce a current in $+x$ because current is defined opposite to electron flow. Holes diffusing down their gradient produce current in the same direction as their motion.
 
-$$D = \mu \frac{k_B T}{q} = \mu V_T$$
+Mobility and diffusion coefficient are not independent. At equilibrium, zero net current flows, so drift and diffusion must exactly cancel everywhere. Applying this condition to the equilibrium carrier distribution (which follows a Boltzmann exponential in the electrostatic potential) yields the **Einstein relation**:
 
-where $V_T = k_B T / q \approx 26$ mV at 300 K is the **thermal voltage**. This is not an independent equation — it is a thermodynamic constraint. Violating it would imply a perpetual current in equilibrium, which violates the second law. Concretely:
+$$\frac{D_n}{\mu_n} = \frac{D_p}{\mu_p} = \frac{k_B T}{q} \equiv V_T$$
 
-$$D_n = 1400 \times 0.026 \approx 36 \text{ cm}^2/\text{s}, \quad D_p = 450 \times 0.026 \approx 11.7 \text{ cm}^2/\text{s}$$
+At 300 K, the **thermal voltage** $V_T \approx 25.85\ \text{mV}$. This is not an empirical fit — it is forced by thermodynamics. Any model where this relation is violated predicts spontaneous current flow at equilibrium, violating the second law.
+
+Practical values: $D_n \approx 36\ \text{cm}^2/\text{s}$, $D_p \approx 12\ \text{cm}^2/\text{s}$ in lightly doped silicon at 300 K.
 
 ### The P-N Junction
 
-Place p-type and n-type silicon in contact (in practice, this is done by ion implantation or diffusion into a single crystal — there is no physical interface, just a doping profile that changes over nanometers to microns).
+Bring p-type and n-type silicon into metallurgical contact. The steep concentration gradient at the interface drives immediate diffusion:
 
-At the instant of contact, there is a large electron concentration gradient at the boundary: electrons diffuse from n into p, holes diffuse from p into n. As they leave, they expose the fixed dopant ions: positive donor ions on the n-side, negative acceptor ions on the p-side. These fixed charges cannot move. They create an electric field pointing from n to p — which drives drift currents opposing the diffusion. Equilibrium is reached when drift exactly cancels diffusion for each carrier species independently.
+- Electrons diffuse from n → p (high $n$ to low $n$)
+- Holes diffuse from p → n (high $p$ to low $p$)
 
-The region depleted of mobile carriers is the **depletion region**. Its width is set by charge neutrality: total negative charge on p-side equals total positive charge on n-side.
+As electrons vacate the n-side near the junction, they leave behind positively charged, immobile donor ions ($\text{P}^+$, $\text{As}^+$). As holes vacate the p-side, they expose negatively charged acceptor ions ($\text{B}^-$). A region forms near the junction that is depleted of free carriers — the **depletion region** — containing only fixed ionic charge.
 
-$$x_n N_D = x_p N_A$$
+This fixed charge distribution creates an electric field $\mathcal{E}$ pointing from the positive charge on the n-side to the negative charge on the p-side (n→p direction). This field drives drift currents that oppose the diffusion:
 
-where $x_n$ and $x_p$ are the depletion widths into the n and p sides respectively. Total depletion width:
+- Drift pushes electrons back toward n (field opposes diffusion)
+- Drift pushes holes back toward p
 
-$$W = x_n + x_p = \sqrt{\frac{2\epsilon_s}{q}\left(\frac{1}{N_A} + \frac{1}{N_D}\right)V_{bi}}$$
+Equilibrium is reached when drift current density exactly equals diffusion current density for each carrier species separately (not just in total). The junction reaches a steady state with a **built-in electric field** but zero net current.
 
-For heavily doped n-type ($N_D \gg N_A$), the depletion region extends almost entirely into the lightly doped p-side. Asymmetric doping produces asymmetric depletion — this is why the drain/body junction in a MOSFET behaves differently on each side.
+### The Depletion Region and Built-in Potential
 
----
-
-## How It Works
-
-### Built-in Potential
-
-The Fermi level $E_F$ — the electrochemical potential of electrons, the energy at which occupation probability is exactly $\frac{1}{2}$ — must be spatially uniform throughout any system in thermal equilibrium. (A gradient in $E_F$ would imply a net current, which is not equilibrium.) Since doping shifts $E_F$ differently in p and n regions, the bands must bend across the
+The built-in potential $V_{bi}$ is the electrostatic potential difference across the depletion region at equilibrium. It can be derived directly from the Einstein relation and the requirement of zero net current:

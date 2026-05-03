@@ -10,11 +10,13 @@ resources:
     title: "Introduction to Linear Algebra (Strang)"
 ---
 
+## Module 15: Logic and Formal Methods — Propositional Logic, Predicate Logic, SAT/SMT, and Model Checking
+
 ## Why This Matters
 
-Software has bugs that testing cannot find. Testing checks specific inputs; logic checks *all* inputs simultaneously. The difference is not quantitative — it is categorical. A test suite that covers a million inputs still leaves unchecked the one input that triggers the race condition. A formal proof eliminates that category of doubt entirely.
+The Linux kernel's BPF verifier rejects a program if it cannot prove, through exhaustive symbolic execution, that every possible execution path is memory-safe. The rejection is not heuristic — it is a logical proof. The verifier encodes program state as constraints and checks satisfiability. When it fails, the kernel prints a message like `R1 unbounded memory access` — which means: "I could not prove $\forall$ execution paths, the pointer is within bounds." Understanding why requires knowing what satisfiability means, what makes a proof valid, and why exhaustive state-space search is sometimes the only option.
 
-This is not theoretical: the Linux kernel's memory model is formally specified in a language called LKMM and checked with a tool called `herd7`. The TLS 1.3 protocol was verified with ProVerif before deployment. A model checker found a real livelock bug in the Linux ext3 journaling layer. SAT solvers are embedded in GCC's value-range propagation, in CBMC (a bounded model checker for C), and in hardware verification toolchains. Knowing how these tools work tells you what they can and cannot guarantee — and why "passes all tests" is a weaker claim than it sounds.
+Dirty COW (CVE-2016-5195) is instructive not as a cautionary tale but as a logical failure: the kernel held a belief expressible as $\text{readonly}(\text{mapping}) \Rightarrow \neg\text{writable}(\text{pte})$, but a race condition allowed a sequence of events that falsified the consequent while the antecedent held. The invariant was never formally stated, never checked mechanically, and therefore broke silently. `sparse`, `CBMC`, and the BPF verifier exist because informal reasoning has a track record of missing exactly these cases.
 
 ---
 
@@ -22,101 +24,111 @@ This is not theoretical: the Linux kernel's memory model is formally specified i
 
 ### Propositional Logic
 
-Propositional logic deals with atomic propositions — statements with a definite truth value — and connectives that combine them. There are no quantified variables, no functions, no structure inside a proposition. It is the base layer that everything else builds on.
+Propositional logic deals with atomic statements — true ($\top$) or false ($\bot$) — combined with connectives:
 
-| Symbol | Name | Truth condition |
-|--------|------|-----------------|
-| $\neg P$ | negation | true iff $P$ is false |
-| $P \land Q$ | conjunction | true iff both true |
-| $P \lor Q$ | disjunction | true iff at least one true |
-| $P \Rightarrow Q$ | implication | false only when $P$ true and $Q$ false |
-| $P \Leftrightarrow Q$ | biconditional | true iff same truth value |
+| Operator | Symbol | Semantics |
+|---|---|---|
+| NOT | $\neg P$ | $\top$ iff $P = \bot$ |
+| AND | $P \land Q$ | $\top$ iff both $\top$ |
+| OR | $P \lor Q$ | $\top$ iff at least one $\top$ |
+| IMPLIES | $P \Rightarrow Q$ | $\bot$ iff $P = \top$ and $Q = \bot$ |
+| IFF | $P \Leftrightarrow Q$ | $\top$ iff same value |
 
-Implication deserves attention. $P \Rightarrow Q$ is **vacuously true** when $P$ is false — the premise never fired, so the implication was never challenged. This is why a specification like "if `malloc` returns non-null, then the pointer is aligned" is trivially satisfied whenever `malloc` returns null. Your verifier is not broken; the formula is vacuously true. You must separately verify the case where the pointer is actually returned.
+Implication deserves attention because it consistently surprises people. $P \Rightarrow Q$ is not an assertion that $Q$ is true — it is a constraint on the relationship between $P$ and $Q$. When $P$ is false, the constraint is trivially satisfied regardless of $Q$. This is called **vacuous truth** and it is not a philosophical quirk; it is what makes modus ponens sound. If implication were false when $P$ was false, you could not chain inferences: knowing $A \Rightarrow B$ and $B \Rightarrow C$ would no longer guarantee $A \Rightarrow C$ in degenerate cases.
 
-A formula is a **tautology** if it is true under every truth assignment (e.g., $P \lor \neg P$), a **contradiction** if false under every assignment (e.g., $P \land \neg P$), and **satisfiable** if true under at least one assignment. Tautologies and contradictions are the two degenerate cases; satisfiability is the interesting middle ground that SAT solvers exploit.
+A formula is:
+- **Tautological** if it evaluates to $\top$ under every variable assignment — e.g., $P \lor \neg P$
+- **Contradictory** if it evaluates to $\bot$ under every assignment — e.g., $P \land \neg P$
+- **Satisfiable** if at least one assignment makes it $\top$
 
-### Predicate Logic
+The tautology/satisfiability duality is operationally important: to check if a formula $\phi$ is a tautology, check whether $\neg \phi$ is unsatisfiable. This is why SAT solvers are the computational core of theorem provers.
 
-Predicate logic adds variables, predicates, and quantifiers. A predicate $P(x)$ is a proposition parameterized by an object $x$. Quantifiers let you make claims over entire domains.
+### Predicate Logic (First-Order Logic)
 
-$$\forall x \, P(x) \quad \text{"for all } x \text{, } P(x) \text{ holds"}$$
-$$\exists x \, P(x) \quad \text{"there exists an } x \text{ such that } P(x) \text{ holds"}$$
+Propositional logic has no variables ranging over objects, so it cannot express properties of kernel data structures in any useful way. Predicate logic adds:
 
-The duality of quantifiers and negation is fundamental and practical:
+- **Terms**: variables ($x$, $p$, $\text{addr}$) ranging over a domain
+- **Predicates**: $\text{valid}(p)$, $\text{locked}(m)$, $\text{covers}(\text{vma}, \text{addr})$
+- **Quantifiers**:
+  - $\forall x \, P(x)$ — $P$ holds for every element of the domain
+  - $\exists x \, P(x)$ — $P$ holds for at least one element
+
+The Linux VMA invariant — every mapped address is covered by exactly one VMA — is:
+
+$$\forall \text{addr} \left( \text{mapped}(\text{addr}) \Rightarrow \exists! \, \text{vma} \left( \text{covers}(\text{vma}, \text{addr}) \right) \right)$$
+
+where $\exists!$ means "there exists exactly one." This is a formula you can write down, attempt to prove from the kernel's data structure invariants, or hand to a model checker. You cannot express it in propositional logic because it quantifies over an unbounded domain of addresses.
+
+Quantifier scope matters precisely because negation distributes through quantifiers in non-obvious ways:
 
 $$\neg \forall x \, P(x) \equiv \exists x \, \neg P(x)$$
 $$\neg \exists x \, P(x) \equiv \forall x \, \neg P(x)$$
 
-To **refute** a universal claim, you need one counterexample. To **refute** an existential claim, you must rule it out for every element of the domain. This asymmetry directly explains why model checkers produce counterexample traces when they find a bug: they are witnessing the existential $\exists \text{trace} \, \neg P(\text{trace})$.
+A bug report that says "this invariant was violated" is asserting $\exists x \, \neg P(x)$ — a single counterexample suffices to falsify a universal claim. This is why model checkers and fuzzers search for counterexamples rather than attempting proofs: falsification is often dramatically cheaper than verification.
 
-Predicate logic is the natural language for system specifications. "Every file descriptor returned by `open` is positive" is $\forall fd \, (\text{open returns } fd \Rightarrow fd > 0)$. "There exists a schedule under which two threads both hold the same mutex" is $\exists s \, (\text{mutex\_held}(A, s) \land \text{mutex\_held}(B, s))$. Making specifications explicit in this form forces precision that informal prose cannot provide.
+### SAT and the Complexity of Reasoning
 
-### The SAT Problem
+A **SAT problem** asks: given a propositional formula in **Conjunctive Normal Form (CNF)** — a conjunction of clauses, each clause a disjunction of literals — does any variable assignment satisfy it?
 
-A formula in **conjunctive normal form (CNF)** is a conjunction of **clauses**, each clause a disjunction of **literals** (a variable $x_i$ or its negation $\neg x_i$):
+$$(\neg A \lor B \lor C) \land (A \lor \neg B) \land (\neg C \lor A)$$
 
-$$(x_1 \lor \neg x_2 \lor x_3) \land (\neg x_1 \lor x_4) \land (x_2 \lor \neg x_3 \lor \neg x_4)$$
+SAT is NP-complete. This means: no polynomial-time algorithm is known, and the problem is at least as hard as every other problem in NP under polynomial reduction. The implication for verification is direct: checking whether a program has a bug that can be triggered within $k$ steps is reducible to SAT in $O(k)$ clauses, so verification is at least NP-hard in general. This is not a limitation of current tools — it is a structural property of the problem.
 
-The **SAT problem**: given a CNF formula over $n$ variables, does there exist a truth assignment satisfying all clauses simultaneously?
+Despite NP-completeness, modern solvers (CaDiCaL, Kissat, MiniSat) handle industrial instances with $10^6$–$10^7$ variables because real-world instances have exploitable structure. The key algorithmic ingredient is **Conflict-Driven Clause Learning (CDCL)**, described below.
 
-Any propositional formula can be converted to CNF via the Tseitin transformation, which introduces auxiliary variables to avoid exponential blowup. This is why CNF is the standard input format — it is not a restriction, it is a normal form.
+### SMT: Reasoning Over Richer Domains
 
-SAT is NP-complete: in the worst case, the search space is $2^n$. But worst-case inputs (random 3-SAT near the phase transition at clause-to-variable ratio $\approx 4.27$) rarely appear in practice. Real instances — encoding hardware circuits, compiler constraints, program verification conditions — have enough structure that DPLL with conflict-driven clause learning (CDCL) solves formulas with millions of variables in minutes. The theoretical hardness bound does not bind on structured inputs.
+**SMT (Satisfiability Modulo Theories)** extends SAT with background theories: integers ($\mathbb{Z}$), bitvectors ($\mathbb{Z}_{2^n}$), arrays, floating point, uninterpreted functions. The SMT solver coordinates a SAT solver (handling Boolean structure) with theory solvers (handling arithmetic, memory models, etc.) via the DPLL(T) architecture.
 
-### SMT: SAT Over Theories
+Where SAT can only check:
 
-**Satisfiability Modulo Theories (SMT)** lifts SAT to richer domains. Instead of asking whether a boolean formula is satisfiable, you ask whether it is satisfiable given that variables inhabit a specific theory: linear integer arithmetic ($\mathbb{Z}$ with $+$, $\leq$), bitvectors ($\mathbb{Z}/2^n\mathbb{Z}$ with bitwise ops), arrays, uninterpreted functions.
+$$(A \land B) \lor \neg C$$
 
-The bitvector theory is directly relevant to C: a C `uint32_t` is exactly a 32-bit bitvector. When you ask Z3 whether an unsigned overflow check is correct, it is reasoning about $\mathbb{Z}/2^{32}\mathbb{Z}$, not mathematical integers. The distinction matters: $2^{32} - 1 + 1 = 0$ in bitvector arithmetic but $= 2^{32}$ in $\mathbb{Z}$. Getting the theory wrong gives you a proof about the wrong model.
+SMT can check, in the theory of bitvectors, whether a C expression can overflow:
 
-An SMT solver works by having a DPLL-style SAT engine coordinate with theory solvers. The SAT engine proposes a candidate boolean assignment; theory solvers check whether that assignment is consistent within their theory; if not, they produce a theory lemma (a clause) that rules out the conflicting assignment and feeds it back to the SAT engine. This DPLL(T) architecture is why Z3 can handle mixed arithmetic-and-logic queries efficiently.
+$$\text{BV}_{32}(x) + \text{BV}_{32}(y) < \text{BV}_{32}(x)$$
+
+This is precisely what the BPF verifier does for register arithmetic: it maintains range constraints as SMT-style bitvector constraints and checks whether unsafe states are reachable.
+
+The core SMT theories relevant to kernel verification:
+
+| Theory | Domain | Kernel Use |
+|---|---|---|
+| QF_BV | Fixed-width bitvectors | Integer overflow, pointer arithmetic |
+| QF_A | Arrays with reads/writes | Memory models |
+| QF_LIA | Linear integer arithmetic | Loop bounds, buffer sizes |
+| QF_UF | Uninterpreted functions | Abstraction of system calls |
 
 ### Model Checking
 
-A **Kripke structure** is a tuple $(S, S_0, R, L)$: a set of states $S$, initial states $S_0 \subseteq S$, a transition relation $R \subseteq S \times S$, and a labeling function $L : S \to 2^{AP}$ mapping states to the atomic propositions true there.
+A **Kripke structure** is a tuple $M = (S, S_0, R, L)$ where $S$ is a set of states, $S_0 \subseteq S$ the initial states, $R \subseteq S \times S$ the transition relation, and $L : S \to 2^{\text{AP}}$ a labeling function mapping states to the atomic propositions true in that state.
 
-A **specification** in Linear Temporal Logic (LTL) is evaluated over paths through this structure. The core operators:
+**Model checking** answers: does $M \models \phi$? — does every execution of the system satisfy the formula $\phi$?
 
-- $\square P$ — $P$ holds at **every** state on the path ("globally" / "always")
-- $\diamond P$ — $P$ holds at **some** state on the path ("eventually")
-- $P \mathbin{\mathcal{U}} Q$ — $P$ holds until $Q$ holds ("until")
+The key temporal logics are:
 
-These compose. A standard safety property for mutex correctness:
+- **LTL (Linear Temporal Logic)**: reasons about a single linear execution path. Operators:
+  - $\mathbf{G}\, P$ — $P$ holds at every future state ("globally")
+  - $\mathbf{F}\, P$ — $P$ holds at some future state ("finally")
+  - $P \, \mathbf{U} \, Q$ — $P$ holds continuously until $Q$ becomes true
+  - $\mathbf{X}\, P$ — $P$ holds at the next state
 
-$$\square \neg (\text{cs}_A \land \text{cs}_B)$$
+- **CTL (Computation Tree Logic)**: reasons over branching execution trees, with path quantifiers $\mathbf{A}$ (all paths) and $\mathbf{E}$ (some path) prefixed to temporal operators.
 
-"It is always the case that $A$ and $B$ are not simultaneously in the critical section." A liveness property:
+The mutual exclusion property in LTL:
 
-$$\square (\text{request} \Rightarrow \diamond \text{response})$$
+$$\mathbf{G}\, \neg (\text{inCS}_1 \land \text{inCS}_2)$$
 
-"Every request is eventually followed by a response." Safety says bad things never happen. Liveness says good things eventually do. Both are necessary: a system that deadlocks satisfies all safety properties vacuously (nothing bad ever happens because nothing happens at all) but violates liveness.
+The liveness property (every request is eventually granted) in LTL:
 
-Model checking works by computing the set of reachable states — either explicitly (BFS/DFS over the state graph) or symbolically (representing sets of states as BDDs or SAT formulas). When the model checker finds a state violating the specification, it outputs the shortest path from an initial state to that state. That path is a concrete counterexample.
+$$\mathbf{G}\, (\text{request} \Rightarrow \mathbf{F}\, \text{granted})$$
 
-The fundamental limitation is **state space explosion**: $k$ boolean variables give $2^k$ states; $n$ concurrent processes each with $k$ variables give $k^n$ interleavings. Symbolic model checking (using BDDs or SAT/SMT to represent sets of states) pushes this boundary but does not eliminate it.
+The difference between LTL and CTL matters for expressiveness. "$P$ is reachable" is $\mathbf{EF}\, P$ in CTL but not directly expressible in LTL (LTL cannot distinguish "on some path" from "on all paths"). Conversely, $\mathbf{G}\,\mathbf{F}\, P$ ("$P$ happens infinitely often") is LTL but not CTL. Most industrial model checkers support CTL* (which subsumes both) or operate directly on LTL via automata-theoretic methods.
 
 ---
 
 ## How It Works
 
-### Resolution
+### CNF Conversion: Tseitin Transformation
 
-Given two clauses containing a complementary literal, resolution derives a new clause:
-
-$$\frac{(A \lor x) \quad (\neg x \lor B)}{A \lor B}$$
-
-The variable $x$ is **resolved away**. The derived clause is a logical consequence of the two premises — if both are satisfied, so is $A \lor B$.
-
-The **resolution refutation** procedure: add the negation of the formula you want to prove to your axioms, then apply resolution repeatedly. If you derive the empty clause $\bot$, the extended set is unsatisfiable, which means the original formula was a tautology. This is the foundation of automated theorem proving and the theoretical basis of DPLL.
-
-### DPLL and Unit Propagation
-
-DPLL is a backtracking search over variable assignments, accelerated by two rules:
-
-1. **Unit propagation**: if a clause has exactly one unassigned literal, that literal *must* be true (otherwise the clause is falsified). Assign it immediately.
-2. **Pure literal elimination**: if a variable appears only positively or only negatively across all remaining clauses, assign it to satisfy all those clauses at once.
-
-Consider:
-
-$$(x_1 \lor x_2) \land (\neg x_1 \lor x_3)
+Naive CNF conversion via distribution can produce

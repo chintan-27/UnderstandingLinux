@@ -12,87 +12,89 @@ resources:
 
 ## Why This Matters
 
-Every transistor in your CPU sits inside a silicon crystal lattice. Whether that transistor switches reliably at 5 GHz or fails after six months depends on what the crystal does under stress, heat, and electric fields. Grain boundaries scatter electrons and limit conductivity in metal interconnects. Point defects create the dopant sites that make n-type and p-type semiconductors possible. Diffusion through a crystal lattice is how dopants are introduced during fabrication and how atoms migrate to create voids under electromigration — the dominant failure mode in copper interconnects below 10 nm. The kernel's CPU frequency scaling, thermal throttling, and memory refresh intervals are all engineering responses to atomic-scale physics. This module explains the physics those engineering choices are compensating for.
+Every piece of hardware your Linux system runs on exists because humans learned to control matter at the atomic scale. A CPU's switching speed is bounded by electron mobility through a silicon crystal; that mobility collapses when the crystal contains too many defects. DRAM retention time is governed by charge leakage through oxide, which is a diffusion process. Solder joints crack under thermal cycling because of grain boundary stress accumulation. These are not metaphors — they are the rate-limiting physics that determine why your CPU throttles, why ECC events cluster at elevated temperatures, and why old hardware fails in characteristic ways. This module builds the physical intuition behind those mechanisms.
 
 ---
 
 ## Core Concepts
 
-### Crystal Structures: Long-Range Order
+### Crystal Lattices: Periodicity as the Source of Band Structure
 
-A crystal is a solid where atoms occupy the vertices of a repeating three-dimensional **lattice**. The smallest repeating unit is the **unit cell**. Silicon forms a **diamond cubic** structure: two interpenetrating face-centered cubic (FCC) sublattices, one offset from the other by $\frac{a\sqrt{3}}{4}$ along the body diagonal, where $a = 0.543\ \text{nm}$ is the lattice constant. Each silicon atom is covalently bonded to four neighbors in a tetrahedral geometry — this four-fold coordination is why silicon is a semiconductor rather than a metal: the bonding and antibonding states split into a valence band and a conduction band separated by a 1.12 eV gap.
+A crystal is defined by translational symmetry: atoms occupy positions $\mathbf{r} = n_1\mathbf{a}_1 + n_2\mathbf{a}_2 + n_3\mathbf{a}_3$ for integer $n_i$, where $\mathbf{a}_i$ are the primitive lattice vectors. The repeating unit is the **unit cell**. Silicon adopts the **diamond cubic** structure: two interpenetrating face-centered cubic (FCC) sublattices, one offset from the other by $\frac{a}{4}(1,1,1)$, giving each atom exactly four covalent nearest neighbors in a tetrahedral geometry.
 
-The reason atoms form crystals rather than random arrangements is energy minimization. The equilibrium bond length $r_0$ is the separation where net interatomic force is zero:
+Why does this geometry determine electrical behavior? Because electrons in a periodic potential cannot have arbitrary energies — Bloch's theorem forces electron wavefunctions to inherit the lattice periodicity, and the resulting interference between forward- and backward-scattered waves opens **band gaps**: ranges of energy with no allowed electron states. Silicon's gap is:
 
-$$\frac{dU}{dr}\bigg|_{r=r_0} = 0$$
+$$E_g \approx 1.12\ \text{eV} \quad \text{at } T = 300\ \text{K}$$
 
-The potential well depth at $r_0$ is the cohesive energy per bond. For silicon, cohesive energy is approximately $4.63\ \text{eV/atom}$, which is why silicon does not spontaneously disorder at room temperature — thermal energy $k_B T \approx 0.026\ \text{eV}$ at 300 K is far below the energy cost of breaking bonds.
+This value sits between metals ($E_g = 0$) and insulators ($E_g > 5\ \text{eV}$), which is precisely what makes it controllable: thermal energy at room temperature ($k_BT \approx 0.026\ \text{eV}$) is too small to bridge the gap spontaneously, but chemical doping can place electrons just below the conduction band, where trivially small energies ionize them.
 
-The lattice is not static. Atoms vibrate around equilibrium with amplitudes that grow with temperature. These vibrations are quantized — the quanta are **phonons** — and they carry heat through the crystal via propagation rather than electron transport. Silicon's thermal conductivity ($\approx 150\ \text{W/m·K}$) is high because phonons propagate with low scattering in a pure, stiff lattice. Anything that disrupts lattice periodicity — impurities, defects, grain boundaries — scatters phonons and reduces thermal conductivity. This matters for CPU cooling: a doped, stressed silicon die conducts heat less efficiently than a perfect crystal, and the thermal interface between die and heatspreader is engineered precisely because phonons cannot cross an amorphous boundary without mode conversion losses.
+The lattice constant $a = 0.543\ \text{nm}$ sets the atom density:
 
-### Defects: Where Reality Diverges from the Ideal
+$$n = \frac{8}{a^3} = \frac{8}{(5.43 \times 10^{-10})^3} \approx 5.00 \times 10^{28}\ \text{m}^{-3}$$
 
-Real crystals contain defects at finite temperature because their presence increases entropy enough to lower the Gibbs free energy even at the cost of disrupting local bonding. Defects are classified by dimensionality:
+Modern transistor gate pitches are $\sim 5\ \text{nm}$ — roughly 9 lattice constants — so the discrete atomic structure of the crystal is no longer negligible in device design. At this scale, one misplaced dopant atom shifts the threshold voltage of an individual transistor.
 
-**Point defects (0D):**
-- **Vacancy**: a missing atom. The site is empty, local bonds are broken, and neighboring atoms relax inward.
-- **Interstitial**: an extra atom squeezed between lattice sites. Silicon interstitials are particularly mobile and mediate dopant diffusion during ion implantation annealing.
-- **Substitutional impurity**: a foreign atom replacing a host atom. Phosphorus (group V, one extra valence electron → n-type donor) and boron (group III, one fewer electron → p-type acceptor) substituted into silicon at concentrations of $10^{15}$–$10^{20}\ \text{cm}^{-3}$ are the deliberate point defects that make transistors switch.
+### Defects: The Mechanisms That Make Semiconductors Useful
 
-**Line defects (1D) — Dislocations:**
-A dislocation is a line along which the crystal's regular stacking is disrupted. The displacement the crystal undergoes as you trace a closed loop around the dislocation line is the **Burgers vector** $\vec{b}$. For an edge dislocation, $\vec{b}$ is perpendicular to the dislocation line; for a screw dislocation, $\vec{b}$ is parallel. The shear stress required to move a dislocation through a perfect crystal is orders of magnitude lower than the theoretical shear strength of the lattice, which is why metals deform plastically at stresses far below $E/10$. In silicon wafers, dislocation density must be kept below roughly $10^3\ \text{cm}^{-2}$ — dislocations in the active device region act as recombination centers that degrade transistor performance.
+A perfect crystal is a mathematical abstraction with zero entropy; thermodynamics guarantees that real crystals contain defects. More importantly, controlled defects are the *mechanism* of transistor operation.
 
-**Planar defects (2D) — Grain Boundaries:**
-Where two crystals of differing orientations meet, a grain boundary forms. Polycrystalline silicon, copper interconnects, and solder joints are all polycrystalline. The consequences are profound and mostly negative from a device perspective.
+**Point defects:**
 
-The equilibrium vacancy concentration follows a Boltzmann distribution because the system minimizes free energy by trading bond energy for configurational entropy:
+- **Vacancy**: a missing atom. Neighboring atoms relax inward; the local electronic structure changes. Vacancies are the dominant vehicle for solid-state diffusion — atoms migrate by hopping into adjacent vacancies. The equilibrium vacancy concentration is:
 
-$$n_v = N \exp\!\left(-\frac{E_f}{k_B T}\right)$$
+$$n_v = N \exp\!\left(-\frac{E_f}{k_BT}\right)$$
 
-where $N$ is the number of lattice sites, $E_f$ is the vacancy formation energy ($\approx 2.3\ \text{eV}$ for copper, $\approx 3.6\ \text{eV}$ for tungsten), $k_B$ is Boltzmann's constant, and $T$ is temperature. For copper at 20°C versus 300°C:
+where $E_f \approx 2.3\ \text{eV}$ for silicon. At $T = 1000\ \text{K}$ (a typical anneal temperature), $n_v/N \approx e^{-26.7} \approx 10^{-12}$, which sounds small but corresponds to $\sim 5 \times 10^{16}\ \text{vacancies/m}^3$ — comparable to intentional dopant concentrations.
 
-$$\frac{n_v(300°\text{C})}{n_v(20°\text{C})} = \exp\!\left(-\frac{E_f}{k_B}\left(\frac{1}{573} - \frac{1}{293}\right)\right) \approx 10^{10}$$
+- **Substitutional dopant**: a phosphorus atom (group V, 5 valence electrons) replacing a silicon atom donates one electron to the conduction band, costing only $E_d \approx 0.045\ \text{eV}$ — far below $k_BT$ at room temperature, so essentially all donors are ionized. Boron (group III, 3 valence electrons) accepts an electron from the valence band for $E_a \approx 0.045\ \text{eV}$, creating a mobile hole. The carrier density in an n-type sample doped at $N_D$ is:
 
-Ten orders of magnitude more vacancies at chip operating temperatures than at room temperature. Those vacancies in copper interconnects are what electromigration moves — electron wind drags copper atoms along the current direction, leaving vacancy clusters (voids) at the source and hillocks at the sink.
+$$n \approx N_D, \quad p \approx \frac{n_i^2}{N_D}$$
 
-### Stress and Strain: How Solids Respond to Force
+where $n_i \approx 1.5 \times 10^{10}\ \text{cm}^{-3}$ at 300 K is the intrinsic carrier concentration. This is why heavily doped silicon ($N_D \sim 10^{19}\ \text{cm}^{-3}$) behaves like a metal — carriers outnumber intrinsic thermally generated ones by nine orders of magnitude.
 
-**Stress** $\sigma$ is force per unit area (Pa). **Strain** $\varepsilon$ is fractional deformation — dimensionless ratio of displacement to original length. In the elastic regime:
+- **Interstitial**: an atom sitting between lattice sites, causing local compression. Oxygen interstitials in silicon act as pinning centers for dislocations — deliberately introduced to prevent dislocation propagation through the active device region.
 
-$$\sigma = E \varepsilon$$
+**Line defects (dislocations):**
 
-where $E$ is **Young's modulus**. Silicon is elastically anisotropic: $E \approx 130\ \text{GPa}$ along $\langle 100 \rangle$, $\approx 187\ \text{GPa}$ along $\langle 111 \rangle$. Modern process nodes deliberately introduce **strain engineering** — depositing silicon-germanium in source/drain regions compresses the silicon channel, which distorts the band structure and increases carrier mobility by 20–50%, directly increasing drive current and switching speed without scaling geometry.
+An edge dislocation is an extra half-plane of atoms terminated inside the crystal. The surrounding lattice is elastically strained in a field that decays as $1/r$ from the dislocation core. Dislocations move under shear stress (they enable plastic deformation in metals), but in silicon they are catastrophic: the broken bonds at the dislocation core introduce **mid-gap trap states** that act as carrier recombination centers. A single dislocation threading through a transistor channel can increase off-state leakage by orders of magnitude. Wafer manufacturers specify dislocation densities below $10^3\ \text{cm}^{-2}$ for device-grade material; float-zone silicon reaches below $10^1\ \text{cm}^{-2}$.
 
-Beyond the **yield stress** $\sigma_y$, plastic deformation occurs via dislocation motion — the crystal permanently reshapes. Beyond the **fracture stress**, it breaks. Silicon is brittle (no plastic regime) — it fractures rather than bends, which is why wafer handling requires controlled environments and why die cracking during packaging is a yield concern.
+The **Burgers vector** $\mathbf{b}$ characterizes a dislocation's strength: it is the closure failure when you walk a loop around the dislocation in the perfect crystal. For FCC silicon, $|\mathbf{b}| = \frac{a}{\sqrt{2}} \approx 0.384\ \text{nm}$.
 
-Thermal stress arises when bonded materials have different **coefficients of thermal expansion (CTE)**. The mismatch strain is:
+### Grain Boundaries: Structural Discontinuities That Resist Current
 
-$$\varepsilon_{\text{thermal}} = (\alpha_1 - \alpha_2)\,\Delta T$$
+A **polycrystalline** material consists of many crystalline grains with different orientations, separated by **grain boundaries** — thin regions (1–2 nm wide) where the periodic structure breaks down. The misorientation angle $\theta$ between adjacent grains determines the boundary structure: low-angle boundaries ($\theta < 15°$) can be described as arrays of dislocations; high-angle boundaries are amorphous-like transition zones.
 
-For silicon ($\alpha \approx 2.6\ \text{ppm/K}$) bonded to copper ($\alpha \approx 17\ \text{ppm/K}$), a $\Delta T = 100\ \text{K}$ temperature swing produces:
+Grain boundaries matter for chip interconnects for three compounding reasons:
 
-$$\varepsilon_{\text{thermal}} = (17 - 2.6) \times 10^{-6} \times 100 = 1.44 \times 10^{-3}$$
+1. **Electron scattering**: Conduction electrons scatter at boundaries, adding a resistivity contribution $\rho_{GB}$ that scales as $d^{-1}$ where $d$ is grain size. As copper interconnect widths shrink below the electron mean free path ($\lambda_{Cu} \approx 40\ \text{nm}$ at room temperature), $\rho_{GB}$ dominates over bulk scattering. Interconnect resistivity at the 5 nm node is 2–3× the bulk copper value — this directly increases $RC$ delay and power dissipation.
 
-Multiplied by copper's modulus ($\approx 130\ \text{GPa}$), that's $\sim 187\ \text{MPa}$ of stress — enough to drive fatigue cracking in solder joints over thousands of power cycles. CPU package design is largely the engineering problem of managing this mismatch across silicon, copper lid, thermal interface material, and FR4 PCB substrate.
+2. **Accelerated diffusion**: Grain boundary diffusion has activation energy $Q_{GB} \approx 0.8\ \text{eV}$ in copper, versus $Q_{bulk} \approx 2.1\ \text{eV}$. At operating temperatures ($\sim 100°\text{C}$), boundary diffusion is faster than bulk diffusion by a factor:
 
-### Diffusion: Atomic Motion Through a Lattice
+$$\frac{D_{GB}}{D_{bulk}} = \exp\!\left(\frac{Q_{bulk} - Q_{GB}}{k_BT}\right) = \exp\!\left(\frac{1.3}{0.032}\right) \approx 10^{17}$$
 
-At finite temperature, atoms hop between lattice sites by surmounting an energy barrier $Q$. The probability of surmounting the barrier follows Boltzmann statistics, giving an **Arrhenius diffusion coefficient**:
+This is why electromigration damage nucleates at grain boundaries before anywhere else.
 
-$$D = D_0 \exp\!\left(-\frac{Q}{k_B T}\right)$$
+3. **Impurity segregation**: Impurity atoms with a size or valence mismatch lower their energy by sitting in the disordered boundary region. This makes grain boundaries preferential sites for corrosion and void nucleation.
 
-$D_0$ is a pre-exponential that encodes attempt frequency and geometry; $Q$ is the activation energy. For boron diffusing in silicon, $Q \approx 3.46\ \text{eV}$; for phosphorus, $Q \approx 3.66\ \text{eV}$. These values set the time and temperature of annealing steps in fab. Note the exponential sensitivity: a 50°C process temperature error changes $D$ by a factor of $\sim 2$–$5$ depending on $Q$, shifting dopant profile depths and threshold voltages.
+### Stress and Strain: Why Packages Crack on Thermal Cycling
 
-Net atomic flux down a concentration gradient is **Fick's First Law**:
+**Stress** $\sigma$ is force per unit area (Pa). **Strain** $\varepsilon$ is fractional change in length (dimensionless). In the elastic regime, they are related by Young's modulus $E$:
 
-$$J = -D \frac{\partial C}{\partial x}$$
+$$\sigma = E\varepsilon$$
 
-The time evolution of concentration is **Fick's Second Law**:
+Silicon is elastically anisotropic: $E$ varies from $\approx 130\ \text{GPa}$ along $\langle100\rangle$ to $\approx 187\ \text{GPa}$ along $\langle111\rangle$. Wafers are diced along specific crystal planes to minimize chipping, and this anisotropy is why they cleave cleanly.
 
-$$\frac{\partial C}{\partial t} = D \frac{\partial^2 C}{\partial x^2}$$
+Thermal stress arises from CTE mismatch between bonded layers. For silicon and its gate oxide:
 
-For a delta-function source (ion implant) diffusing into a semi-infinite solid, the solution is a Gaussian:
+| Material | CTE $\alpha$ (K$^{-1}$) |
+|---|---|
+| Silicon | $2.6 \times 10^{-6}$ |
+| SiO$_2$ | $0.5 \times 10^{-6}$ |
+| Copper | $17 \times 10^{-6}$ |
+| FR4 PCB | $\sim 14 \times 10^{-6}$ |
 
-$$C(x,t) = \frac{Q_0}{\sqrt{\pi D t}}\exp\!\left(-\frac{x^2}{4Dt}\right)$$
+When a chip heats by $\Delta T$ from its bonding temperature, the biaxial stress generated at an interface is:
 
-where $Q_0$ is the total implanted dose. The **diffusion length** $L = 2\sqrt{Dt}$ characterizes how far the profile spreads. At
+$$\sigma = \frac{E}{1-\nu}\,\Delta\alpha\cdot\Delta T$$
+
+where $\nu$ is Poisson's ratio. For a CPU cycling between 30°C idle and 90°C load ($\Delta T = 60\ \text{K}$), the stress at the silicon–

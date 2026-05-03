@@ -12,104 +12,94 @@ resources:
 
 ## Why This Matters
 
-Every circuit on your motherboard needs clean, stable DC voltage at a specific level. The wall outlet delivers 120V AC. A battery delivers a voltage that sags under load and drops as it discharges. Without regulation, a 5% voltage droop on a CPU's 1.0V rail shifts logic thresholds enough to violate setup and hold times — the result is silent data corruption or hard resets, not a clean error you can debug. Without decoupling, the 10A current spike when a CPU transitions from idle to full load travels through parasitic inductance in PCB traces and creates a voltage spike that can reset neighboring chips. Linux sees all of this directly: the `cpufreq` subsystem exists because the VRM has thermal limits; `hwmon` exposes VRM fault flags; ACPI P-states and C-states are negotiated in real time partly to stay within the power delivery envelope. Power delivery is a physical constraint that software navigates continuously.
+Every circuit on your Linux machine — CPU, RAM, PCIe bus, storage controller — requires a stable DC voltage to function correctly. If the voltage supply to your CPU droops 5% during a memory burst, you get bit errors, instability, or a hard crash — not a kernel panic with a useful message, but silent data corruption or a machine check exception. If decoupling is absent, high-frequency switching noise from one subsystem couples into the analog front-end of another. Voltage regulators solve the first problem; decoupling capacitors solve the second. Without both working correctly, no amount of software correctness matters — the hardware beneath your kernel is lying to it.
 
 ---
 
 ## Core Concepts
 
+### The Problem: Unregulated DC
+
+Rectifying AC through a transformer and bridge gives you DC, but it is *unregulated*: the output voltage sags under heavy load because of nonzero source impedance, rises under light load, and ripples at twice the line frequency (120 Hz in North America, 100 Hz in Europe). The ripple amplitude is:
+
+$$V_{ripple} \approx \frac{I_{load}}{2 f C}$$
+
+where $f$ is the line frequency and $C$ is the filter capacitor. Doubling $C$ halves the ripple, but at 120 Hz you need hundreds of microfarads to get millivolt-level ripple — capacitors that are physically enormous. The practical answer is regulation through a feedback loop, not brute-force filtering.
+
 ### Linear Regulators
 
-A linear regulator places a transistor (the pass element) in series between the unregulated input and the regulated output. A feedback loop compares the output voltage to a stable bandgap reference and adjusts the transistor's gate to hold the output at the set point. The transistor is biased in its active region — it behaves as a variable resistor, and the excess voltage $(V_{in} - V_{out})$ drops across it.
+A linear regulator places a transistor — the *pass element* — in series between the unregulated input and the regulated output. A feedback amplifier compares the output to a bandgap reference and drives the pass transistor's gate to maintain constant $V_{out}$. The pass transistor operates in its active region, dropping the excess voltage as heat:
 
-The efficiency ceiling is set by the voltage ratio alone:
+$$P_{dissipated} = (V_{in} - V_{out}) \times I_{load}$$
 
-$$\eta_{max} = \frac{V_{out}}{V_{in}}$$
+This produces very clean output — no switching transitions, no high-frequency noise — which makes linear regulators attractive for noise-sensitive analog and RF circuitry. But efficiency is bounded by the voltage ratio:
 
-At $V_{in} = 12\text{V}$, $V_{out} = 5\text{V}$, efficiency is capped at $\approx 42\%$. The remaining $7\text{V} \times I_{load}$ is dissipated as heat in the pass transistor — not as a switching loss or a conduction loss that you can engineer around, but as a direct consequence of Ohm's law applied to the voltage difference. At 1A, that is 7W regardless of load behavior. The thermal problem scales with current, which is why linear regulators at anything above a few hundred milliamps require significant heatsinking.
+$$\eta = \frac{V_{out}}{V_{in}}$$
 
-Linear regulators remain useful in three narrow cases: small $V_{in}$-to-$V_{out}$ differential (efficiency loss is acceptable), low load current, or applications requiring very low output noise. Switching regulators inject high-frequency noise by their operating principle; a linear post-regulator on a sensitive analog or RF supply trades efficiency for the noise floor.
+At $V_{in} = 12\,\text{V}$, $V_{out} = 5\,\text{V}$, $I_{load} = 1\,\text{A}$: $\eta = 42\%$, with $7\,\text{W}$ wasted as heat in the pass transistor. At $100\,\text{A}$ — not unusual for a server VRM — that becomes $700\,\text{W}$ of thermal load. Linear regulators are practical only when $V_{in} - V_{out}$ is small (a few hundred millivolts, as in an LDO post-regulator) or load current is low.
 
 ### Switching Regulators
 
-A switching regulator drives a transistor as a saturated switch — either fully on (small $V_{DS}$, nearly zero dissipation) or fully off (zero $I_D$, zero dissipation). The switch is never held in the resistive region, so the power loss during each state is small. Transition losses (charging and discharging gate capacitance, finite switching time) scale with frequency, but efficiency of 85–95% is routinely achievable.
+A switching regulator uses a transistor as a saturated *switch*, not a variable resistor. It alternates rapidly between fully on ($V_{DS} \approx 0$, so $P = V_{DS} \cdot I_D \approx 0$) and fully off ($I_D = 0$, so $P = 0$ again). In both ideal states the switch dissipates negligible power. Real losses come from the transitions themselves — charging and discharging gate capacitance at frequency $f_{sw}$, plus conduction losses from finite on-resistance $R_{DS(on)}$ — but these are small compared to linear dissipation at high current.
 
-The mechanism: during the on-time, the switch connects $V_{in}$ to an inductor, and the inductor current ramps up, storing energy as $E = \frac{1}{2}LI^2$. When the switch opens, the inductor's collapsing magnetic field drives current through a catch diode (or synchronous low-side switch) into the output capacitor and load. The output voltage is set by the fraction of time the switch is on — the duty cycle $D$:
+The most common topology is the *buck converter* (step-down):
+
+1. **High-side switch closes**: $V_{in}$ is applied across the inductor. Current ramps up at $\frac{dI}{dt} = \frac{V_{in} - V_{out}}{L}$, storing energy $E = \frac{1}{2}LI^2$ in the magnetic field.
+2. **Switch opens**: The inductor maintains current flow — because $V = L\,\frac{dI}{dt}$, any attempt to abruptly stop current drives $V$ to whatever value is needed to keep current flowing. A catch diode (or synchronous low-side FET) provides the return path; current ramps down at $\frac{dI}{dt} = \frac{V_{out}}{L}$.
+3. **Feedback loop** measures $V_{out}$ and adjusts the duty cycle $D = t_{on}/T$ to regulate the output. At steady state, volt-second balance on the inductor gives:
 
 $$V_{out} = D \cdot V_{in}$$
 
-This holds for a continuous-conduction-mode (CCM) buck converter in steady state. The feedback loop adjusts $D$ in real time to maintain regulation against load and line changes. The cost relative to a linear regulator is complexity: switching noise, EMI, and component count. Every high-frequency switching edge is a radiated and conducted emission source.
+Efficiencies of 85–95% are achievable, which is why every modern power supply — laptop charger, server PSU, CPU VRM — is a switcher. The cost is complexity and switching noise: the fast $dV/dt$ and $dI/dt$ transitions generate broadband EMI that must be filtered and shielded.
+
+### Voltage References
+
+Every regulator requires a stable reference voltage to compare against. Bandgap references exploit the predictable temperature behavior of silicon PN junctions: the base-emitter voltage $V_{BE}$ of a bipolar transistor has a negative temperature coefficient (~$-2\,\text{mV/°C}$), while the thermal voltage $V_T = kT/q$ has a positive one. A circuit that sums these in the right proportion produces a temperature-stable output near $1.25\,\text{V}$ — the silicon bandgap voltage extrapolated to $0\,\text{K}$. If this reference drifts, every downstream voltage drifts with it, and the regulator's regulation accuracy is only as good as its reference.
 
 ### Decoupling Capacitors
 
-When a digital circuit switches and demands a burst of current, that current must travel from the power supply through PCB traces, vias, and package leads to the die. Every segment of that path has inductance. Faraday's law gives the voltage penalty:
+Even a perfect regulator cannot respond instantaneously to load steps. The *power distribution network* (PDN) — board traces, vias, connector pins, bond wires inside the package — has nonzero inductance $L_{PDN}$. When a digital block switches, it draws a current spike with a rise time in the nanosecond range. That $dI/dt$ through the PDN inductance creates a voltage drop:
 
-$$V_L = L\frac{dI}{dt}$$
+$$V_{drop} = L_{PDN} \frac{dI}{dt}$$
 
-A 10A step in 1ns through 1nH of inductance produces a 10V spike on a 1V rail — catastrophic. Decoupling capacitors placed physically close to the load act as local charge reservoirs. They supply the initial transient current from stored charge $Q = CV$ while the regulator's slower feedback loop (with bandwidth typically in the tens to hundreds of kHz) catches up.
+For $L_{PDN} = 10\,\text{nH}$ and $\frac{dI}{dt} = 1\,\text{A/ns} = 10^9\,\text{A/s}$:
 
-Decoupling requires capacitors at multiple scales because each real capacitor has a self-resonant frequency (SRF) above which its parasitic series inductance (ESL) dominates and it behaves inductively. Below the SRF, it is capacitive and useful for decoupling. The required hierarchy:
+$$V_{drop} = 10\,\text{nH} \times 10^9\,\text{A/s} = 10\,\text{V}$$
 
-| Type | Typical Value | Function |
-|---|---|---|
-| Bulk electrolytic/polymer | 100 µF – 1 mF | Load steps over microseconds to milliseconds |
-| MLCC ceramic | 100 nF | Nanosecond switching transients |
-| On-die capacitance | tens of nF (integrated) | Sub-nanosecond transitions at the die edge |
+That is catastrophic on a 1.2 V CPU core rail. The fix is to place capacitors physically close to the load. They act as local charge reservoirs: they supply the instantaneous current while the regulator (which has finite loop bandwidth and sees the inductance of the longer supply path) catches up. The allowable voltage droop $\Delta V$ determines how much charge the capacitor must supply:
 
-The reason you cannot use one large capacitor is that a 1 mF electrolytic has an SRF of perhaps 10 kHz — it is inductive at the frequencies a 100 MHz clock edge generates. A 100 nF ceramic MLCC has an SRF around 50–100 MHz and handles that range. On-die capacitance, placed microns from the switching gates, handles the fastest transitions at GHz frequencies.
+$$Q = C \cdot \Delta V$$
+
+If $\Delta I = 10\,\text{A}$, the transient lasts $t = 100\,\text{ns}$, and $\Delta V_{max} = 50\,\text{mV}$, then:
+
+$$C \geq \frac{\Delta I \cdot t}{\Delta V} = \frac{10 \times 100 \times 10^{-9}}{50 \times 10^{-3}} = 20\,\mu\text{F}$$
+
+Different capacitor values cover different frequency decades. Bulk electrolytics (100–1000 µF, mounted near the VRM) handle slow load steps where regulator bandwidth is insufficient. MLCC ceramics (100 nF–10 µF, scattered across the board near loads) handle mid-frequency switching transients. Small ceramics (1–10 nF) placed directly at IC power pins — or inside the package itself — handle the fastest edges. Each layer targets the impedance of the PDN at a specific frequency range; the goal is a flat $|Z_{PDN}(f)|$ below the target impedance across the entire operating bandwidth.
 
 ### Power Integrity
 
-Power integrity (PI) is the discipline of keeping $V_{DD}$ and $V_{SS}$ within their specified tolerance bands at every point in the system across all frequencies of interest. The governing quantity is the power distribution network (PDN) impedance $Z_{PDN}(f)$. The target impedance at any frequency is:
-
-$$Z_{target} = \frac{\Delta V_{allowed}}{I_{max}}$$
-
-For a CPU rail with $V_{DD} = 1.0\text{V}$, a 5% tolerance ($\Delta V = 50\text{mV}$), and peak current $I_{max} = 100\text{A}$:
-
-$$Z_{target} = \frac{0.05\text{V}}{100\text{A}} = 0.5\text{m}\Omega$$
-
-Maintaining sub-milliohm PDN impedance from DC through several hundred MHz requires coordinated placement of VRM output capacitors, board-level bulk and bypass capacitors, and on-package capacitance. Resonances in the PDN (where inductive and capacitive elements interact) produce impedance peaks that cause voltage droop at specific frequencies — the frequencies that happen to match a CPU's load modulation pattern from a tight loop.
+Power integrity (PI) is the discipline of ensuring every power node stays within voltage tolerance under all operating conditions. A PI failure looks, from software, like random machine check exceptions, ECC-corrected or uncorrected memory errors, PCIe link retrains, or spontaneous reboots under load — symptoms that are frequently misdiagnosed as software bugs or bad RAM.
 
 ---
 
 ## How It Works
 
-### Buck Converter Operation in Detail
+### The Buck Converter in Detail
 
-Consider a synchronous buck converter: input $V_{in}$, output $V_{out}$, inductor $L$, output capacitor $C$, switching frequency $f_{sw}$, duty cycle $D$.
+For a synchronous buck converter with switching frequency $f_{sw}$, inductor $L$, and duty cycle $D$:
 
-**On-phase** (duration $DT$, where $T = 1/f_{sw}$): The high-side switch closes, connecting $V_{in}$ to the inductor. The voltage across the inductor is $V_{in} - V_{out}$, so current ramps up:
+**Current ripple** through the inductor during on-time $t_{on} = D/f_{sw}$:
 
-$$\frac{dI_L}{dt}\bigg|_{on} = \frac{V_{in} - V_{out}}{L}$$
+$$\Delta I_L = \frac{(V_{in} - V_{out}) \cdot D}{f_{sw} \cdot L} = \frac{V_{out}(1 - D)}{f_{sw} \cdot L}$$
 
-**Off-phase** (duration $(1-D)T$): The high-side switch opens; the low-side switch closes, connecting the inductor to ground. The voltage across the inductor is $-V_{out}$, so current ramps down:
+Both expressions are equal at steady state — this is the volt-second balance condition. Solving either for $V_{out}$ recovers $V_{out} = D \cdot V_{in}$.
 
-$$\frac{dI_L}{dt}\bigg|_{off} = \frac{-V_{out}}{L}$$
+**Why higher $f_{sw}$ allows smaller passive components**: for a fixed $\Delta I_L$ target, $L \propto 1/f_{sw}$. Doubling the switching frequency halves the required inductance and capacitance. This is why modern CPU VRMs run at 300 kHz–3 MHz rather than the 50–100 kHz common in older designs — silicon FET switching losses scale as $P_{sw} \propto f_{sw}$, so there is a design tradeoff between passive component size and switching losses.
 
-In steady state, the inductor current must be periodic — the current at the end of each cycle equals the current at the start. This means the volt-second product must balance over one cycle (the average voltage across the inductor must be zero):
+**Minimum inductance for continuous conduction mode (CCM)**: the converter enters discontinuous conduction mode (DCM) when $\Delta I_L/2 > I_{load}$. For CCM at minimum load $I_{min}$:
 
-$$(V_{in} - V_{out}) \cdot DT = V_{out} \cdot (1-D)T$$
+$$L_{min} = \frac{V_{out}(1-D)}{2 f_{sw} \cdot I_{min}}$$
 
-Solving:
+A controller entering DCM changes its small-signal transfer function, which can destabilize the feedback loop — this is why converters have a minimum load specification.
 
-$$V_{out} = D \cdot V_{in}$$
-
-The peak-to-peak inductor current ripple is:
-
-$$\Delta I_L = \frac{(V_{in} - V_{out}) \cdot D}{L \cdot f_{sw}}$$
-
-The resulting output voltage ripple (assuming the capacitor ESR is negligible) is:
-
-$$\Delta V_{out} = \frac{\Delta I_L}{8 \cdot C \cdot f_{sw}} = \frac{V_{out}(1-D)}{8LCf_{sw}^2}$$
-
-This equation tells you the design levers for ripple reduction: increase $L$, increase $C$, or increase $f_{sw}$. Doubling $f_{sw}$ reduces ripple by $4\times$ for the same $L$ and $C$ — this is why modern server VRMs operate at 300 kHz to 1 MHz rather than the 50–100 kHz typical in older designs. Faster switching allows physically smaller passives while maintaining tighter output regulation.
-
-### Multiphase VRMs
-
-A CPU VRM uses $N$ parallel switching phases, each offset in time by $T/N$. Each phase runs the same basic buck topology but out-of-phase with its neighbors.
-
-The output current ripple of the $N$-phase converter is not $N$ times worse — the ripple components partially cancel because they are phase-shifted. At the worst-case duty cycle $D = k/N$ for integer $k$, the effective ripple current seen by the output capacitors is:
-
-$$\Delta I_{ripple,N} \approx \frac{\Delta I_{ripple,1}}{N}$$
-
-The ripple frequency presented to the output capacitors is $N \cdot f_{sw}$, not $f_{sw}$. Higher effective ripple frequency means less capacitance is needed for the same voltage ripple — from the ripple equation, $C \propto 1/f^2$, so multiplying frequency by $N$ reduces required capacitance by $N^2$ at fixed ripple.
+### Reactive Power and Why Capacitors Don't Burn
