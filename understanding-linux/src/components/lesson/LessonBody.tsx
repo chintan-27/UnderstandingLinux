@@ -3,14 +3,13 @@ import remarkGfm from 'remark-gfm';
 import remarkMath from 'remark-math';
 import rehypeHighlight from 'rehype-highlight';
 import rehypeKatex from 'rehype-katex';
-import { CodeBlock } from './CodeBlock';
+import { PreBlock } from './CodeBlock';
 import type { ExtraProps } from 'react-markdown';
 import type { ComponentPropsWithoutRef } from 'react';
 
 type HeadingProps = ComponentPropsWithoutRef<'h2'> & ExtraProps;
 type AnchorProps = ComponentPropsWithoutRef<'a'> & ExtraProps;
 type ImgProps = ComponentPropsWithoutRef<'img'> & ExtraProps;
-type CodeProps = ComponentPropsWithoutRef<'code'> & ExtraProps & { inline?: boolean };
 
 function makeHeadingId(children: React.ReactNode): string {
   return String(children)
@@ -42,10 +41,8 @@ const components = {
     <img src={src} alt={alt} loading="lazy" className="rounded-xl max-w-full my-6" {...props} />
   ),
   // eslint-disable-next-line @typescript-eslint/no-unused-vars
-  code: ({ node: _node, inline, className, children, ...props }: CodeProps) => (
-    <CodeBlock inline={inline} className={className} {...props}>
-      {children}
-    </CodeBlock>
+  pre: ({ node: _node, children, ...props }: ComponentPropsWithoutRef<'pre'> & ExtraProps) => (
+    <PreBlock {...props}>{children}</PreBlock>
   ),
 };
 

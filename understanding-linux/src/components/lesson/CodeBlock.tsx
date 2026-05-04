@@ -1,17 +1,33 @@
-import { useState, type ComponentPropsWithoutRef } from 'react';
+import { useState, type ReactNode, isValidElement, Children } from 'react';
 import { Copy, Check } from 'lucide-react';
 
-type CodeProps = ComponentPropsWithoutRef<'code'> & { inline?: boolean };
-
-export function CodeBlock({ children, className, inline }: CodeProps) {
-  const [copied, setCopied] = useState(false);
-
-  if (inline) {
-    return <code className={className}>{children}</code>;
+function extractText(node: ReactNode): string {
+  if (typeof node === 'string') return node;
+  if (typeof node === 'number') return String(node);
+  if (!node) return '';
+  if (Array.isArray(node)) return node.map(extractText).join('');
+  if (isValidElement(node)) {
+    const props = node.props as { children?: ReactNode };
+    if (props.children) return extractText(props.children);
   }
+  return '';
+}
 
-  const code = String(children).replace(/\n$/, '');
-  const lang = (className ?? '').replace('language-', '') || 'text';
+function getLang(children: ReactNode): string {
+  const child = Children.toArray(children)[0];
+  if (isValidElement(child)) {
+    const props = child.props as { className?: string };
+    const cls = props.className ?? '';
+    const match = cls.match(/language-(\S+)/);
+    if (match) return match[1];
+  }
+  return 'text';
+}
+
+export function PreBlock({ children }: { children?: ReactNode }) {
+  const [copied, setCopied] = useState(false);
+  const lang = getLang(children);
+  const code = extractText(children).replace(/\n$/, '');
 
   const copy = () => {
     navigator.clipboard.writeText(code).then(() => {
@@ -32,8 +48,8 @@ export function CodeBlock({ children, className, inline }: CodeProps) {
           {copied ? <Check size={13} /> : <Copy size={13} />}
         </button>
       </div>
-      <pre className={`${className ?? ''} rounded-xl !m-0`}>
-        <code className={className}>{code}</code>
+      <pre className="rounded-xl !m-0">
+        {children}
       </pre>
     </div>
   );
