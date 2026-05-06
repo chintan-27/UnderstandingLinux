@@ -10,147 +10,477 @@ resources:
     title: "The Linux Programming Interface (Kerrisk)"
 ---
 
-## Module 196: Async I/O Models — select, poll, epoll, io_uring
-
-## Why This Matters
-
-A server blocking one thread per connection pays a cost that scales linearly with connection count — not because threads are doing work, but because the kernel is context-switching between thousands of threads that are sleeping. The real cost is memory ($\approx 8\,\text{MB}$ default stack per thread × 10,000 connections = $80\,\text{GB}$ virtual address space) and scheduler overhead, not CPU work. The solution is *I/O multiplexing*: one thread asks the kernel which descriptors are ready, then handles only those.
-
-The evolution from `select` to `io_uring` is not incremental polish — each step eliminates a specific, measurable bottleneck. Understanding where each bottleneck lives (the kernel scan loop, the fd_set copy, the system call boundary, the readiness-vs-completion model mismatch) is what this module is about.
-
----
-
 ## Core Concepts
+### Synchronous vs. Asynchronous I/O
+A **synchronous** I/O system call (`read()`, `write()`) blocks the calling thread until the kernel finishes the operation. If the file descriptor refers to a socket, pipe, or terminal that is not ready, the thread is put to sleep and a context switch occurs. The cost of a blocked syscall includes:
+- Kernel entry/exit overhead (~100–300 ns on modern x86‑64)
+- Potential scheduler latency if the thread is descheduled
+- Wasted CPU cycles while the thread could be doing other work
 
-### The Fundamental Problem: Readiness vs. Completion
+**Asynchronous I/O** decouples the initiation of an operation from its completion, allowing the application to continue executing while the kernel processes the request in the background. The application later retrieves the result via a completion mechanism (e.g., a return value from a wait syscall or a completion queue entry). This model is essential for handling many concurrent I/O sources without creating a thread per source, which would incur:
+- Stack memory overhead (typically 8 MiB per thread)
+- Context‑switch cost proportional to the number of threads
+- Synchronization overhead for shared state
 
-Two distinct I/O models exist, and conflating them causes bugs:
+### Multiplexing Primitives
+The kernel provides multiplexing syscalls that let a single thread wait for readiness on *multiple* file descriptors. Their efficiency hinges on how they track interest and how they report readiness.
 
-- **Readiness model** (`select`, `poll`, `epoll`): the kernel tells you a descriptor *can* be read without blocking. You still call `read()` yourself. Two syscalls per I/O event minimum.
-- **Completion model** (`io_uring`, AIO): you submit an operation and the kernel tells you when it *finished*. One round trip for the result.
+| Syscall | Interest representation | Kernel readiness check | Complexity per wait | Typical use case |
+|---------|------------------------|------------------------|---------------------|------------------|
+| `select` | Bitmask in `fd_set` (size = `FD_SETSIZE` bits) | Linear scan of the bitmask | $O(\text{maxfd})$ | Legacy code, portable |
+| `poll` | Array of `struct pollfd` | Linear scan of the array | $O(n)$ where *n* = number of entries | Slightly better than `select`, no `FD_SETSIZE` limit |
+| `epoll` | Red‑black tree of registered fds + ready list | Tree lookup for add/remove; ready list scan | $O(\log n)$ for update, $O(k)$ for wait where *k* = number of ready fds | High‑scale servers (nginx, Node.js) |
+| `io_uring` | Submission and completion rings (shared memory) | Lock‑less producer/consumer on rings; kernel processes submissions asynchronously | $O(1)$ submission, $O(1)$ completion retrieval | Ultra‑low‑latency, zero‑copy applications (databases, network stacks) |
 
-This distinction matters immediately when you try to mix epoll with file I/O: regular files on Linux are *always* reported ready by `select`/`poll`/`epoll` because the VFS layer doesn't support readiness semantics for them — the actual disk wait happens inside `read()` anyway. Only sockets, pipes, terminals, and a handful of other fd types have genuine readiness.
+**Why the differences matter:**  
+- `select`/`poll` must examine every registered descriptor each time they block, even if only one is ready. As the number of monitored fds grows, the wait time grows linearly.  
+- `epoll` maintains a kernel‑side data structure (a red‑black tree) that tracks interest; adding or removing a descriptor costs $O(\log n)$, but waiting only walks the ready list, which contains *only* those descriptors that the kernel has marked ready.  
+- `io_uring` goes further: the application and kernel share two lock‑less rings (submission and completion). The application writes a `struct io_uring_sqe` (submission queue entry) into the submission ring, triggers a syscall (`io_uring_enter`) to tell the kernel how many entries to consume, and later reads completion queue entries (`struct io_uring_cqe`) from the completion ring. No per‑descriptor scanning occurs; the kernel processes I/O requests directly from the submission ring.
 
-### select: $O(n)$ Scan with a Hard Descriptor Ceiling
+### Key Data Structures
+- **`fd_set`** (used by `select`): an array of `unsigned long` bits. On Linux, `FD_SETSIZE` is typically 1024, so the structure occupies $\frac{1024}{8}=128$ bytes. The macro `FD_SET(fd, &set)` computes `set->fds_bits[fd / (8*sizeof(unsigned long))] |= (1UL << (fd % (8*sizeof(unsigned long))))`.
+- **`struct pollfd`**:  
+  ```c
+  struct pollfd {
+      int   fd;          /* file descriptor */
+      short events;      /* requested events */
+      short revents;     /* returned events */
+  };
+  ```
+  On a 64‑bit system each field is naturally aligned, giving a size of 8 bytes (fd) + 2 bytes (events) + 2 bytes (revents) + 2 bytes padding = 16 bytes.  
+- **`struct epoll_event`**:  
+  ```c
+  struct epoll_event {
+      __uint32_t events;  /* epoll events */
+      epoll_data_t data;  /* user data */
+  };
+  ```
+  Typically 8 bytes on x86‑64.  
+- **`io_uring_sqe`** (submission queue entry): 64 bytes, containing opcode, fd, offsets, pointers to buffers, and flags.  
+- **`io_uring_cqe`** (completion queue entry): 16 bytes, containing user‑data tag and result (return value or negative error).
 
-`select` passes three bitmaps to the kernel: one each for read interest, write interest, and error interest. The kernel scans every bit from 0 to `nfds-1` on every call, regardless of how many are set. The hard limit `FD_SETSIZE` (defined as 1024 in `<sys/select.h>`) is a compile-time constant — the bitmap is a fixed-size array in the `fd_set` type itself, not a pointer to a heap buffer. You cannot watch fd 1025 with `select`, period.
+### Operational Flow
+1. **Registration** – The application informs the kernel which fds it cares about and what events (read, write, error, etc.) it wants.
+2. **Wait** – The application invokes a multiplexing syscall (`select`, `poll`, `epoll_wait`, `io_uring_enter`). The kernel either:
+   - Scans its interest structure to find ready fds (`select`/`poll`), or
+   - Checks a ready list that was populated asynchronously by the interrupt/BH handlers (`epoll`), or
+   - Processes pre‑submitted requests from the shared submission ring (`io_uring`).
+3. **Retrieval** – The kernel returns either a count of ready fds (`select`/`poll`), an array of filled `epoll_event`s (`epoll_wait`), or completion queue entries (`io_uring_get_cqe`). The application then processes each ready fd or completion.
+4. **Re‑arm (if needed)** – For level‑triggered interfaces (`select`, `poll`, default `epoll`) the kernel continues to report readiness until the condition clears. For edge‑triggered `epoll` (`EPOLLET`) the application must re‑arm after each event by performing an I/O operation that would block if the fd were not ready.
 
-Each call copies $\lceil n/8 \rceil$ bytes of fd_set into the kernel and back. For $n = 1024$, that is 128 bytes per bitmap, three bitmaps each way — 768 bytes of copying per call, plus the linear scan.
-
-Total kernel work per call: $O(n)$ where $n$ = `nfds` argument, not the number of set bits.
-
-### poll: Same Algorithm, No Ceiling
-
-`poll` accepts a caller-allocated array of `pollfd` structs, removing the `FD_SETSIZE` limit. But the kernel implementation still iterates the full array calling `->poll()` on each file descriptor's file operations. The copy cost is now proportional to the array length: $n \times \text{sizeof(struct pollfd)} = n \times 8$ bytes transferred per call.
-
-The improvement is purely ergonomic. For $n = 10{,}000$ connections, you're copying 80 KB into the kernel on every `poll()` call, and the kernel is calling `->poll()` on 10,000 file structs even if one has data.
-
-### epoll: Amortized Registration, $O(1)$ Wait
-
-`epoll` splits the problem into two phases:
-
-1. **Registration** (`epoll_ctl`): inserts the fd into a red-black tree inside the kernel's epoll instance. Cost: $O(\log n)$ per registration. This happens once per fd lifetime, not per wait call.
-
-2. **Wait** (`epoll_wait`): drains a linked list of ready events. The kernel populates this list via *wait queue callbacks* — at registration time, epoll installs a callback on each socket's internal wait queue. When the NIC driver delivers a packet and wakes the socket's wait queue, the callback fires and adds the socket to the ready list. `epoll_wait` never touches sockets that received no events.
-
-No fd_set copy. No array scan. The kernel only touches descriptors that transitioned to ready since the last drain.
-
-Complexity comparison for $n$ monitored descriptors, $k$ wait calls, $m$ events returned per call (averaged):
-
-$$\text{select/poll total work} = O(n \cdot k)$$
-
-$$\text{epoll total work} = O(n \log n) + O(m \cdot k)$$
-
-When $m \ll n$ — which is exactly the high-connection-count / sparse-activity scenario — the epoll term $O(m \cdot k)$ dominates and is much smaller. The crossover point where epoll starts winning over poll is roughly $n \approx 20$–$50$ descriptors on real hardware, measurable with `strace` timing.
-
-### io_uring: Eliminating the System Call Boundary
-
-`epoll` with non-blocking I/O still requires at minimum two syscalls per I/O event: `epoll_wait` to learn readiness, then `read`/`write` to move data. Each syscall crosses the user/kernel boundary, flushes speculative execution state (post-Spectre mitigations made this worse), and may cause a TLB shootdown if address spaces differ.
-
-`io_uring` maps two ring buffers into both userspace and kernel address space via `mmap`. The **Submission Queue (SQ)** is written by userspace; the **Completion Queue (CQ)** is written by the kernel. In `SQPOLL` mode, a kernel thread spins on the SQ, consuming entries without any syscall from userspace. Completions appear in the CQ and are read directly from userspace memory. Zero syscalls in steady state.
-
-The model shift is significant: instead of "tell me what's ready so I can call read," you write `{op: IORING_OP_READ, fd: sock, buf: ptr, len: n}` into the SQ and later read `{result: bytes_read, user_data: tag}` from the CQ. The kernel does the actual I/O.
-
----
-
-## How It Works
-
-### select: The Bitmap Mechanics
-
+## Worked Examples
+### Example 1: `select` – Echo Server Handling Two Clients
 ```c
-#include <sys/select.h>
+/* select_echo.c */
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
 #include <unistd.h>
+#include <string.h>
+#include <stdio.h>
+#include <stdlib.h>
 
-fd_set readfds;
-struct timeval timeout = {.tv_sec = 5, .tv_usec = 0};
+#define PORT 9000
+#define BACKLOG 2
+#define BUF_SIZE 1024
 
-FD_ZERO(&readfds);
-FD_SET(sock1, &readfds);
-FD_SET(sock2, &readfds);
-int maxfd = (sock1 > sock2) ? sock1 : sock2;
+int main(void)
+{
+    int listen_fd = socket(AF_INET, SOCK_STREAM, 0);
+    struct sockaddr_in addr = {
+        .sin_family = AF_INET,
+        .sin_addr.s_addr = INADDR_ANY,
+        .sin_port = htons(PORT)
+    };
+    bind(listen_fd, (struct sockaddr *)&addr, sizeof(addr));
+    listen(listen_fd, BACKLOG);
 
-// The kernel scans fds 0 through maxfd — not just sock1 and sock2.
-// select() MODIFIES readfds in place: bits for non-ready fds are cleared.
-// You must call FD_ZERO + FD_SET again before the next select().
-int nready = select(maxfd + 1, &readfds, NULL, NULL, &timeout);
-if (nready < 0) { perror("select"); exit(1); }
+    fd_set read_set;
+    int max_fd = listen_fd;
+    int client_fds[2] = { -1, -1 };
+    int client_cnt = 0;
 
-if (FD_ISSET(sock1, &readfds)) {
-    // sock1 has data — read() will not block
-    ssize_t n = read(sock1, buf, sizeof(buf));
+    while (1) {
+        FD_ZERO(&read_set);
+        FD_SET(listen_fd, &read_set);
+        max_fd = listen_fd;
+        for (int i = 0; i < 2; ++i) {
+            if (client_fds[i] != -1) {
+                FD_SET(client_fds[i], &read_set);
+                if (client_fds[i] > max_fd) max_fd = client_fds[i];
+            }
+        }
+
+        /* block until something is ready */
+        int ready = select(max_fd + 1, &read_set, NULL, NULL, NULL);
+        if (ready == -1) {
+            perror("select");
+            exit(EXIT_FAILURE);
+        }
+
+        /* new connection */
+        if (FD_ISSET(listen_fd, &read_set)) {
+            int conn = accept(listen_fd, NULL, NULL);
+            if (client_cnt < 2) {
+                client_fds[client_cnt++] = conn;
+                printf("Accepted client %d (fd=%d)\n", client_cnt, conn);
+            } else {
+                close(conn); /* exceed limit */
+            }
+        }
+
+        /* handle existing clients */
+        for (int i = 0; i < client_cnt; ++i) {
+            int fd = client_fds[i];
+            if (FD_ISSET(fd, &read_set)) {
+                char buf[BUF_SIZE];
+                ssize_t n = read(fd, buf, sizeof(buf));
+                if (n <= 0) { /* EOF or error */
+                    printf("Client %d closed (fd=%d)\n", i, fd);
+                    close(fd);
+                    client_fds[i] = -1;
+                    /* compact array */
+                    for (int j = i; j < client_cnt-1; ++j) client_fds[j] = client_fds[j+1];
+                    client_fds[--client_cnt] = -1;
+                    --i; /* re‑check this slot */
+                } else {
+                    write(fd, buf, n); /* echo */
+                }
+            }
+        }
+    }
 }
 ```
+**Step‑by‑step reasoning**
+1. `listen_fd` is the only fd initially registered; `max_fd` tracks the highest fd for `select`.
+2. Each loop iteration rebuilds the `fd_set` because `select` modifies it (clears bits for non‑ready fds).
+3. `select(max_fd+1, &read_set, NULL, NULL, NULL)` blocks until at least one bit is set. Complexity: $O(\text{max_fd}+1)$ → here at most `listen_fd`+2.
+4. On readiness, we test each fd with `FD_ISSET`. For the listening socket we `accept`; for client sockets we `read` and echo.
+5. When a client closes, we compact the `client_fds` array to keep `max_fd` accurate. Forgetting to recompute `max_fd` after a close is a common mistake (see Common Mistakes).
 
-The `maxfd + 1` argument tells the kernel where to stop scanning. Passing a larger value than necessary wastes time scanning zero bits. The kernel-side cost is proportional to this value, not to the number of set bits.
-
-### poll: Surviving Beyond FD_SETSIZE
-
+### Example 2: `poll` – Concurrent File Copy from Three Sources
 ```c
+/* poll_copy.c */
+#include <fcntl.h>
 #include <poll.h>
+#include <unistd.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 
-struct pollfd fds[N_CONNS];
-for (int i = 0; i < N_CONNS; i++) {
-    fds[i].fd     = conn_sockets[i];
-    fds[i].events = POLLIN | POLLRDHUP;
-    // fds[i].revents is written by the kernel, not caller
+#define BUF_SIZE 4096
+
+int main(int argc, char *argv[])
+{
+    if (argc != 5) {
+        fprintf(stderr, "Usage: %s <src1> <src2> <src3> <dst>\n", argv[0]);
+        exit(EXIT_FAILURE);
+    }
+
+    int src[3];
+    for (int i = 0; i < 3; ++i) {
+        src[i] = open(argv[i+1], O_RDONLY);
+        if (src[i] < 0) {
+            perror("open src");
+            exit(EXIT_FAILURE);
+        }
+    }
+    int dst = open(argv[4], O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (dst < 0) {
+        perror("open dst");
+        exit(EXIT_FAILURE);
+    }
+
+    struct pollfd pfd[3];
+    int remaining = 3;
+    char buf[BUF_SIZE];
+
+    for (int i = 0; i < 3; ++i) {
+        pfd[i].fd = src[i];
+        pfd[i].events = POLLIN;
+        pfd[i].revents = 0;
+    }
+
+    while (remaining > 0) {
+        int ret = poll(pfd, 3, -1); /* block indefinitely */
+        if (ret == -1) {
+            if (errno == EINTR) continue;
+            perror("poll");
+            exit(EXIT_FAILURE);
+        }
+
+        for (int i = 0; i < 3; ++i) {
+            if (pfd[i].revents & POLLIN) {
+                ssize_t n = read(pfd[i].fd, buf, sizeof(buf));
+                if (n <= 0) { /* EOF or error */
+                    close(pfd[i].fd);
+                    pfd[i].fd = -1;
+                    pfd[i].events = 0;
+                    --remaining;
+                    continue;
+                }
+                /* write to destination; handle short writes */
+                size_t off = 0;
+                while (off < (size_t)n) {
+                    ssize_t w = write(dst, buf + off, n - off);
+                    if (w <= 0) {
+                        perror("write");
+                        exit(EXIT_FAILURE);
+                    }
+                    off += w;
+                }
+            }
+            pfd[i].revents = 0; /* clear for next poll */
+        }
+    }
+
+    close(dst);
+    return 0;
+}
+```
+**Why `poll` is preferable here**
+- No `FD_SETSIZE` limit; we can easily scale to hundreds of files by enlarging the `pfd` array.
+- The `revents` field tells us exactly which event occurred (`POLLIN` in this case). Forgetting to zero‑revents after processing leads to spurious reprocessing.
+
+### Example 3: `epoll` – Edge‑Triggered HTTP‑Like Server (Non‑Blocking Accept)
+```c
+/* epoll_et.c */
+#define _GNU_SOURCE
+#include <sys/epoll.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <netinet/in.h>
+#include <string.h>
+#include <stdio.h>
+#include <stdlib.h>
+
+#define PORT 8080
+#define MAX_EVENTS 1024
+#define BUF_SIZE 2048
+
+static int set_nonblocking(int fd)
+{
+    int flags = fcntl(fd, F_GETFL, 0);
+    if (flags == -1) return -1;
+    return fcntl(fd, F_SETFL, flags | O_NONBLOCK);
 }
 
-// poll() does NOT destroy fds[].events — but it still copies
-// the entire array (N_CONNS * 8 bytes) into the kernel.
-int nready = poll(fds, N_CONNS, 5000 /* ms */);
+int main(void)
+{
+    int listen_fd = socket(AF_INET, SOCK_STREAM, 0);
+    int opt = 1;
+    setsockopt(listen_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
 
-for (int i = 0; i < N_CONNS; i++) {
-    if (fds[i].revents & POLLIN) {
-        read(fds[i].fd, buf, sizeof(buf));
+    struct sockaddr_in addr = {
+        .sin_family = AF_INET,
+        .sin_addr.s_addr = INADDR_ANY,
+        .sin_port = htons(PORT)
+    };
+    bind(listen_fd, (struct sockaddr *)&addr, sizeof(addr));
+    listen(listen_fd, SOMAXCONN);
+    set_nonblocking(listen_fd);
+
+    int epfd = epoll_create1(0); /* size argument ignored since Linux 2.6.8 */
+    struct epoll_event ev;
+    ev.events = EPOLLIN | EPOLLET; /* edge‑triggered */
+    ev.data.fd = listen_fd;
+    if (epoll_ctl(epfd, EPOLL_CTL_ADD, listen_fd, &ev) == -1) {
+        perror("epoll_ctl listen");
+        exit(EXIT_FAILURE);
     }
-    if (fds[i].revents & POLLRDHUP) {
-        // Peer closed write end — detect half-close without read()
-        close(fds[i].fd);
+
+    struct epoll_event events[MAX_EVENTS];
+    char buf[BUF_SIZE];
+
+    for (;;) {
+        int n = epoll_wait(epfd, events, MAX_EVENTS, -1);
+        if (n == -1) {
+            if (errno == EINTR) continue;
+            perror("epoll_wait");
+            exit(EXIT_FAILURE);
+        }
+
+        for (int i = 0; i < n; ++i) {
+            int fd = events[i].data.fd;
+            uint32_t event = events[i].events;
+
+            if ((event & EPOLLERR) || (event & EPOLLHUP) || !(event & EPOLLIN)) {
+                /* error or hangup */
+                fprintf(stderr, "epoll error on fd %d\n", fd);
+                close(fd);
+                continue;
+            }
+
+            if (fd == listen_fd) {
+                /* accept all pending connections (edge‑triggered) */
+                while (1) {
+                    struct sockaddr_in client_addr;
+                    socklen_t client_len = sizeof(client_addr);
+                    int conn = accept4(listen_fd,
+                                       (struct sockaddr *)&client_addr,
+                                       &client_len,
+                                       SOCK_NONBLOCK);
+                    if (conn == -1) {
+                        if (errno == EAGAIN || errno == EWOULDBLOCK)
+                            break; /* no more pending */
+                        perror("accept4");
+                        break;
+                    }
+                    struct epoll_event conn_ev;
+                    conn_ev.events = EPOLLIN | EPOLLET;
+                    conn_ev.data.fd = conn;
+                    if (epoll_ctl(epfd, EPOLL_CTL_ADD, conn, &conn_ev) == -1)
+                        perror("epoll_ctl add conn");
+                }
+                continue;
+            }
+
+            /* client socket – read until would‑block */
+            while (1) {
+                ssize_t rr = read(fd, buf, sizeof(buf));
+                if (rr == -1) {
+                    if (errno == EAGAIN || errno == EWOULDBLOCK)
+                        break; /* done for now */
+                    perror("read");
+                    goto close_conn;
+                }
+                if (rr == 0) { /* EOF */
+                    goto close_conn;
+                }
+                /* echo back (simplistic) */
+                size_t off = 0;
+                while (off < (size_t)rr) {
+                    ssize_t ss = write(fd, buf + off, rr - off);
+                    if (ss <= 0) {
+                        perror("write");
+                        goto close_conn;
+                    }
+                    off += ss;
+                }
+            }
+            continue;
+
+        close_conn:
+            close(fd);
+        }
     }
 }
 ```
+**Key points**
+- Edge‑triggered (`EPOLLET`) requires the socket to be non‑blocking and the application to keep reading/writing until `EAGAIN`. If the application stops early, it will not be notified again until new data arrives.
+- The listen socket is also edge‑triggered; we loop on `accept4` until it returns `EAGAIN` to pull all pending connections in one burst, preventing starvation.
+- `epoll_wait` returns the number of filled `epoll_event` structures; we must iterate over exactly that count.
 
-`POLLRDHUP` (Linux-specific, requires `_GNU_SOURCE`) is worth using: it tells you when the remote side called `shutdown(SHUT_WR)` or `close()`, which `POLLIN` alone won't distinguish from arriving data without a zero-length `read()`.
-
-### epoll: Registration, Wait Queue Callbacks, Edge vs. Level
-
+### Example 4: `io_uring` – Async Read‑Then‑Write Loop (Zero‑Copy)
 ```c
-#include <sys/epoll.h>
+/* io_uring_copy.c */
+#define _GNU_SOURCE
+#include <liburing.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
 
-// epoll_create1(0) is preferred over epoll_create(size) —
-// the 'size' argument has been ignored since Linux 2.6.8.
-int epfd = epoll_create1(EPOLL_CLOEXEC);  // avoid fd leak across exec()
+#define QUEUE_DEPTH 32
+#define BUF_SIZE    4096
 
-struct epoll_event ev = {
-    .events  = EPOLLIN | EPOLLET,  // edge-triggered
-    .data.fd = sock1,
-};
-// O(log n) insertion into the kernel's rb-tree for this epoll instance
-epoll_ctl(epfd, EPOLL_CTL_ADD, sock1, &ev);
+int main(int argc, char *argv[])
+{
+    if (argc != 3) {
+        fprintf(stderr, "Usage: %s <src> <dst>\n");
+        exit(EXIT_FAILURE);
+    }
 
-struct epoll_event events[MAX_EVENTS];
+    int src_fd = open(argv[1], O_RDONLY);
+    if (src_fd < 0) { perror("open src"); exit(EXIT_FAILURE); }
+    int dst_fd = open(argv[2], O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (dst_fd < 0) { perror("open dst"); exit(EXIT_FAILURE); }
 
-for (;;) {
-    // Blocks until at least one fd is ready, or timeout expires.
-    // Returns only the ready fds — does not touch the rb-tree.
-    int n = epoll_wait(epfd, events, MAX_EVENTS, -1
+    struct io_uring ring;
+    if (io_uring_queue_init(QUEUE_DEPTH, &ring, 0) < 0) {
+        perror("io_uring_queue_init");
+        exit(EXIT_FAILURE);
+    }
+
+    /* Pre‑allocate a buffer pool (simple single buffer for demo) */
+    char *buf = aligned_alloc(4096, BUF_SIZE);
+    if (!buf) { perror("aligned_alloc"); exit(EXIT_FAILURE); }
+
+    off_t src_offset = 0;
+    off_t dst_offset = 0;
+    int pending = 0;
+
+    while (1) {
+        /* Submit read requests while we have capacity and src not EOF */
+        while (pending < QUEUE_DEPTH) {
+            struct io_uring_sqe *sqe = io_uring_get_sqe(&ring);
+            if (!sqe) break; /* submission ring full */
+            io_uring_prep_read_fixed(sqe,
+                                     src_fd,
+                                     buf,
+                                     BUF_SIZE,
+                                     src_offset,
+                                     0); /* fixed fd index 0 */
+            io_uring_sqe_set_data(sqe, (void *)(uintptr_t)src_offset);
+            src_offset += BUF_SIZE;
+            ++pending;
+        }
+
+        if (pending == 0) break; /* nothing left to do */
+
+        /* Submit the batch */
+        if (io_uring_submit(&ring) < 0) {
+            perror("io_uring_submit");
+            exit(EXIT_FAILURE);
+        }
+
+        /* Reap completions */
+        struct io_uring_cqe *cqe;
+        unsigned int head;
+        io_uring_for_each_cqe(&ring, head, cqe) {
+            int res = cqe->res;
+            if (res < 0) {
+                fprintf(stderr, "io_uring read error: %s\n", strerror(-res));
+                exit(EXIT_FAILURE);
+            }
+            if (res == 0) { /* EOF */
+                --pending;
+                continue;
+            }
+            off_t offset = (off_t)(uintptr_t)cqe->user_data;
+            /* Write the data we just read */
+            struct io_uring_sqe *wsqe = io_uring_get_sqe(&ring);
+            if (!wsqe) { fprintf(stderr, "sqe full while reaping\n"); exit(EXIT_FAILURE); }
+            io_uring_prep_write_fixed(wsqe,
+                                      dst_fd,
+                                      buf,
+                                      res,
+                                      offset,
+                                      0);
+            io_uring_sqe_set_data(wsqe, (void *)(uintptr_t)offset);
+            /* completion will be processed later */
+        }
+        io_uring_cq_advance(&ring, head);
+    }
+
+    /* Drain any remaining writes */
+    while (pending > 0) {
+        io_uring_submit_and_wait(&ring, 1);
+        struct io_uring_cqe *cqe;
+        io_uring_wait_cqe(&ring, &cqe);
+        if (cqe->res < 0) { perror("io_uring write error"); exit(EXIT_FAILURE); }
+        io_uring_cq_seen(&ring, cqe);
+        --pending;
+    }
+
+    io_uring_queue_exit(&ring);
+    free(buf);
+    close(src_fd);
+    close(dst_fd);
+    return 0;
+}
+```
+**Explanation of the flow**
+1. **Submission ring** – We obtain `io_uring_sqe`s, prepopulate them with `read_fixed` (or `write_fixed`) describing a buffer, offset, and length. The `user_data` field carries the file offset so we can match completions to the correct buffer region.
+2. **Submit** – `io_uring_submit` tells the kernel

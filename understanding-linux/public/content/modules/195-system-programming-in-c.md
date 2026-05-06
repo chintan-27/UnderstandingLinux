@@ -10,132 +10,394 @@ resources:
     title: "The Linux Programming Interface (Kerrisk)"
 ---
 
-## Why This Matters
+## Core Concepts
+### Processes
+A process is the OS abstraction of an executing program. It consists of:
+* **Memory layout** – text (code), data, heap, stack, and guarded regions.  
+* **Kernel resources** – a `task_struct` (Linux) containing PID, parent/child pointers, file descriptor table, signal handlers, scheduling info, and credentials.  
+* **Address space** – isolated via page tables; each process has its own CR3 (x86‑64) or PTBR (ARM).  
 
-Every program runs inside a process — a kernel-managed abstraction that gives your code a private virtual address space, a set of open file descriptors, and the illusion of owning the CPU. When that illusion breaks, the failure is usually silent: a process writes past its allocation and corrupts a neighbor's memory; two threads race on a shared counter and lose increments; a file descriptor leaks across a `fork()` and a pipe never delivers EOF; a signal arrives mid-`read()` and the caller never checks `EINTR`. You cannot diagnose these failures without understanding the mechanism. This module is about that mechanism.
+**Why fork() works** – When `fork()` is invoked, the kernel creates a new `task_struct` and duplicates the parent’s page tables **copy‑on‑write (COW)**. No physical memory is copied until a page is written. The cost is therefore proportional to the number of dirty pages:
+$$
+T_{fork} \approx C_{struct} + \sum_{p\in\text{pages}} \big[ \text{dirty}(p) \cdot (C_{copy}+C_{map}) \big]
+$$
+where `C_struct` is the allocation of the new task struct, and `C_copy`/`C_map` are the costs of copying a page and inserting it into the child’s page table.
+
+### Files
+A file is a sequence of bytes managed by the Virtual File System (VFS). Opening a file returns a **file descriptor (fd)**, an index into the per‑process fd table that points to a `struct file` representing:
+* **file operations** (`read`, `write`, `llseek`, …)  
+* **inode** – metadata (size, permissions, timestamps)  
+* **offset** – current file position  
+
+**Why open() returns an fd** – The fd is a small integer (typically 0‑1023) because the kernel stores the fd table as a simple array; lookup is O(1). The actual kernel object (`struct file`) lives in kernel memory, providing isolation: a process cannot forge an fd to access another’s resources without privileged system calls.
+
+### Signals
+A signal is a **software interrupt** delivering asynchronous notification. The kernel maintains for each thread:
+* **signal mask** (`sigset_t blocked`) – signals currently blocked from delivery.  
+* **pending set** (`sigset_t pending`) – signals that have been generated but not yet delivered.  
+
+Delivery occurs when:
+1. A signal is generated (by kernel, another process via `kill()`, or self‑raise).  
+2. The signal is not blocked (`(pending & ~blocked) != 0`).  
+3. The kernel selects a target thread, clears the bit from `pending`, and invokes the handler (or default action).
+
+**Why sigaction() is preferred over signal()** – `signal()` has unspecified behavior regarding automatic resetting of the handler and restarting of interrupted system calls across implementations. `sigaction()` lets you specify:
+```c
+struct sigaction sa = {
+    .sa_handler = handler,
+    .sa_flags   = SA_RESTART,   // restart interrupted syscalls
+    .sa_mask    = 0             // no extra blocked signals during handler
+};
+sigaction(SIGINT, &sa, NULL);
+```
+Thus you control restart semantics and avoid race conditions where a second signal arrives before the handler reinstates the mask.
+
+### Pipes
+A pipe is a **kernel‑managed circular buffer** (typically 64 KiB) with two ends: read‑end and write‑end. Each end is represented by a file descriptor referring to the same `struct pipe_inode_info`.  
+* **Write** copies data from user space into the buffer; if full, the writer blocks (or returns `EAGAIN` if `O_NONBLOCK`).  
+* **Read** copies data out; if empty, the reader blocks (or returns `EAGAIN`).  
+
+**Why pipes are unidirectional** – The VFS layer treats each end as a separate `struct file` with distinct `f_op->read`/`write` pointers; the underlying buffer enforces FIFO ordering, but there is no mechanism to write to the read‑end or read from the write‑end without breaking the contract.
+
+### Sockets
+A socket is an endpoint for communication, represented by a `struct socket` that points to a `struct sock` in the protocol‑specific layer (TCP, UDP, UNIX domain). The socket API is layered:
+1. **BSD socket interface** (`socket()`, `bind()`, `listen()`, `accept()`, `connect()`, `send()`, `recv()`).  
+2. **Protocol families** (AF_INET, AF_INET6, AF_UNIX, AF_NETLINK, …).  
+3. **Network stack** – IP, TCP/UDP, or UNIX domain protocols.
+
+**Why socket() returns a fd** – Like files, sockets are accessed via the VFS; the fd table indexes a `struct file` whose `f_op` points to socket‑specific operations (`sock_sendmsg`, `sock_recvmsg`, etc.). This uniform descriptor model enables `select()`, `poll()`, and `epoll()` to wait on both files and sockets interchangeably.
+
+### Epoll
+Epoll provides **O(1)** event notification for many fds, unlike `select()`/`poll()` which are O(n). Core data structures:
+* **epoll file descriptor** – created by `epoll_create1()`.  
+* **red‑black tree** (`struct rb_root`) storing all registered fds (key = fd).  
+* **ready list** (`struct list_head`) holding fds that have become ready since the last `epoll_wait()`.
+
+**Why epoll_wait() is O(1)** – Upon an event (e.g., data arrival), the kernel marks the corresponding `struct epitem` as ready and inserts it into the ready list. `epoll_wait()` merely copies up to `maxevents` entries from this list to user space; the cost does not grow with the number of registered fds.
+
+### Threads
+A thread is a **lightweight process** sharing the same memory descriptor (`mm_struct`) but having its own:
+* **Thread ID** (`tid`) – unique within the thread group.  
+* **Kernel stack** – typically 8 KiB (x86‑64) or 4 KiB (ARM).  
+* **Register set** – saved/restored on context switch.  
+* **Signal disposition** – can be per‑thread (via `pthread_sigmask`) or shared.
+
+**Why pthread_create() is cheaper than fork()** – No new `mm_struct` is allocated; the kernel merely duplicates the scheduler entities (`task_struct`) and allocates a new stack. Memory overhead is roughly the size of the stack plus a few KB for the task struct:
+$$
+\Delta M_{thread} \approx \text{stacksize} + \sizeof(struct task_struct)
+$$
+versus fork() which may duplicate megabytes of COW pages.
 
 ---
 
-## Core Concepts
+## How It Works
+### fork() and exec()
+1. **fork()** – kernel:
+   * Allocates a new `task_struct` (`dup_task_struct()`).  
+   * Copies the parent’s page table entries marking them **read‑only** (COW).  
+   * Sets child’s `tid` distinct from parent’s PID, increments `ptrace` counters, resets statistics.  
+   * Returns child PID to parent, 0 to child.  
+2. **execve()** – replaces the current process image:
+   * Unmaps existing memory regions (`exit_mmap()`).  
+   * Loads new ELF executable via `load_elf_binary()`: allocates new `vm_area_struct`s for text, data, heap, stack.  
+   * Sets `rip`/`eip` to entry point, initializes registers, clears signal handlers (except those set `SA_ONSTACK`).  
+   * Returns never (on success) or -1 on error.
 
-### Processes
+### pipe()
+* `int pipe(int pipefd[2])`:
+  1. Allocates a `struct pipe_inode_info` with a circular buffer (`PAGE_SIZE * PIPE_BUF`).  
+  2. Creates two `struct file` instances: one with `f_mode = FMODE_READ`, the other `FMODE_WRITE`.  
+  3. Installs them into the caller’s fd table at `pipefd[0]` and `pipefd[1]`.  
+  4. Returns 0 on success.
 
-A process is the kernel's runtime record of an executing instance: a virtual address space, open file descriptors, credentials (UID/GID/capabilities), signal state, and one or more threads. The kernel represents each process as a `task_struct` (`include/linux/sched.h`). A process moves between scheduler states:
+### socket()
+* `int socket(int domain, int type, int protocol)`:
+  1. Looks up `net_proto_family` for `domain` (e.g., `inet_family_ops` for AF_INET).  
+  2. Calls the family’s `create()` method, which allocates a `struct sock` and binds it to a `struct socket`.  
+  3. Wraps the socket in a `struct file` with socket‑specific `file_operations`.  
+  4. Inserts the file into the fd table and returns the index.
 
-- `TASK_RUNNING` — on-CPU or runnable, waiting for a timeslice
-- `TASK_INTERRUPTIBLE` — sleeping, woken by I/O completion or a signal
-- `TASK_UNINTERRUPTIBLE` — sleeping, woken only by I/O completion (shows as `D` in `ps`)
-- `EXIT_ZOMBIE` — exited but not yet reaped; `task_struct` persists until the parent calls `wait()`
+### connect()
+* For a stream socket (SOCK_STREAM):
+  1. Builds a `struct sockaddr` (AF_INET → `struct sockaddr_in`).  
+  2. Calls `__sys_connect()` which:
+     * Checks socket state (`SS_UNCONNECTED`).  
+     * Resolves destination address (ARP/route lookup).  
+     * Sends a SYN segment, enters `SYN_SENT` state.  
+     * Blocks (or returns `EINPROGRESS` if `O_NONBLOCK`) until SYN‑ACK received or timeout.
 
-**Why `fork` + `exec` instead of a single "spawn" call?** Separating creation from execution gives the child a window — between `fork()` returning and `exec()` loading the new image — to manipulate its own environment: close file descriptors, set up pipes with `dup2()`, drop privileges, adjust resource limits. This is why shells implement redirection cleanly without kernel involvement.
+### epoll_create1() / epoll_ctl() / epoll_wait()
+* **epoll_create1(int flags)**:
+  * Allocates an `eventpoll` structure (`struct eventpoll`) containing the rb‑tree and ready list, returns its fd.  
+* **epoll_ctl(int epfd, int op, int fd, struct epoll_event *ev)**:
+  * `op = EPOLL_CTL_ADD`: inserts `fd` into the rb‑tree with key `fd`, stores user data (`ev->data.ptr` or `ev->data.u64`).  
+  * `op = EPOLL_CTL_MOD`: updates the event mask in the tree node.  
+  * `op = EPOLL_CTL_DEL`: removes the node.  
+* **epoll_wait(int epfd, struct epoll_event *events, int maxevents, int timeout)**:
+  * If ready list non‑empty, copies up to `maxevents` entries to `events`.  
+  * Else, waits on the `epoll` wait queue (via `wait_event_interruptible_timeout()`) until either an event arrives or timeout expires.
 
-### Virtual Memory
+### pthread_create()
+* `int pthread_create(pthread_t *thread, const pthread_attr_t *attr,
+                      void *(*start_routine)(void *), void *arg)`:
+  1. Allocates kernel stack (`alloc_thread_stack_node()`).  
+  2. Duplicates the calling thread’s `task_struct` via `clone()` with flags `CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND | CLONE_THREAD | CLONE_SYSVSEM | CLONE_SETTLS | CLONE_PARENT_SETTID | CLONE_CHILD_CLEARTID`.  
+  3. Sets child’s `thread_info` and `tsk->thread.sp0` to the new stack top.  
+  4. Places the start routine and argument onto the child’s stack as per the ABI (so the first instruction executes `start_routine(arg)`).  
+  5. Returns the new thread’s TID in `*thread`; the child runs concurrently.
 
-Each process sees a private address space. The CPU's MMU translates virtual addresses to physical addresses through a multi-level page table. On x86-64 with 4-level paging, a 48-bit virtual address is decomposed as:
+---
 
-$$\underbrace{[47{:}39]}_{\text{PML4}} \underbrace{[38{:}30]}_{\text{PDPT}} \underbrace{[29{:}21]}_{\text{PD}} \underbrace{[20{:}12]}_{\text{PT}} \underbrace{[11{:}0]}_{\text{offset (4 KiB page)}}$$
+## Worked Examples
+### Example 1: Pipe with Parent‑Child Communication (showing fd numbers)
+```c
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <string.h>
+#include <sys/wait.h>
 
-A page is 4 KiB = $2^{12}$ bytes. The kernel maps pages lazily (demand paging): the page table entry exists but is marked not-present until the first access, which triggers a page fault that the kernel handles by allocating a physical frame. The canonical address space of a 64-bit process is $2^{48}$ bytes — 256 TiB — of which roughly the upper half is kernel space.
+int main(void) {
+    int pipefd[2];               // pipefd[0] = read, pipefd[1] = write
+    if (pipe(pipefd) == -1) {
+        perror("pipe");
+        exit(EXIT_FAILURE);
+    }
+    printf("[parent] pipe fds: %d (read), %d (write)\n", pipefd[0], pipefd[1]);
 
-Inspect a running process's memory layout:
+    pid_t pid = fork();
+    if (pid == -1) {
+        perror("fork");
+        exit(EXIT_FAILURE);
+    }
 
-```bash
-cat /proc/$$/maps          # virtual memory areas: address, perms, offset, inode, path
-cat /proc/$$/smaps         # per-VMA RSS, PSS, swap usage
-pmap -x $$                 # same data, formatted
+    if (pid == 0) {              // child
+        close(pipefd[0]);        // close unused read end
+        const char *msg = "Hello from child (PID ";
+        char buf[64];
+        snprintf(buf, sizeof(buf), "%s%d)\\n", msg, getpid());
+        size_t len = strlen(buf);
+        ssize_t w = write(pipefd[1], buf, len);
+        if (w != (ssize_t)len) {
+            perror("write");
+            _exit(EXIT_FAILURE);
+        }
+        close(pipefd[1]);        // EOF for reader
+        _exit(EXIT_SUCCESS);
+    } else {                     // parent
+        close(pipefd[1]);        // close unused write end
+        char rb[128];
+        ssize_t r = read(pipefd[0], rb, sizeof(rb)-1);
+        if (r == -1) {
+            perror("read");
+            exit(EXIT_FAILURE);
+        }
+        rb[r] = '\0';
+        printf("[parent] received: %s", rb);
+        int status;
+        waitpid(pid, &status, 0); // reap zombie
+        close(pipefd[0]);
+        return 0;
+    }
+}
 ```
+**Step‑by‑step reasoning**
+1. `pipe()` allocates a kernel pipe buffer (64 KiB) and returns two fds; suppose the kernel assigns `pipefd[0]=3`, `pipefd[1]=4` (stdin/stdout/stderr are 0‑2).  
+2. `fork()` duplicates the fd table; child inherits fds 3 and 4 pointing to the same pipe buffer.  
+3. Child closes fd 3 (read end) because it only writes. It writes a formatted string containing its PID (e.g., if child PID = 5421, the message is `"Hello from child (PID 5421)\\n"`).  
+4. `write()` copies up to `PIPE_BUF` bytes atomically; here length ≈ 24 < 4096, so the write succeeds instantly and returns 24.  
+5. Child closes fd 4, signaling EOF.  
+6. Parent, having closed fd 4, reads from fd 3; `read()` blocks until data arrives, then copies 24 bytes into `rb`, NUL‑terminates, and prints.  
+7. Parent calls `waitpid()` to reap the child, preventing a zombie.
 
-A VMA entry looks like:
+### Example 2: TCP Client Socket with Non‑Blocking Connect and epoll
+```c
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <sys/epoll.h>
 
+int main(void) {
+    /* 1. Create non‑blocking TCP socket */
+    int sockfd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
+    if (sockfd < 0) { perror("socket"); exit(EXIT_FAILURE); }
+
+    /* 2. Prepare server address */
+    struct sockaddr_in serv = {
+        .sin_family = AF_INET,
+        .sin_port   = htons(8080),
+    };
+    if (inet_pton(AF_INET, "127.0.0.1", &serv.sin_addr) <= 0) {
+        perror("inet_pton"); close(sockfd); exit(EXIT_FAILURE);
+    }
+
+    /* 3. Initiate connect (may return -EINPROGRESS) */
+    if (connect(sockfd, (struct sockaddr *)&serv, sizeof(serv)) < 0) {
+        if (errno != EINPROGRESS) {
+            perror("connect"); close(sockfd); exit(EXIT_FAILURE);
+        }
+        /* Connection in progress; we'll wait for writability */
+    }
+
+    /* 4. Set up epoll to wait for socket becoming writable */
+    int efd = epoll_create1(0);
+    if (efd < 0) { perror("epoll_create1"); close(sockfd); exit(EXIT_FAILURE); }
+
+    struct epoll_event ev = {
+        .events = EPOLLOUT,          // wait for write‑ability
+        .data   = { .fd = sockfd }
+    };
+    if (epoll_ctl(efd, EPOLL_CTL_ADD, sockfd, &ev) < 0) {
+        perror("epoll_ctl"); close(efd); close(sockfd); exit(EXIT_FAILURE);
+    }
+
+    /* 5. Wait up to 5 s for socket to be ready */
+    struct epoll_event out;
+    int n = epoll_wait(efd, &out, 1, 5000);
+    if (n <= 0) {
+        fprintf(stderr, "connect timeout or error\n");
+        close(efd); close(sockfd); exit(EXIT_FAILURE);
+    }
+
+    /* 6. Verify connection succeeded */
+    int err = 0;
+    socklen_t len = sizeof(err);
+    if (getsockopt(sockfd, SOL_SOCKET, SO_ERROR, &err, &len) < 0) {
+        perror("getsockopt"); close(efd); close(sockfd); exit(EXIT_FAILURE);
+    }
+    if (err != 0) {
+        errno = err; perror("connect"); close(efd); close(sockfd); exit(EXIT_FAILURE);
+    }
+    puts("Connected to 127.0.0.1:8080");
+
+    /* 7. Clean up */
+    close(efd);
+    close(sockfd);
+    return 0;
+}
 ```
-7f3a4c000000-7f3a4c200000 rw-p 00000000 00:00 0
+**Explanation of numbers**
+* The socket call typically yields the next free fd, e.g., `sockfd=3`.  
+* `SOCK_NONBLOCK` sets `O_NONBLOCK` flag on the underlying file description; after `connect()`, the socket returns `-1` with `errno = EINPROGRESS` because the TCP three‑way handshake is asynchronous.  
+* `epoll_create1()` might return `efd=4`.  
+* The epoll wait queue holds a single entry; when the SYN‑ACK arrives, the kernel marks the socket writable, places it in the ready list, and `epoll_wait()` returns `n=1`.  
+* `getsockopt(SO_ERROR)` retrieves the stored error code from the handshake; a value of `0` means success.
+
+### Example 3: Thread Pool with Mutex‑Protected Work Queue (using futex via pthread)
+```c
+#define _GNU_SOURCE
+#include <stdio.h>
+#include <stdlib.h>
+#include <pthread.h>
+#include <stdatomic.h>
+#include <unistd.h>
+
+typedef struct job {
+    void (*func)(void *);
+    void *arg;
+    struct job *next;
+} job_t;
+
+static pthread_mutex_t qlock = PTHREAD_MUTEX_INITIALIZER;
+static pthread_cond_t  qnot_empty = PTHREAD_COND_INITIALIZER;
+static atomic_int      npending = ATOMIC_VAR_INIT(0);
+static job_t          *head = NULL, *tail = NULL;
+static int             shutdown = 0;
+
+static void *worker(void *arg) {
+    (void)arg;
+    for (;;) {
+        pthread_mutex_lock(&qlock);
+        while (!head && !shutdown) {
+            pthread_cond_wait(&qnot_empty, &qlock);
+        }
+        if (shutdown && !head) {
+            pthread_mutex_unlock(&qlock);
+            break;
+        }
+        job_t *job = head;
+        head = job->next;
+        if (!head) tail = NULL;
+        pthread_mutex_unlock(&qlock);
+
+        atomic_fetch_sub(&npending, 1);
+        job->func(job->arg);
+        free(job);
+    }
+    return NULL;
+}
+
+int tpool_enqueue(void (*f)(void *), void *a) {
+    job_t *job = malloc(sizeof *job);
+    if (!job) return -1;
+    job->func = f;
+    job->arg  = a;
+    job->next = NULL;
+
+    pthread_mutex_lock(&qlock);
+    if (tail) tail->next = job;
+    else      head = job;
+    tail = job;
+    atomic_fetch_add(&npending, 1);
+    pthread_cond_signal(&qnot_empty);
+    pthread_mutex_unlock(&qlock);
+    return 0;
+}
+
+void tpool_shutdown(void) {
+    pthread_mutex_lock(&qlock);
+    shutdown = 1;
+    pthread_cond_broadcast(&qnot_empty);
+    pthread_mutex_unlock(&qlock);
+}
+
+/* Example job: prints a number after a short nap */
+void print_num(void *v) {
+    int n = *(int *)v;
+    usleep(1000);          // 1 ms
+    printf("%d ", n);
+    fflush(stdout);
+}
+
+int main(void) {
+    const int nthreads = 4;
+    pthread_t th[nthreads];
+    for (int i = 0; i < nthreads; ++i)
+        pthread_create(&th[i], NULL, worker, NULL);
+
+    int values[20];
+    for (int i = 0; i < 20; ++i) {
+        values[i] = i+1;
+        tpool_enqueue(print_num, &values[i]);
+    }
+
+    /* wait for all jobs */
+    while (atomic_load(&npending) > 0) {
+        usleep(100);
+    }
+    tpool_shutdown();
+    for (int i = 0; i < nthreads; ++i)
+        pthread_join(th[i], NULL);
+    putchar('\n');
+    return 0;
+}
 ```
+**Key points**
+* The work queue is protected by a **PTHREAD_MUTEX_INITIALIZER** (fast futex‑based lock).  
+* `pthread_cond_wait()` atomically releases the mutex and sleeps on a futex; wake‑up via `pthread_cond_signal()` reacquires the mutex before returning.  
+* `atomic_int npending` lets the main thread detect completion without extra locking.  
+* The worker loop checks `shutdown` under the mutex to avoid missed signals.
 
-Fields: `[start]-[end] perms offset dev inode pathname`. `p` means private (copy-on-write); `s` means shared.
+---
 
-The kernel represents each VMA as a `struct vm_area_struct` (`include/linux/mm_types.h`), linked into a red-black tree per process for $O(\log n)$ lookup by address.
-
-### File Descriptors
-
-The kernel maintains three tables:
-
-1. **Per-process FD table** — maps integer FDs to open file descriptions
-2. **System-wide open file table** — one entry per `open()` call, holding offset, flags, and a pointer to the inode/socket; this entry is shared across `fork()` and `dup()`
-3. **Inode table** — the actual file metadata
-
-```
-Process A              Open File Table         Inode Table
- fd 3 ─────────────▶  [offset=512, O_RDWR] ─▶  inode 7741
- fd 4 ─┐
-        └──────────▶  [offset=0,   O_RDWR] ─▶  inode 7741
-Process B
- fd 5 ─────────────▶  [offset=512, O_RDWR] (same entry as A fd 3)
-```
-
-After `fork()`, parent and child share the same open file table entries. If both write sequentially to a log file without `O_APPEND`, they race on the offset field of that shared entry. `O_APPEND` makes each `write()` atomic with respect to seeking to the end — the kernel holds `i_mutex` across the seek+write.
-
-FD limits per process:
-
-```bash
-ulimit -n                  # soft limit (e.g., 1024)
-cat /proc/sys/fs/file-max  # system-wide hard limit
-```
-
-### Signals
-
-A signal is a kernel-delivered asynchronous notification. The kernel sets a bit in `task_struct->pending` (for per-process signals) or `thread->pending` (for thread-directed signals) and schedules delivery on the next return from kernel mode. Signals are not queued by default — two `SIGUSR1` deliveries before the handler runs may appear as one. The exception is real-time signals (`SIGRTMIN` to `SIGRTMAX`), which are queued.
-
-When a signal arrives during a blocking syscall like `read()`:
-- If the handler is installed with `SA_RESTART`, the kernel re-enters the syscall automatically.
-- Without `SA_RESTART`, the syscall returns `-1` with `errno == EINTR`.
-
-**Every blocking syscall in a production program must handle `EINTR`.** Missing it produces intermittent failures that only appear under load or when a debugger attaches (because `ptrace` uses `SIGSTOP`/`SIGCONT`).
-
-Signal delivery is asynchronous with respect to memory operations, so signal handlers may only call functions listed in `signal-safety(7)`. The async-signal-safe set is smaller than you expect: `printf` is not on it; `write(2)` is.
-
-The signal mask blocks delivery (not receipt) of listed signals. `sigprocmask()` modifies it. `sigpending()` returns the set of blocked signals that have been sent but not yet delivered.
-
-```bash
-kill -l               # list all signal names and numbers
-kill -SIGTERM $$      # send SIGTERM to this shell (it will ignore it)
-```
-
-### Pipes
-
-A pipe is a kernel-managed, unidirectional byte stream with an in-kernel ring buffer. On Linux, the default pipe capacity is 65536 bytes (64 KiB), configurable via `fcntl(fd, F_SETPIPE_SZ, size)` up to `/proc/sys/fs/pipe-max-size`.
-
-Write behavior depends on write size relative to `PIPE_BUF` (4096 bytes on Linux):
-- Writes $\leq$ `PIPE_BUF` are **atomic**: they either complete fully or block; they will not interleave with concurrent writers.
-- Writes $>$ `PIPE_BUF` may be interleaved with other writers.
-
-A write to a pipe with no readers delivers `SIGPIPE` to the writer; if `SIGPIPE` is blocked or ignored, `write()` returns `-1` with `errno == EPIPE`.
-
-### Sockets
-
-A socket is a bidirectional communication endpoint created with `socket(domain, type, protocol)`. The domain determines the address family:
-
-- `AF_INET` / `AF_INET6` — TCP/UDP over IPv4/IPv6
-- `AF_UNIX` — local IPC via filesystem path or abstract name
-
-For `SOCK_STREAM` (TCP or Unix stream), the connection setup involves a three-way handshake managed entirely by the kernel; `accept()` dequeues an already-established connection from the backlog. The backlog size passed to `listen()` limits the number of completed connections waiting for `accept()`, not the number of half-open connections (that's controlled by `tcp_max_syn_backlog`).
-
-For high-throughput data transfer between sockets and files, `sendfile(2)` avoids the user-space copy:
-
-$$\text{traditional: disk} \to \text{kernel buffer} \to \text{user buffer} \to \text{socket buffer} \to \text{NIC}$$
-$$\text{sendfile: disk} \to \text{kernel buffer} \to \text{socket buffer} \to \text{NIC}$$
-
-### epoll
-
-`select(2)` and `poll(2)` require passing the entire watched FD set to the kernel on each call and scanning it linearly. For $n$ FDs, each call costs $O(n)$ regardless of how many are ready.
-
-`epoll` separates registration from waiting:
-
-- `epoll_create1(0)` — create an epoll instance (returns an FD)
-- `epoll_ctl(epfd, EPOLL_CTL_ADD, fd, &event)` — register an FD; stored in a kernel-side red-black tree
-- `epoll_wait(epfd, events, maxevents, timeout)` — block until ready; returns only ready FDs from a linked list the kernel maintains
-
-Wakeup cost: $O(1)$ in the number of registered FDs, $O(k)$ in the number of ready FDs $k$. For $n = 10000$ FDs with $k = 5$ ready, `epoll_wait` does $O(5)$ work where `poll` would do $O(10000)$.
-
-Two triggering modes:
-- **Level-triggered (default)**: `epoll_wait` returns the FD as long as it remains readable/writable. Missed events are recovered on the next call.
-- **Edge-triggered** (`EPOLLET`): `epoll_wait` returns the FD only on state transitions (not-ready → ready). You must drain the FD completely on each notification — typically with a `read()` loop until `EAGAIN
+## Common Mistakes
+| # | Mistake | Why it’s Wrong | Correct Approach |
+|---|---------|----------------|------------------|
+| 1 | **Assuming `read()`/`write()` transfer the full count** | These calls may return fewer bytes than requested (e.g., due to signals, non‑blocking mode, or kernel buffer limits). Ignoring the return value leads to truncated data or infinite loops. | Loop until the requested number of bytes is processed: `while (n > 0) { ssize_t r = read(fd, buf, n); if (r <= 0) handle_error(); buf += r; n -= r; }` |
+| 2 | **Using `signal()` instead of `sigaction()`** | `signal()` has implementation‑defined semantics regarding automatic handler reset and restart of interrupted syscalls; race conditions can arise when a second signal arrives before the handler is reinstated. | Use `sigaction()` with explicit flags

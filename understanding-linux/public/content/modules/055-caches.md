@@ -10,115 +10,339 @@ resources:
     title: "Computer Architecture A Quantitative Approach (Hennessy)"
 ---
 
-## Why This Matters
-
-Every modern CPU can execute instructions in nanoseconds, but DRAM takes 50–100 ns to respond to a random read. At a 3 GHz clock, that 100 ns penalty is **300 wasted cycles per miss**. Caches exist because programs are not random: they exhibit *locality*, and the cache hierarchy is the hardware mechanism that converts that statistical regularity into performance. Misconfigure your data structures to fight the cache and you can easily see 10× slowdowns — not from an algorithmic complexity change, but from the memory subsystem refusing to cooperate.
-
----
-
 ## Core Concepts
+### Memory Hierarchy and the Role of a Cache  
+Modern processors execute instructions far faster than DRAM can supply them. The latency gap (≈100 ns for DRAM vs ≈1 ns for L1) is bridged by inserting small, fast storage levels—caches—between the core and main memory. A cache stores *copies* of recently used memory lines so that the core can satisfy a request without going to DRAM.
 
-### Locality: Why Caches Work at All
+The effectiveness of a cache hinges on the **principle of locality**:
 
-Two properties of real programs make caches effective:
+* **Temporal locality** – a location that is accessed now is likely to be accessed again soon.  
+* **Spatial locality** – locations near a recently accessed address are likely to be accessed soon.
 
-**Temporal locality**: a recently-accessed location will likely be accessed again soon. A loop counter read and written on every iteration is the canonical example. The cache keeps it hot so subsequent accesses cost ~4 cycles (L1 latency) instead of ~300.
+If a program exhibits strong locality, a small cache can capture a large fraction of references, reducing the average memory‑access time.
 
-**Spatial locality**: accessing address $A$ predicts that addresses near $A$ will be accessed soon. The cache exploits this by fetching a full *cache line* — 64 bytes on all modern x86 processors — on every miss, not just the word that was requested. If your program then touches the next word in sequence, it's already in cache.
+### Cache Organization  
+A cache is divided into **sets**; each set contains **W** ways (cache lines).  
+For a cache of total size **C** bytes, line size **B** bytes, and associativity **W**:
 
-These two properties hold because programs contain loops (temporal) and operate on contiguous data structures like arrays and structs (spatial). A program that accessed memory in a truly random order — say, pointer-chasing through a shuffled linked list spanning gigabytes — would derive almost no benefit from a cache, and its performance would reflect raw DRAM latency at every step. This is why linked list traversal is genuinely slower than array traversal at scale, even when both are $O(n)$.
+\[
+\text{Number of sets } S = \frac{C}{B \times W}
+\]
 
-### Cache Mapping: Where Can a Block Live?
+An address is split into three fields:
 
-A cache holds far fewer blocks than DRAM. The hardware must determine which cache location a given memory block *can* occupy, and then whether it currently *does* occupy it. There are three strategies:
+| Field   | Width (bits) | Purpose |
+|---------|--------------|---------|
+| **Offset** | \(\log_2 B\) | selects a byte inside a line |
+| **Index**  | \(\log_2 S\) | selects a set |
+| **Tag**    | `addr_width - Index - Offset` | identifies which memory block occupies the line |
 
-**Direct-mapped**: each memory block maps to exactly one cache slot, determined by `block_address mod num_slots`. A lookup requires checking exactly one slot — fast, simple hardware. The cost: two frequently-used blocks can map to the same slot and evict each other on alternating accesses (*thrashing*). There is no way to keep both resident simultaneously.
+*Direct‑mapped* → \(W = 1\) (one way per set).  
+*Fully associative* → \(S = 1\) (all lines in one set, index width = 0).  
+*Set‑associative* → \(1 < W < \frac{C}{B}\) (typical L1/L2 caches are 4‑way or 8‑way).
 
-**Fully associative**: a block can go in any slot. This eliminates conflict misses entirely, but finding a block requires comparing every tag in parallel. The hardware cost scales badly with size; in practice, fully associative structures are limited to small tables like TLBs (32–1024 entries).
+### Hit, Miss, and Replacement  
+On a memory request the cache controller:
 
-**Set-associative** ($n$-way): the cache is partitioned into $S$ sets, each holding $n$ ways. A block maps to exactly one set (via `block_address mod S`) but can occupy any of the $n$ ways within that set. Modern L1 caches are typically 4–8-way; L3 caches are often 16-way. Increasing $n$ reduces conflict misses with diminishing returns: going from 1-way (direct-mapped) to 2-way captures most of the gain; going from 8-way to 16-way provides very little additional benefit for typical workloads.
+1. Extracts index → selects a set.  
+2. Compares the tag of the request with the tags of all ways in that set.  
+3. If any tag matches → **hit**; data is returned from the matching way.  
+4. If no tag matches → **miss**; a line must be fetched from the next level.
 
-For a cache with $S$ sets and 64-byte blocks ($2^6$ bytes), the set index for a block at byte address $a$ is:
+If the selected set is full (all ways valid) a **replacement policy** chooses which victim to evict. Common policies:
 
-$$\text{set} = \left\lfloor \frac{a}{64} \right\rfloor \bmod S$$
+| Policy | Decision rule | Approx. hardware cost |
+|--------|---------------|-----------------------|
+| **FIFO** | evict the line that arrived earliest | simple queue |
+| **LRU**  | evict the line used least recently | requires ordering bits (≈\(\log_2 W!\) bits per set) |
+| **Pseudo‑LRU** | approximates LRU with a binary tree | 1 bit per tree node (≈\(W-1\) bits) |
+| **Random** | evict a randomly chosen way | trivial |
+| **NRU (Not Recently Used)** | evict a line with use‑bit = 0; periodic clearing | 1 use‑bit per way |
 
-Within that set, all $n$ tags are compared in parallel — the width of the set is the hardware cost you pay.
+### Write Policies and Coherence  
+When a store hits, the cache can either:
 
-### Replacement Policy: What Gets Evicted?
+* **Write‑through** – propagate the store to the next level immediately (higher bandwidth, simpler coherence).  
+* **Write‑back** – modify the line only in the cache; mark it *dirty*; write back to lower level on eviction (reduces traffic, needs dirty bit).
 
-When a set is full and a new block arrives, the hardware must choose a victim. The oracle policy would evict whichever block will be reused furthest in the future (Bélády's algorithm), but that requires knowledge of future accesses. Hardware must approximate it:
-
-**LRU (Least Recently Used)**: evict the block accessed longest ago. Performs well for workloads with clear temporal reuse. Exact LRU requires $\log_2(n!)$ bits of ordering state per set — at $n = 16$, that is $\lceil \log_2(16!) \rceil = 44$ bits per set, plus update logic on every access. Most hardware implements *pseudo-LRU*: a binary tree of bits that approximates LRU with $n - 1$ bits per set, accepting occasional wrong evictions in exchange for simpler update logic.
-
-**Random**: select a victim uniformly at random. Counterintuitively competitive with LRU at $n \geq 4$, because conflict patterns that would systematically defeat LRU don't systematically defeat random. Simpler hardware, no pathological cases.
-
-**RRIP (Re-Reference Interval Prediction)**: each line is tagged with a predicted re-reference distance (2 bits in the basic form). New lines are inserted with a "distant" prediction; lines that hit have their prediction promoted to "near". Eviction targets the line with the most distant prediction. Intel uses a variant (SRRIP/DRRIP) in L3 caches to resist cache-unfriendly scan patterns that would pollute an LRU cache.
-
-### Cache Coherence: The Multiprocessor Problem
-
-Each core in a modern CPU has a private L1 and L2 cache. This means multiple cores can simultaneously hold a copy of the same cache line. Without a coherence mechanism, a write by one core would be invisible to others, causing silent data corruption: two cores both reading a "current" value that disagree.
-
-A coherent memory system enforces two invariants:
-
-1. **Single-writer / multiple-reader**: at any instant, a line is either writable by exactly one core, or readable by any number of cores — not both.
-2. **Write serialization**: if two cores write to the same location, all other cores observe those writes in the same order.
-
-The standard mechanism is **MESI** (a state machine per cache line):
-
-| State | Meaning |
-|---|---|
-| **M**odified | Line is dirty; only this cache has it; memory is stale |
-| **E**xclusive | Line is clean; only this cache has it; memory matches |
-| **S**hared | Line is clean; multiple caches may have it; memory matches |
-| **I**nvalid | Line is not present or has been invalidated |
-
-When a core in state S or I wants to *write*, it issues an **invalidate** transaction on the interconnect. Every other cache holding that line transitions to I before the requesting core's write proceeds. This serializes writes through the interconnect and prevents two cores from believing they have write authority simultaneously.
-
-**False sharing** is the coherence tax on adjacent data. Two cores writing to different variables $x$ and $y$ — independent, no logical sharing — but $x$ and $y$ happen to sit in the same 64-byte line. The coherence protocol sees one unit: that line. It bounces ownership between cores on every write, serializing what should be parallel updates. The program is correct; it is simply paying the full coherence round-trip (~40–100 ns on a NUMA system) for every write to either variable.
+In a multiprocessor each core has its own L1/L2 caches. To keep a *single* view of memory, the caches must stay **coherent**. The dominant hardware scheme is **MESI** (Modified, Exclusive, Shared, Invalid). Each line carries a 2‑bit state; bus‑snooping or a directory tracks state transitions on every read/write request, issuing invalidations or updates as needed.
 
 ---
 
 ## How It Works
+### Cache Lookup – Step‑by‑step
+Assume a 32‑bit byte‑addressable processor, L1 data cache: 32 KB, 4‑way, 64‑byte line.
 
-### Address Decomposition
+1. **Calculate parameters**  
 
-For a physically-addressed cache with $2^s$ sets and $2^b$-byte blocks, a physical address is decomposed into three fields:
+\[
+B = 64\text{ B} \Rightarrow \text{offset} = \log_2 64 = 6\text{ bits}
+\]  
+\[
+C = 32\text{ KiB} = 32 \times 2^{10} = 2^{15}\text{ B}
+\]  
+\[
+W = 4 \Rightarrow S = \frac{C}{B \times W} = \frac{2^{15}}{2^{6} \times 4}= \frac{2^{15}}{2^{8}} = 2^{7}=128\text{ sets}
+\]  
+\[
+\text{index} = \log_2 S = 7\text{ bits}
+\]  
+\[
+\text{tag} = 32 - (\text{index}+\text{offset}) = 32 - (7+6) = 19\text{ bits}
+\]
 
-$$\underbrace{\text{tag}}_{(w - s - b) \text{ bits}} \;\|\; \underbrace{\text{set index}}_{s \text{ bits}} \;\|\; \underbrace{\text{block offset}}_{b \text{ bits}}$$
+2. **Extract fields from address A**  
 
-For a concrete 32-bit address with a 4-way set-associative cache of 256 sets ($s = 8$) and 64-byte lines ($b = 6$):
+\[
+\text{offset}= A[5:0] \\
+\text{index}= A[12:6] \\
+\text{tag}= A[31:13]
+\]
 
-$$\underbrace{[31:14]}_{\text{tag, }18\text{ bits}} \;\|\; \underbrace{[13:6]}_{\text{set index, }8\text{ bits}} \;\|\; \underbrace{[5:0]}_{\text{block offset, }6\text{ bits}}$$
+3. **Set selection** – use index to address the 128‑set array.  
+4. **Tag compare** – parallel comparators check tag against each of the 4 ways.  
+5. **Hit detection** – if any comparator asserts, the corresponding way’s data is multiplexed to the core; the LRU state for that set is updated (the accessed way becomes most‑recent).  
+6. **Miss handling** – if no match:  
 
+   * Allocate a victim way according to the replacement policy.  
+   * If the victim is dirty, schedule a write‑back to the next level.  
+   * Issue a read request to L2/main memory for the missing 64‑byte line.  
+   * When the line returns, place it in the victim way, set its tag, mark it valid (and clean if read‑only).  
+   * Forward the requested byte(s) to the core (critical‑word‑first or full‑line depending on design).  
+
+7. **Write handling** – on a store hit:  
+
+   * Write‑through: update data way and forward to next level.  
+   * Write‑back: update data way, set dirty bit, leave lower level unchanged until eviction.  
+
+   On a store miss with write‑allocate: treat as a read miss (fetch line), then perform the store as a hit; with no‑write‑allocate: send the store straight to the next level, leaving cache unchanged.
+
+### Coherence Actions (MESI Snooping)
+* **Processor read** – if line is in Modified/Owned state in another cache, that cache supplies the data and both transition to Shared; otherwise data comes from memory and requester becomes Shared (or Exclusive if no other cached copy).  
+* **Processor write** – if line is Modified/Exclusive locally, proceed; else issue a Bus Upgrade (or Read‑Invalidate) transaction, causing all other caches to invalidate their copies, then transition local line to Modified.  
+
+These transactions occur on the interconnect bus (or point‑to‑point links with a directory), adding latency but preserving a single memory view.
+
+---
+
+## Worked Examples
+### Example 1 – Direct‑Mapped Cache Hit
+**Cache parameters**: 16 KB size, 4 KB block size, direct‑mapped (\(W=1\)).  
+
+\[
+S = \frac{C}{B}= \frac{16\text{ KiB}}{4\text{ KiB}} = 4\text{ sets}
+\]  
+\[
+\text{offset} = \log_2 4096 = 12\text{ bits},\quad
+\text{index}= \log_2 4 = 2\text{ bits},\quad
+\text{tag}= 32-(12+2)=18\text{ bits}
+\]
+
+**Address to test**: `0x00001000` (decimal 4096).  
+
+*Binary*: `0000 0000 0000 0001 0000 0000 0000 0000`  
+- offset[11:0] = `0x000`  
+- index[13:12] = `01` (set 1)  
+- tag[31:14] = `0x00004`  
+
+Assume the cache line for set 1 currently holds tag `0x00004` and is valid. The tag comparator matches → **hit**.  
+
+**Latency**: L1 hit time ≈ 1 cycle. No miss penalty incurred.
+
+### Example 2 – Same Cache, Miss
+**Address**: `0x00003000` (decimal 12288).  
+
+- offset = `0x000`  
+- index = `11` binary → set 3 (since 12 KB / 4 KB = 3)  
+- tag = `0x00000`  
+
+Set 3 currently holds tag `0x00001` (different). No match → **miss**.  
+
+**Miss penalty** (typical L2 latency ≈ 12 cycles, main‑memory ≈ 100 cycles). Assume the line is not in L2, so we go to memory:
+
+\[
+\text{AMAT}= t_{\text{hit}} + \text{miss\_rate}\times t_{\text{miss}}
+\]
+
+If this reference is the only one, miss_rate = 1:
+
+\[
+\text{AMAT}= 1 + 1 \times 100 = 101\text{ cycles}
+\]
+
+If we had a 95 % hit rate, AMAT ≈ \(1 + 0.05 \times 100 = 6\) cycles, showing the impact of locality.
+
+### Example 3 – 4‑Way Set‑Associative Cache, LRU Replacement
+**Cache**: 32 KB, 64 B line, 4‑way → \(S = 32\text{KiB} / (64\times4) = 128\) sets (as derived earlier).  
+
+**Reference stream** (byte addresses):  
+
+| Ref | Address | Index (hex) | Tag (hex) |
+|-----|---------|-------------|-----------|
+| 1   | 0x00001000 | 0x20 | 0x00000 |
+| 2   | 0x00001040 | 0x20 | 0x00000 (same line, different offset) |
+| 3   | 0x00002000 | 0x40 | 0x00000 |
+| 4   | 0x00003000 | 0x60 | 0x00000 |
+| 5   | 0x00001080 | 0x20 | 0x00000 (same set as refs 1‑2) |
+
+**State before ref 5** (LRU order per set, most‑recent first):  
+
+*Set 0x20*: ways = [ref 2 (MRU), ref 1]  
+*Set 0x40*: [ref 3]  
+*Set 0x60*: [ref 4]
+
+**Processing ref 5**  
+
+1. Index = 0x20 → look at set 0x20.  
+2. Tag compare finds a match in way holding ref 2 → **hit**.  
+3. LRU update: move ref 5’s way to MRU position → new order = [ref 5, ref 2, ref 1].  
+
+No replacement needed.  
+
+If ref 5 had been to a *new* tag (e.g., 0x000010C0) the set would be full; LRU would evict the *least‑recently used* way, which is ref 1 (the oldest). The victim line would be written back if dirty, then the new line installed in that way.
+
+---
+
+## Common Mistakes
+| # | Mistake | Why It’s Wrong | Correct Understanding |
+|---|---------|----------------|-----------------------|
+| 1 | **Assuming cache size = data storage only** (ignoring tag, valid, dirty bits) | The total silicon area includes metadata; a 32 KB 4‑way cache with 64‑B lines needs \(S \times W \times (\text{tag}+2)\) bits ≈ 3 KB extra. | Compute **effective storage** = data + overhead; use formulas to size tag RAM correctly. |
+| 2 | **Believing LRU always yields the lowest miss rate** | LRU approximates optimal (Belady) but can be worse for certain access patterns (e.g., sequential scans with associativity > 1). | Understand workload‑dependent performance; consider **pseudo‑LRU** or **random** for lower hardware cost when LRU’s benefit is marginal. |
+| 3 | **Treating physical and virtual addresses interchangeably for cache indexing** | Many L1 caches are **VIPT** (virtually indexed, physically tagged); using the wrong bits can cause synonyms or aliasing problems. | Verify indexing scheme: if page size > cache size × associativity, VIPT works; otherwise OS must page‑color or use physically indexed caches. |
+| 4 | **Ignoring write policy effects on coherence traffic** | Write‑through generates a bus transaction per store, saturating bandwidth; write‑back reduces traffic but requires invalidation on shared lines. | Choose policy based on workload: read‑dominant → write‑back; write‑heavy, low‑sharing → write‑through. |
+| 5 | **Assuming cache coherence is free** | Each coherence transaction incurs latency and bandwidth; false sharing can dominate performance in parallel code. | Align data structures to cache‑line boundaries, pad to avoid false sharing, and use tools like `perf` to measure cache‑miss and coherence‑traffic events. |
+
+---
+
+## Exercises
+### Easy  
+1. **Parameter calculation** – A 64 KB, 8‑way set‑associative cache has 32‑byte lines. Compute the number of sets, index width, offset width, and tag width for a 64‑bit address.  
+
+   *Solution*:  
+   \[
+   S = \frac{64\text{ KiB}}{32\text{ B} \times 8}= \frac{2^{16}}{2^{5}\times 2^{3}} = 2^{8}=256\text{ sets}
+   \]  
+   \[
+   \text{offset}= \log_2 32 =5\text{ bits},\;
+   \text{index}= \log_2 256 =8\text{ bits},\;
+   \text{tag}=64-(5+8)=51\text{ bits}
+   \]
+
+### Medium  
+2. **Trace‑driven simulation** – Write a C program that simulates a direct‑mapped 8 KB cache with 16‑byte lines. Given a memory‑trace file (hex addresses, one per line), compute hit‑rate and average memory‑access time assuming hit time = 1 cycle, miss penalty = 100 cycles.  
+
+   *Hints*:  
+   - Extract index = (addr >> 4) & 0x3F (since 8 KB/16 B = 512 sets → 9 bits? Wait recalc: 8 KB = 8192 B; lines = 8192/16 = 512 → index bits = 9).  
+   - Keep an array of tags (`uint64_t tag[512]`), initialize to an invalid value (e.g., `~0ULL`).  
+   - On each access, compare tag; on miss, load new tag and increment miss counter.  
+
+### Hard  
+3. **Design a configurable cache simulator** – Implement a simulator that accepts parameters (size, associativity, line size, replacement policy) and a trace file, then outputs:  
+   - Hit‑rate per level (L1, L2) if you simulate a hierarchy.  
+   - Traffic breakdown (reads, writes, write‑backs).  
+   - Optional: MESI state transitions for a two‑core system (you can generate synthetic shared‑read/write patterns).  
+
+   *Evaluation*: Run the simulator on the `ladder` and `loop` traces from the **Cache Lab** (CMU 15‑213) and compare results to a reference simulator (e.g., `dineroIV`).  
+
+4. **Linux kernel cache inspection** – Write a shell script that prints, for each logical CPU, the size, line size, and associativity of its data and instruction caches (L1, L2, L3) by reading the appropriate sysfs files.  
+
+   *Expected output format*:  
+   ```
+   CPU0: L1d=32K (8-way, 64B), L1i=32K (8-way, 64B), L2=256K (8-way, 64B), L3=8192K (16-way, 64B)
+   CPU1: …
+   ```
+
+   *Bonus*: Add a `perf stat -e cache-references,cache-misses, LLC-loads, LLC-stores` run of a user‑provided binary and report the miss ratio.
+
+---
+
+## Linux Connection
+Linux exposes the hardware caches through **sysfs** and provides tools to measure their behavior.  
+
+### Sysfs layout (x86, ARM, etc.)  
+Each logical CPU has a directory tree under `/sys/devices/system/cpu/<cpu>/cache/index*/`. The `index*` directories are ordered from the innermost cache outward (index 0 = L1 data or instruction depending on the `type` file).  
+
+Key files (read‑only, unless noted):
+
+| File | Meaning |
+|------|---------|
+| `size` | Human‑readable size (e.g., `32K`) |
+| `number_of_sets` | Integer |
+| `ways_of_associativity` | Integer (0 → fully associative) |
+| `shared_cpu_list` | CPUs that share this cache (useful for identifying core vs. socket sharing) |
+| `type` | `"Data"`, `"Instruction"`, or `"Unified"` |
+| `level` | Cache level (`1`, `2`, `3`…) |
+| `coherency_line_size` | Line size in bytes (usually 64) |
+
+#### Example Commands
+```bash
+# Show L1 data cache size for CPU0
+cat /sys/devices/system/cpu/cpu0/cache/index0/size
+# => 32K
+
+# Show associativity and line size for L2 on all CPUs
+for cpu in /sys/devices/system/cpu/cpu[0-9]*; do
+    echo -n "${cpu##*/}: "
+    cat $cpu/cache/index1/ways_of_associativity
+    echo -n "‑way, "
+    cat $cpu/cache/index1/coherency_line_size
+    echo "B line"
+done
 ```
-Physical address (32 bits):
- 31             14 | 13          6 | 5           0
- [    tag        ] [ set index   ] [   offset    ]
-      18 bits            8 bits          6 bits
+
+### Tools for Measuring Cache Behavior
+| Tool | What it measures | Typical invocation |
+|------|------------------|--------------------|
+| `perf` | Hardware performance counters (cache‑references, cache‑misses, branch‑misses, etc.) | `perf stat -e cache-references,cache-misses,cycles,instructions ./myprog` |
+| `likwid-perfctr` (LIKWID) | Pre‑defined metric groups (e.g., `L2CACHE`, `L3CACHE`, `MEM`) | `likwid-perfctr -g L2CACHE ./myprog` |
+| `numactl` + `vmstat` | NUMA‑aware memory placement (relevant when caches are shared across sockets) | `numactl --cpunodebind=0 --membind=0 ./myprog` |
+| `x86info` / `cpuid` | Low‑level CPUID leaf decoding (cache parameters) | `x86info -c` |
+| `hwloc` (`lstopo`) | Visual topology showing caches, cores, sockets | `lstopo-no-graphics` |
+
+### Kernel Subsystems that Interact with Caches
+| Subsystem | Role |
+|-----------|------|
+| `arch/x86/kernel/cpu/cache.c` (or architecture‑specific equivalents) | Early boot detection of cache hierarchies, populates sysfs files. |
+| `mm/page_alloc.c` (page allocator) | Uses **page coloring** to reduce cache aliasing when VIPT caches are used. |
+| `mm/vmscan.c` (page reclaim) | Tries to keep clean pages in the cache to avoid write‑back stalls during memory pressure. |
+| `kernel/sched/core.c` (scheduler) | Attempts to schedule related threads on cores that share a cache (cache‑aware load balancing). |
+| `fs/buffer.c` (block layer buffer cache) | Implements the **page cache**, a software cache for file data that sits atop the hardware caches. |
+
+#### Runnable Example – Measuring L1 miss rate with `perf`
+```bash
+# Compile a simple tight loop that walks a large array
+cat > miss_test.c <<'EOF'
+#include <stdlib.h>
+#include <stdio.h>
+#define SIZE (100*1024*1024) // 100 MB
+int main(void) {
+    unsigned char *buf = malloc(SIZE);
+    for (size_t i=0; i<SIZE; i+=64)   // stride = one cache line
+        buf[i] = 1;
+    free(buf);
+    return 0;
+}
+EOF
+gcc -O2 -march=native miss_test.c -o miss_test
+
+# Run perf, collecting L1‑d cache misses and references
+perf stat -e dcache-loads,dcache-load-misses ./miss_test
 ```
+Typical output (on a modern Xeon):
+```
+       1,562,345,678      dcache-loads
+         123,456,789      dcache-load-misses
+            7.90% of all dcache-loads
+```
+The miss ratio (~8 %) reflects the stride‑64 access pattern (one load per cache line, no reuse).
 
-The total cache capacity is:
+---
 
-$$\text{capacity} = 2^s \times n \times 2^b = 256 \times 4 \times 64 = 65536 \text{ bytes} = 64 \text{ KiB}$$
+## Why This Matters
+Understanding caches is not an academic exercise; it is the **foundation for performance engineering** across the stack:
 
-This matches a typical L1 data cache size. On a lookup, hardware uses the 8-bit set index to address the set's tag array, reads all 4 tags simultaneously, and XORs each with the address's tag field — a hit is a zero result combined with a valid bit.
-
-The reason the block offset occupies the *low* bits and the tag the *high* bits is not arbitrary: it ensures that spatially adjacent addresses (differing only in low bits) map to the *same* set, maximizing spatial prefetch utility. If the set index used high bits, sequential addresses would spray across the whole cache.
-
-### Conflict Miss Demonstration
-
-A direct-mapped cache with $2^k$ sets maps address $a$ to set $\lfloor a/64 \rfloor \bmod 2^k$. Two arrays whose base addresses differ by a multiple of the cache size will have every corresponding element map to the *same* set — guaranteed thrashing:
-
-```c
-// Assume L1 data cache: direct-mapped, 32 KiB, 64-byte lines
-// = 512 sets. Two arrays 32 KiB apart alias to the same sets.
-#define N 4096
-double A[N], B[N];   // sizeof(double) * 4096 = 32 KiB each
-                     // If &A[0] and &B[0] differ by 32 KiB,
-                     // A[i] and B[i] map to the same cache set.
-
-for (int i = 0; i < N; i++) {
-    A[i] = A[i] * B[i];
-    // Access A[i]: load A[i]'s line into set k, evicting B[i]'s line
-    // Access B[i]: miss — load B[i]'s line into set k, evicting A[i]'s line
-    //
+* **Algorithm design** – Loop tiling, blocking, and cache‑oblivious algorithms are derived directly from the cache‑size, line‑size, and associativity formulas. Knowing whether your data fits in L1, L2, or LLC dictates whether you optimize for temporal reuse or bandwidth.  
+* **System software** – The kernel’s page‑allocator, slab allocator, and scheduler all make decisions based on cache topology to minimize false sharing and maximize cache‑resident data.  
+* **Multiprocessor scalability** – Coherence protocols (MESI, MOESIF, etc.) add latency that grows with sharer count. Recognizing when a data structure is *shared* versus *private* lets you align locks, use per‑CPU data, or employ RCU to avoid unnecessary coherence traffic.  
+* **Power & energy** – Each cache access consumes far less energy than a DRAM access. Reducing miss rate translates directly into lower dynamic power, a critical factor in data‑centers and mobile devices.  
+* **Diagnostics & tuning** – Tools like

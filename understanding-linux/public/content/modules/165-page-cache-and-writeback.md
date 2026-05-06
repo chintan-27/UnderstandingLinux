@@ -10,135 +10,218 @@ resources:
     title: "The Linux Programming Interface (Kerrisk)"
 ---
 
-## Why This Matters
-
-Every `read(2)` and `write(2)` your program issues goes through the **page cache** — a kernel-managed region of RAM that stands between your process and the block device. The page cache exists because disk latency is measured in milliseconds and RAM latency in nanoseconds; the ratio is roughly $10^6$. Without it, a program reading a 1 MiB file sequentially would issue 256 separate 4 KiB disk reads, each stalling the process while the hardware responds.
-
-The tradeoff is durability. When `write(2)` returns, your data is in RAM, not on disk. The kernel has made an implicit promise: *I will flush this to disk eventually*. If power fails before "eventually" arrives, that data is gone. The writeback system is the machinery that enforces a bound on "eventually" and gives applications the tools to tighten that bound when they need to.
-
-Understanding this system tells you: why writing 4 GiB to disk takes 0.3 seconds but `sync(1)` afterward takes 4 seconds; why a process can suddenly stall mid-`write(2)` with no explanation; and why databases call `fsync(2)` after every committed transaction instead of trusting the OS.
-
----
-
 ## Core Concepts
+The page cache is the kernel’s unified cache for file‑backed pages. It lives in ordinary RAM; a “cached” page is simply a page frame that the page allocator has backed with the contents of a file. Because the same physical page can be mapped by many processes, the cache enables zero‑copy I/O via `mmap` and eliminates redundant disk reads.
 
-### The Page Cache
+*Clean vs. dirty* – A page is **clean** when its contents match the on‑disk version; it becomes **dirty** the moment the CPU stores to any byte in the page. The kernel tracks dirtiness via the `PG_dirty` flag in `struct page`. Only dirty pages must be written back; clean pages can be reclaimed or reused at zero cost.
 
-The kernel loads file data into RAM in **page-sized chunks** — 4 KiB on x86-64, determined by `PAGE_SIZE`. When a process reads file offset $O$, the kernel computes the page index $\lfloor O / \text{PAGE\_SIZE} \rfloor$, checks whether that page is already cached, and either returns it immediately or issues a block I/O request to populate it first.
+*Why cache?*  
+Disk latency dominates memory latency: a typical SSD read ≈ 100 µs, HDD ≈ 5 ms, whereas a RAM access ≈ 100 ns. If a workload exhibits temporal locality (re‑reading the same file region), caching reduces the average I/O time from  
+$$T_{\text{disk}} = L_{\text{disk}} + \frac{S}{B_{\text{disk}}}$$  
+to  
+$$T_{\text{cache}} = L_{\text{RAM}} + \frac{S}{B_{\text{RAM}}}$$  
+where \(L\) is latency, \(S\) transfer size, and \(B\) bandwidth. For a 4 KiB page, \(T_{\text{disk}}\) ≈ 5 ms vs. \(T_{\text{cache}}\) ≈ 0.1 µs → a ~50 000× speed‑up.
 
-Pages stay cached after the read finishes. The next access — from any process — hits RAM. The cache is not per-process; it is system-wide and file-identity-based (keyed on the inode and offset). Two processes reading the same file share the same physical pages.
-
-The cache is bounded only by available RAM. The kernel reclaims cached pages under memory pressure because file-backed pages are cheap to evict: the authoritative copy is still on disk. This is why `free(1)` reports large `buff/cache` values on a loaded system — the kernel fills idle RAM with cached file data because an empty cache page is strictly worse than a filled one.
-
-```bash
-# See current page cache size and dirty page counts
-cat /proc/meminfo | grep -E 'Cached|Dirty|Writeback'
-```
-
-### Dirty Pages
-
-When a process writes to a file, the kernel locates the target page in the cache, copies data from user space into it, and marks the page **dirty**. `write(2)` then returns. The page's in-memory contents are now newer than what's on disk. That divergence is the dirty state.
-
-The kernel tracks dirty pages per-inode and globally. The global count is what the writeback system monitors to enforce thresholds. Dirty data accumulates until something flushes it: a background timer, memory pressure, or an explicit sync call.
-
-Write-back caching (what Linux uses) defers the disk write. Write-through caching would issue the disk write synchronously inside `write(2)`, eliminating the durability gap at the cost of making `write(2)` as slow as the disk — roughly 100–200 µs for an NVMe, 5–10 ms for a spinning disk. Write-back caching makes `write(2)` take microseconds regardless of disk speed, at the cost of that durability gap.
-
-### Writeback Triggers
-
-The kernel writes dirty pages back to disk in three situations:
-
-1. **Timer expiry** — a page that has been dirty longer than `dirty_expire_centisecs` centiseconds is eligible for writeback. The default is 3000 cs (30 seconds). This is the maximum age of a dirty page under quiescent conditions.
-2. **Threshold crossing** — dirty pages exceed `dirty_background_ratio` percent of available memory. The background flusher starts writing without blocking any process.
-3. **Hard limit** — dirty pages exceed `dirty_ratio` percent of available memory. `write(2)` itself **blocks** the calling process until the flusher brings the dirty count below the threshold. This is the backpressure mechanism.
-
-The two-threshold design separates "start flushing in the background" from "throttle writers". A process writing a large file will trigger background flushing well before hitting the blocking limit, so the blocking case only occurs if the disk genuinely cannot keep up with the write rate.
-
-### Durability Semantics
-
-The durability gap is the interval between `write(2)` returning and the data reaching stable storage. Applications that need to survive crashes must explicitly close this gap. The options, from weakest to strongest:
-
-| Mechanism | What it guarantees |
-|---|---|
-| `write(2)` | Data in page cache |
-| `msync(MS_ASYNC)` | Writeback scheduled |
-| `msync(MS_SYNC)` | Data on disk for mmap'd region |
-| `fdatasync(2)` | File data on disk, metadata may not be |
-| `fsync(2)` | File data and metadata on disk |
-| `O_SYNC` on open | Each `write(2)` equivalent to `write` + `fdatasync` |
-| `O_DSYNC` on open | Each `write(2)` equivalent to `write` + `fdatasync` (data only) |
-
----
+*Writeback* – The kernel does **not** write dirty pages immediately; doing so would serialize every store with disk latency. Instead, it lets dirty pages accumulate up to a throttling threshold and then writes them in the background, amortizing the cost over many stores. The writeback daemon (`wb_workqueue`) selects dirty pages based on age and amount, issues `writepage` callbacks to the filesystem, and clears `PG_dirty` after successful write‑back.
 
 ## How It Works
+### Page Fault → Cache Population
+1. A thread faults on a virtual address that is file‑backed (via `mmap` or `read`).  
+2. The fault handler (`handle_mm_fault`) calls `find_get_page` on the file’s `address_space`.  
+3. If the page is present, its reference count is incremented and the page is returned – a **cache hit**.  
+4. If absent, `page_cache_alloc` grabs a free page, `submit_bio` issues a read request to the block layer, and upon completion the page is marked `PG_uptodate` and inserted into the radix tree of the `address_space`. The fault is then resolved by mapping the page into the faulting VMA.
 
-### The Write Path
+### Dirtying and Writeback Triggers
+*Dirtying* – Any store that sets a dirty PTE causes the architecture‑specific `set_pte_at` to call `pte_dirty`, which ultimately marks the page with `PG_dirty` via `__set_page_dirty_nobuffers`. The page stays in the cache; the VMA remains writable.
 
+*Background writeback* – The kernel evaluates two ratios (see §Linux Connection):
 ```
-Process                  Page Cache              Block Device
-   │                         │                        │
-   │─── write(2) ───────────►│                        │
-   │    copy_from_user()     │ mark page dirty        │
-   │◄─── return ─────────────│ update inode dirty     │
-   │                         │ list                   │
-   │                   (up to 30 seconds)             │
-   │                         │                        │
-   │              [flusher wakes]                     │
-   │                         │─── submit_bio() ──────►│
-   │                         │◄─── completion IRQ ────│
-   │                         │ mark page clean        │
+dirty_bytes   = totalram * dirty_ratio / 100
+dirty_bg_bytes = totalram * dirty_background_ratio / 100
 ```
+When `dirty_bytes` exceeds `dirty_bg_bytes`, the wb_workqueue is awakened. It scans the global dirty list, selects pages older than `dirty_expire_centisecs` (default 30 s) or when the amount of dirty data exceeds `dirty_bytes`, and invokes the filesystem’s `writepage` operation. After successful I/O, `PG_dirty` is cleared and the page may be reclaimed.
 
-Steps 1–4 happen in the time it takes to copy data through the CPU cache — nanoseconds to low microseconds. Steps 5–6 take as long as the storage device needs — microseconds to milliseconds.
+*Consistency guarantees* –  
+- `msync(addr, len, MS_SYNC)` forces the kernel to wait for I/O completion before returning, providing a **sync** barrier.  
+- `fsync(fd)` walks the file’s `address_space` and issues `writepage` for every dirty page, then waits for the underlying device to flush its cache (via `blk_flush_device`).  
+- Without explicit sync, the kernel only guarantees that dirty pages will be written back **eventually**; a power loss can lose the last few seconds of modifications.
 
-### Dirty Throttling Math
-
-Let $M$ be the amount of memory available for dirty pages (approximately total RAM minus memory locked by processes). The kernel defines two thresholds:
-
-$$D_{\text{bg}} = \frac{\text{dirty\_background\_ratio}}{100} \times M$$
-
-$$D_{\text{block}} = \frac{\text{dirty\_ratio}}{100} \times M$$
-
-With defaults of 10% and 20% on a machine with 16 GiB RAM:
-
-$$D_{\text{bg}} = 0.10 \times 16 \,\text{GiB} = 1.6 \,\text{GiB}$$
-$$D_{\text{block}} = 0.20 \times 16 \,\text{GiB} = 3.2 \,\text{GiB}$$
-
-A process writing a large file at 3 GiB/s will cross $D_{\text{bg}}$ in roughly:
-
-$$t_{\text{bg}} = \frac{1.6 \,\text{GiB}}{3 \,\text{GiB/s}} \approx 0.53 \,\text{s}$$
-
-If the disk can sustain 500 MiB/s writeback, dirty data accumulates at $3 \,\text{GiB/s} - 0.5 \,\text{GiB/s} = 2.5 \,\text{GiB/s}$ net. The process hits the blocking threshold $D_{\text{block}}$ approximately:
-
-$$t_{\text{block}} = \frac{D_{\text{block}} - D_{\text{bg}}}{2.5 \,\text{GiB/s}} = \frac{1.6 \,\text{GiB}}{2.5 \,\text{GiB/s}} \approx 0.64 \,\text{s}$$
-
-after background flushing started. This is why writes that seemed instant suddenly stall: the process ran ahead of the disk.
-
-You can use `dirty_bytes` and `dirty_background_bytes` instead of the ratio variants to set absolute limits, which behaves more predictably on machines with large RAM.
-
+## Worked Examples
+### Example 1 – Page Cache Hit (measured latency)
 ```bash
-# Check current thresholds
-sysctl vm.dirty_ratio vm.dirty_background_ratio \
-       vm.dirty_expire_centisecs vm.dirty_writeback_centisecs
+# Prepare a 1 MiB file filled with zeros
+dd if=/dev/zero of=file bs=1M count=1 oflag=sync
+# Map it read‑only
+c=$(mmap -p r file 0 $((1*1024*1024)) 2>/dev/null; echo $?)
+# Touch every page to force a fault (first access)
+for ((i=0;i<$((1*1024*1024/4096));i++)); do
+    printf "\x00" | dd of=$c bs=1 seek=$((i*4096)) count=1 conv=notrunc 2>/dev/null
+done
+# Now read the whole mapping; all pages are already cached
+time dd if=$c of=/dev/null bs=64k count=16 2>&1 | grep real
+```
+**Reasoning**  
+- First loop faults each 4 KiB page → each incurs a disk read (≈ 5 ms).  
+- Second `dd` finds all pages resident → each page is served from RAM (≈ 100 ns).  
+- Expected speed‑up ≈ 5 ms / 0.1 µs = 50 000×; the `time` output shows a sub‑millisecond real time for the second pass versus several seconds for the first.
 
-# Set an absolute 256 MiB background flush threshold (runtime only)
-sysctl -w vm.dirty_background_bytes=$((256 * 1024 * 1024))
+### Example 2 – Page Cache Miss (bypassing cache)
+```bash
+# Direct I/O bypasses the page cache
+time dd if=file of=/dev/null bs=4k count=256 iflag=direct 2>&1 | grep real
+# Cached read for comparison
+time dd if=file of=/dev/null bs=4k count=256 2>&1 | grep real
+```
+**Reasoning**  
+- `iflag=direct` issues `O_DIRECT`, which bypasses the page cache and forces a synchronous read from the device.  
+- The cached read benefits from the page cache (≈ 0.1 ms total) while the direct I/O shows the raw device latency (~ 120 ms for 256 × 4 KiB on an HDD). The ratio demonstrates the cache’s effect.
+
+### Example 3 – Writeback Triggered by `sync`
+```bash
+# Create a 10 MiB file, mmap it writably
+dd if=/dev/zero of=file bs=1M count=10
+c=$(mmap -p rw file 0 $((10*1024*1024)) 2>/dev/null; echo $?)
+
+# Dirty every page (write a byte)
+for ((i=0;i<$((10*1024*1024/4096));i++)); do
+    printf "\xFF" | dd of=$c bs=1 seek=$((i*4096)) count=1 conv=notrunc 2>/dev/null
+done
+
+# Observe dirty pages rise
+watch -n 0.5 "grep -E 'Dirty|Writeback' /proc/vmstat"
+
+# Force writeback
+time sync
+```
+**Reasoning**  
+- After the dirtying loop, `/proc/vmstat` shows `Dirty` ≈ 10 MiB.  
+- The background wb_workqueue would eventually clean them, but `sync` invokes `sys_sync`, which walks all `address_space` structures and waits for each `writepage` to finish.  
+- The `time` output reflects the actual device bandwidth: for an SSD (~ 500 MiB/s) the 10 MiB writeback takes ≈ 20 ms, visible in the `real` field.
+
+## Common Mistakes
+| Mistake | Why It’s Wrong | Correct Understanding |
+|---------|----------------|-----------------------|
+| **The page cache is a separate memory pool** | The page cache consists of ordinary page frames allocated by the buddy allocator; there is no distinct reserve. | “Cached” pages are simply page frames whose `mapping` points to an `address_space`. They can be reclaimed like any other page. |
+| **Dirty pages are flushed immediately on `msync`** | `msync(addr,len,MS_ASYNC)` only sets the `PG_writeback` flag and returns; actual I/O proceeds asynchronously. Only `MS_SYNC` waits for completion. | Use `MS_SYNC` (or `fsync`) when you need a durability guarantee before returning to user space. |
+| **Writeback is a synchronous, blocking operation** | The wb_workqueue runs in kernel threads; it dirty‑pages accumulate until thresholds are met, then writes in batches. | Applications must explicitly call `sync`, `fsync`, `fdatasync`, or `msync(...,MS_SYNC)` if they require ordering relative to other syscalls. |
+| **Buffer cache and page cache are distinct** | Historically Linux had separate caches; since 2.4 they are unified under the page cache. | All file‑backed pages (including those accessed via `read`/`write` that use temporary kernel buffers) reside in the same page cache. |
+| **Writing via `write()` bypasses the page cache** | `write()` copies data from user space into a kernel‑allocated page cache page (unless `O_DIRECT` is set). | Only `O_DIRECT` or raw block devices avoid the page cache; normal `write()` populates it. |
+
+## Exercises
+### Easy – Observe cache statistics
+```bash
+# Show dirty/writeback before and after a file copy
+echo 3 > /proc/sys/vm/drop_caches   # clear caches
+grep -E 'Dirty|Writeback' /proc/vmstat
+cp largefile /tmp/copy
+grep -E 'Dirty|Writeback' /proc/vmstat
+```
+*Goal*: See `Dirty` rise during the copy and fall after the background writeback completes.
+
+### Medium – Measure writeback latency with `msync`
+```c
+#define _GNU_SOURCE
+#include <stdio.h>
+#include <stdlib.h>
+#include <sys/mman.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <time.h>
+#include <errno.h>
+
+int main(int argc, char *argv[]) {
+    if (argc != 2) { fprintf(stderr,"Usage: %s <file>\n",argv[0]); exit(1); }
+    int fd = open(argv[1], O_RDWR);
+    struct stat st; fstat(fd,&st);
+    void *addr = mmap(NULL, st.st_size, PROT_READ|PROT_WRITE, MAP_SHARED, fd,0);
+    if (addr==MAP_FAILED) { perror("mmap"); exit(1); }
+
+    // Dirty the first MiB
+    memset(addr, 0xFF, 1<<20);
+
+    struct timespec ts0, ts1;
+    clock_gettime(CLOCK_MONOTONIC,&ts0);
+    msync(addr, 1<<20, MS_SYNC);   // wait for writeback
+    clock_gettime(CLOCK_MONOTONIC,&ts1);
+    double elapsed = (ts1.tv_sec-ts0.tv_sec)+(ts1.tv_sec-ts0.tv_sec)*1e-9+(ts1.tv_nsec-ts0.tv_nsec)*1e-9;
+    printf("msync of 1 MiB took %.3f ms\n", elapsed*1000);
+    munmap(addr,st.st_size);
+    close(fd);
+    return 0;
+}
+```
+*Goal*: Compile (`gcc -O2 -Wall msync_latency.c -o msync_latency`) and run on a file on an SSD vs. HDD to see the impact of device latency.
+
+### Hard – Trace writeback with eBPF
+```bash
+# Install bpftrace if not present
+sudo apt-get install -y bpftrace
+# One‑liner to log latency of each writeback
+sudo bpftrace -e '
+tracepoint:writeback:writeback_dirty_page {
+    @ns[comm] = hist((args->latency_ns));
+}
+'
+# Dirty a file via mmap, then watch the histogram appear.
+```
+*Goal*: Observe the distribution of writeback latency (typically a few hundred µs on SSD, several ms on HDD) and correlate with workload dirty‑rate.
+
+## Linux Connection
+### Core Subsystems
+- **mm/page_cache.c** – Functions like `find_get_page`, `page_cache_alloc`, `add_to_page_cache_lru`.  
+- **mm/page-writeback.c** – The wb_workqueue, `wb_writeback`, `balance_dirty_pages_ratelimited`.  
+- **include/linux/mm.h** – Definitions of `struct address_space`, `struct address_space_operations` (`.writepage`).  
+- **fs/inode.c** – `sync_inode` which walks `i_mapping->private_list` to flush dirty pages.  
+
+### Tunable Parameters (via /proc/sys/vm/)
+| File | Meaning | Typical default |
+|------|---------|-----------------|
+| `dirty_ratio` | Percentage of total RAM that can be dirty before forced writeback | `20` |
+| `dirty_background_ratio` | Percentage triggering background writeback | `10` |
+| `dirty_expire_centisecs` | Age after which a dirty page is eligible for immediate writeback | `3000` (30 s) |
+| `dirty_writeback_centisecs` | Interval the wb_workqueue wakes to examine dirty state | `500` (5 s) |
+
+**Example adjustments**
+```bash
+# Increase aggressive writeback for a latency‑sensitive workload
+sysctl -w vm.dirty_ratio=5
+sysctl -w vm.dirty_background_ratio=2
+# Observe faster dirty‑page clearance:
+watch -n 0.5 "grep -E 'Dirty|Writeback' /proc/vmstat"
 ```
 
-### Read-Ahead
+### Toolchain for Observation
+- **`cat /proc/vmstat`** – fields `pgpgin`, `pgpgout`, `pgsteal`, `pgscan_kswapd`, `pgscan_direct`, `Dirty`, `Writeback`.  
+- **`vmstat 1`** – shows `si`/`so` (swap in/out) and `bi`/`bo` (block in/out) – useful to see when writeback spikes disk I/O.  
+- **`iostat -x 1`** – per‑device await, %util; high %util during writeback indicates I/O bound.  
+- **`perf record -e syscalls:sys_enter_sync,syscalls:sys_enter_fsync -g sleep 10`** – counts sync calls.  
+- **`tracepoint:writeback:writeback_dirty_page`** (via `bpftrace` or `trace-cmd`) – gives per‑page latency.
 
-For sequential access patterns, the kernel speculatively loads pages beyond the requested range. If requests arrive at pages $p$, $p+1$, $p+2$ in order, the kernel infers sequential access and submits a read for pages $[p, p+N]$ where $N$ is the current readahead window size. The window grows with each confirmed sequential hit and shrinks on random access.
-
-The effect: disk I/O for sequential reads runs ahead of the application in a pipeline, so the application finds its pages already warm when it gets to them. This converts random stalls into smooth streaming.
-
-```c
-// Advise the kernel about access patterns to tune readahead
-posix_fadvise(fd, 0, 0, POSIX_FADV_SEQUENTIAL);  // maximize readahead
-posix_fadvise(fd, 0, 0, POSIX_FADV_RANDOM);      // disable readahead
-posix_fadvise(fd, offset, len, POSIX_FADV_WILLNEED);  // prefetch now
-posix_fadvise(fd, offset, len, POSIX_FADV_DONTNEED);  // drop from cache
+### Demonstration: Forcing Immediate Writeback
+```bash
+# Make a 100 MiB file, map it, dirty it, then force sync via fdatasync
+dd if=/dev/zero of=sync_test bs=1M count=100
+fd=$(open sync_test O_RDWR)
+mmap_addr=$(mmap -p rw sync_test 0 $((100*1024*1024)))
+# Dirty every 4th page (to keep CPU work low)
+for ((i=0;i<$((100*1024*1024/4096));i+=4)); do
+    printf "\x00" | dd of=$mmap_addr bs=1 seek=$((i*4096)) count=1
+done
+# Measure time to flush via fdatasync
+time (fdatasync $fd) 2>&1 | grep real
 ```
+On an NVMe (~ 2 GiB/s) the 100 MiB flush should be ≈ 50 ms; on a SATA HDD (~ 150 MiB/s) ≈ 650 ms, illustrating the impact of the underlying device on writeback latency.
 
-### `fsync`, `fdatasync`, and What "On Disk" Means
+## Why This Matters
+Understanding the page cache and writeback is not academic; it directly shapes observable system behavior:
 
-```c
-int fd = open("wal.log", O_WRONLY | O_CREAT
+*Performance* – A warm page cache turns disk‑bound workloads into memory‑bound ones, cutting latency by orders of magnitude. Mis‑estimating cache effectiveness leads to over‑provisioned storage or under‑utilized CPU.
+
+*Consistency & Durability* – Applications that rely on implicit writeback risk data loss on power loss or kernel panic. Knowing when to issue `fsync`, `fdatasync`, or `msync(...,MS_SYNC)` is essential for databases, VM images, and log files.
+
+*Resource Pressure* – The dirty‑ratio thresholds dictate how much memory can be devoted to caching versus reclaim. Setting them too high stalls reclaim and can trigger OOM; setting too low causes incessant writeback, wasting I/O bandwidth and increasing tail latency.
+
+*Observability* – The kernel exposes a rich set of counters (`/proc/vmstat`, tracepoints) and tunables (`sysctl`). Mastery of these lets administrators diagnose stalls, tune for SSD vs. HDD, and validate that application‑level durability calls actually hit the storage layer.
+
+In short, the page cache is the linchpin that bridges the CPU’s nanosecond world with the millisecond world of persistent storage. By grasping its mechanics, limits, and knobs, you can design software that is both fast and reliable—exactly what high‑performance Linux systems demand.

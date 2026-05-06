@@ -10,157 +10,243 @@ resources:
     title: "Understanding the Linux Kernel (Bovet)"
 ---
 
-## Why This Matters
-
-When a process calls `read()` on `/dev/ttyS0`, the kernel executes the same `sys_read` entry point it uses for a regular file on ext4. The divergence happens exactly once: the VFS checks the inode's `i_fop` pointer and dispatches to whatever `file_operations` table the owning driver registered. This single indirection is why `/dev/ttyS0`, `/dev/urandom`, and `/proc/cpuinfo` all behave like files to userspace despite having nothing to do with storage.
-
-Without this layer, each new device class would require modifying the VFS itself. Instead, a driver author writes six or seven functions, registers a table of pointers, and the entire POSIX I/O interface — `open`, `read`, `write`, `lseek`, `ioctl`, `mmap`, `poll` — becomes available to userspace automatically, with the driver only implementing the operations it actually supports.
-
 ## Core Concepts
+A character device transfers data as a raw byte stream without any notion of blocks or fixed-size records. Unlike block devices, which expose an addressable array of sectors that the kernel can cache and reorder, character devices are accessed strictly sequentially; the hardware typically produces or consumes bytes one at a time (e.g., UART, keyboard scanner, USB audio). Because there is no block abstraction, the VFS does not implement caching, read‑ahead, or write‑behind for character devices, and the `llseek` operation is undefined (it returns `-ESPIPE`).  
 
-### Device Nodes
+Each character device is represented in the filesystem by a **device node** (a special file) whose inode stores a `dev_t` consisting of a major and minor number. The major number identifies the driver that handles the device; the minor number distinguishes individual instances of that driver (e.g., different serial ports). When a process opens `/dev/ttyS0`, the VFS looks up the inode, extracts the dev_t, finds the associated `struct cdev` registered by the driver, and binds the file’s `f_op` pointer to the driver’s `file_operations` table.  
 
-A device node is an inode whose type bits are `S_IFCHR` (character) or `S_IFBLK` (block), and whose `i_rdev` field holds a `dev_t` — a 32-bit value encoding a major and minor number. The node holds no data. When the VFS opens it, it calls `chrdev_open()` (for character devices), which looks up the major number in `cdev_map` (a `kobj_map` structure defined in `fs/char_dev.c`), finds the registered `cdev`, and installs the driver's `file_operations` pointer into the `struct file` being created.
+The driver supplies a set of methods in `struct file_operations`: `open`, `release`, `read`, `write`, `llseek`, `ioctl` (or `unlocked_ioctl`), and optionally `poll`. For character devices `llseek` is usually set to `noop_llseek_seek_end` or a function that returns `-ESPIPE`, signalling non‑seekability. The `ioctl` method provides a extensible, driver‑specific control path that avoids proliferating new system calls; its command encoding uses bit‑fields to convey direction, type, number, and size (see the math in *How It Works*).  
 
-Major and minor numbers are each 12 bits wide:
+## How It Works
+When a process invokes `open("/dev/ttyS0", O_RDWR)`, the VFS performs the following steps:  
 
-$$\text{dev\_t} = (\text{major} \ll 20) \mid \text{minor}$$
+1. **Inode lookup** – the dentry for `/dev/ttyS0` yields an `struct inode` whose `i_rdev` encodes the device number (`MKDEV(major,minor)`).  
+2. **Driver binding** – the VFS calls `cdev_get` on the `struct cdev` attached to that inode (found via `inode->i_cdev`). This increments the driver’s module reference count (`try_module_get`).  
+3. **File allocation** – a new `struct file` is allocated, its `f_op` set to `cdev->ops`, and `f_mode`/`f_flags` initialized from the open flags.  
+4. **Open method** – if the driver defined `open`, it is called now; it may allocate per‑open data structures, enable hardware, or check permissions.  
 
-which is why `MAJOR(dev)` is `(dev >> 20)` and `MINOR(dev)` masks the low 20 bits. The historical 8-bit limit (255 majors, 255 minors) was lifted in kernel 2.6 by widening `dev_t` from 16 to 32 bits.
+Subsequent `read` or `write` syscalls are dispatched straight to the driver’s methods via `file->f_op->read`/`write`. The driver typically:  
 
-You can inspect the live major/minor assignments:
+- Allocates kernel memory with `kmalloc(size, GFP_KERNEL)` (or uses a pre‑allocated buffer).  
+- Copies data from/to user space using `copy_to_user`/`copy_from_user`. These functions return the number of bytes **not** copied; a non‑zero result means the user buffer was faulted or inaccessible, and the driver must return `-EFAULT`.  
+- Performs any hardware interaction (e.g., reading a UART data register, writing to a USB endpoint).  
 
-```bash
-cat /proc/devices          # shows registered char and block majors
-ls -l /dev/ttyS0           # crw-rw---- 1 root dialout 4, 64 ...
-                           #                            ^  ^
-                           #                          major minor
-stat --format="%t %T" /dev/ttyS0   # hex major, hex minor
+Because user and kernel address spaces are separate, direct pointer dereference would cause a page fault; the copy functions safely handle atomic page faults and enforce access checks.  
+
+The `ioctl` path works similarly: the driver’s `ioctl` (or `unlocked_ioctl`) receives an encoded command `unsigned long cmd` and argument `unsigned long arg`. The encoding is defined by the `_IOC` macros:  
+
+```
+#define _IOC_NRBITS   8
+#define _IOC_TYPEBITS 8
+#define _IOC_SIZEBITS 14
+#define _IOC_DIRBITS  2
+
+#define _IOC_NRSHIFT   0
+#define _IOC_TYPEBSHIFT (_IOC_NRSHIFT+_IOC_NRBITS)
+#define _IOC_SIZESSHIFT (_IOC_TYPEBSHIFT+_IOC_TYPEBITS)
+#define _IOC_DIRSSHIFT  (_IOC_SIZESSHIFT+_IOC_SIZEBITS)
+
+#define _IOC(dir,type,nr,size) \
+    (((dir)  << _IOC_DIRSSHIFT) | \
+     ((type) << _IOC_TYPEBSHIFT) | \
+     ((nr)   << _IOC_NRSHIFT)   | \
+     ((size) << _IOC_SIZESSHIFT))
 ```
 
-The device node itself is created either by `udev` (responding to `uevent` netlink messages from the kernel) or manually with `mknod`. The node is just a name; deleting it does not unregister the driver.
+Direction bits are `_IOC_NONE=0`, `_IOC_WRITE=1`, `_IOC_READ=2`. For example, `TIOCSERIAL` (used to configure a serial port) is defined as  
 
-### The `file_operations` Struct
+```
+#define TIOCSERIAL   _IOW('T', 0, struct serial_struct)
+```
 
-`struct file_operations` (defined in `<linux/fs.h>`) is the contract between a driver and the VFS. Every field is a function pointer; unimplemented operations are left `NULL`. The VFS checks for `NULL` before calling: a `NULL` `llseek` causes the VFS to return `-ESPIPE` for pipes or use `default_llseek` for regular files, depending on context — but for character devices you almost always want to set `.llseek = no_llseek` explicitly to prevent userspace from accidentally advancing an offset that means nothing to your hardware.
+which expands to a value where the direction bit indicates write (`_IOC_WRITE`), the type is `'T'`, the number is `0`, and the size is `sizeof(struct serial_struct)`. The driver decodes the command with `_IOC_TYPE(cmd)`, `_IOC_NR(cmd)`, `_IOC_DIR(cmd)`, and `_IOC_SIZE(cmd)` to determine how to interpret `arg`.  
 
-The fields most relevant to character drivers:
+**Timing example** – UART transmission at baud rate `B` bits per second with 8N1 framing (1 start, 8 data, 1 stop) takes  
+
+$$
+t_{\text{byte}} = \frac{1+8+1}{B} = \frac{10}{B}\;\text{seconds}.
+$$  
+
+At `B = 115200` baud, `t_byte ≈ 86.8 µs`. This calculation explains why a driver may need to busy‑wait or use a timer when transmitting at high rates.  
+
+**Lifecycle** – on `close`, the VFS calls the driver’s `release` method, which frees per‑open data and calls `module_put` to decrement the module’s reference count. If the count reaches zero, the module can be unloaded.  
+
+## Worked Examples
+### Example 1: Reading a key press from the evdev interface
+Modern keyboards appear as `/dev/input/event*` (evdev). Each `read` returns a `struct input_event`:
 
 ```c
-struct file_operations {
-    struct module *owner;
-    loff_t  (*llseek)  (struct file *, loff_t, int);
-    ssize_t (*read)    (struct file *, char __user *, size_t, loff_t *);
-    ssize_t (*write)   (struct file *, const char __user *, size_t, loff_t *);
-    long    (*unlocked_ioctl)(struct file *, unsigned int, unsigned long);
-    long    (*compat_ioctl)  (struct file *, unsigned int, unsigned long);
-    int     (*mmap)    (struct file *, struct vm_area_struct *);
-    int     (*open)    (struct inode *, struct file *);
-    int     (*release) (struct inode *, struct file *);
-    __poll_t (*poll)   (struct file *, struct poll_table_struct *);
-    /* ... */
+struct input_event {
+    struct timeval time;
+    __u16 type;
+    __u16 code;
+    __s32 value;
 };
 ```
 
-`.owner = THIS_MODULE` is not optional in practice: it holds a reference to your module so the kernel refuses to `rmmod` it while an open file description exists, preventing a use-after-free on the function pointers themselves.
+**Step‑by‑step** (numbers are illustrative):
 
-`compat_ioctl` exists because on a 64-bit kernel running a 32-bit process, pointer sizes differ. If your ioctl passes structs containing pointers, you need `compat_ioctl` to fix up the layout. Omitting it silently breaks 32-bit userspace on 64-bit systems — a common source of hard-to-diagnose failures.
+1. Open the device:  
+   ```c
+   int fd = open("/dev/input/event0", O_RDONLY | O_NONBLOCK);
+   if (fd < 0) { perror("open"); exit(EXIT_FAILURE); }
+   ```
+2. Allocate a buffer on the stack (size known at compile time):  
+   ```c
+   struct input_event ev;
+   ```
+3. Attempt to read one event (size = `sizeof(ev)` = 16 bytes on 64‑bit kernels):  
+   ```c
+   ssize_t r = read(fd, &ev, sizeof(ev));
+   if (r != sizeof(ev)) {
+       if (r == -EAGAIN) /* no data ready */;
+       else { perror("read"); close(fd); exit(EXIT_FAILURE); }
+   }
+   ```
+4. Interpret fields (assume little‑endian):  
+   - `ev.type == EV_KEY (0x01)` indicates a key event.  
+   - `ev.code == KEY_A (0x1e)` is the scan code for the ‘A’ key.  
+   - `ev.value == 1` means key‑press; `0` means release.  
+   - `ev.time` holds a timestamp with microsecond resolution.  
 
-### ioctl: Out-of-Band Control
+A full program would loop, printing timestamps and key symbols until `Ctrl+C`. Note the use of `O_NONBLOCK` to avoid blocking indefinitely; in a real application you would use `poll` or `select` to wait for readability.  
 
-`read()` and `write()` are byte streams. They cannot express "set baud rate to 115200" or "query hardware serial number" without inventing an in-band encoding that userspace and kernel must agree on — fragile and unversioned. `ioctl()` provides a typed, numbered command space instead.
+### Example 2: Sending raw PCL to a USB printer
+Many USB printers appear as `/dev/usb/lp0`. The driver accepts arbitrary bytes; common printer languages (PCL, ESC/P) are transmitted as raw streams.  
 
-The 32-bit request code is structured as:
-
-$$\underbrace{[31:30]}_{\text{dir (2)}} \underbrace{[29:16]}_{\text{size (14)}} \underbrace{[15:8]}_{\text{type (8)}} \underbrace{[7:0]}_{\text{nr (8)}}$$
-
-The **size** field (14 bits, max $2^{14}-1 = 16383$ bytes) lets the kernel call `access_ok()` on the user pointer *before* dispatching to the driver. This is the concrete reason ioctl exists as a distinct syscall rather than a `write()` convention: the kernel can validate the pointer using only the request code, without trusting anything the driver says.
-
-The **type** byte (called a "magic number" in documentation) namespaces commands. Assignments are listed in `Documentation/userspace-api/ioctl/ioctl-number.rst` to prevent collisions between drivers.
-
-Building request codes:
-
-```c
-#define MYDEV_MAGIC 'k'                             /* chosen from ioctl-number.rst */
-
-#define MYDEV_RESET   _IO  (MYDEV_MAGIC, 0)         /* no argument */
-#define MYDEV_GETVAL  _IOR (MYDEV_MAGIC, 1, int)    /* kernel → user: int */
-#define MYDEV_SETVAL  _IOW (MYDEV_MAGIC, 2, int)    /* user → kernel: int */
-#define MYDEV_SWAP    _IOWR(MYDEV_MAGIC, 3, int)    /* bidirectional */
-```
-
-At compile time, `_IOR(MYDEV_MAGIC, 1, int)` expands to:
-
-$$((\_IOC\_READ) \ll 30) \mid (\texttt{sizeof(int)} \ll 16) \mid ({\texttt{'k'}}) \ll 8) \mid 1$$
-
-which for a 64-bit kernel where `sizeof(int) = 4` gives `0x80046b01`. You can verify:
+Reset the printer to a known state (PCL reset command `\033E`), then print a line:  
 
 ```bash
-python3 -c "
-import ctypes, fcntl
-IOC_READ = 2
-val = (IOC_READ << 30) | (4 << 16) | (ord('k') << 8) | 1
-print(hex(val))   # 0x80046b01
-"
+# Reset printer
+printf '\033E' > /dev/usb/lp0
+# Print "Hello World" followed by a carriage return and line feed
+printf 'Hello World\r\n' > /dev/usb/lp0
 ```
 
-## How It Works
+Explanation:  
+- `printf '\033E'` writes the two bytes `0x1B` (`ESC`) and `0x45` (`E`).  
+- The printer interprets `ESC E` as “reset to factory defaults”.  
+- The subsequent string ends with `\r\n` (CR = 0x0D, LF = 0x0A) which tells the printer to advance to the next line.  
 
-### Registration
+If the printer expects ESC/P instead of PCL, replace the reset with `\033@` (ESC @). The driver does not perform any translation; it simply queues the bytes for the USB endpoint.  
 
-A driver claims a range of character devices through one of two paths:
+### Example 3: Setting a custom baud rate on a serial port (16550 UART)
+The legacy way to change baud rate uses the `serial_struct` ioctls; the modern way uses `termios`. Both are shown for completeness.  
+
+**Using termios (preferred):**  
 
 ```c
-/* Static: you already know you want major 240 */
-int register_chrdev_region(dev_t first, unsigned int count, const char *name);
+#include <termios.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <sys/ioctl.h>
 
-/* Dynamic: let the kernel pick an unused major */
-int alloc_chrdev_region(dev_t *dev, unsigned baseminor,
-                        unsigned count, const char *name);
+int main(void) {
+    int fd = open("/dev/ttyS0", O_RDWR | O_NOCTTY);
+    if (fd < 0) { perror("open"); return 1; }
+
+    struct termios t;
+    if (tcgetattr(fd, &t) == -1) { perror("tcgetattr"); close(fd); return 1; }
+
+    cfsetospeed(&t, B9600);   // output speed
+    cfsetispeed(&t, B9600);   // input speed
+    // 8N1, no parity, 1 stop bit, no flow control
+    t.c_cflag &= ~(PARENB | CSTOPB | CSIZE);
+    t.c_cflag |= CS8;
+    t.c_iflag &= ~(IXON | IXOFF | IXANY); // disable software flow control
+    t.c_lflag &= ~(ICANON | ECHO | ECHOE | ISIG); // raw input
+    t.c_oflag &= ~OPOST; // raw output
+
+    if (tcsetattr(fd, TCSANOW, &t) == -1) { perror("tcsetattr"); close(fd); return 1; }
+
+    close(fd);
+    return 0;
+}
 ```
 
-Always prefer `alloc_chrdev_region`. Static major numbers require coordination across the entire kernel tree (see `Documentation/admin-guide/devices.txt`); dynamic allocation avoids collisions and works correctly in any deployment.
+**Explanation of the math:** The UART’s baud rate generator derives the transmitter clock from the system clock (`clk`) via a divisor `D`:  
 
-After allocation, the driver initializes a `cdev` and makes it live:
+$$
+\text{baud} = \frac{\text{clk}}{16 \times D}
+$$  
+
+For a standard 115200 baud base clock (`clk = 115200 × 16 = 1843200` Hz), setting `B9600` selects a divisor  
+
+$$
+D = \frac{\text{clk}}{16 \times 9600} = \frac{1843200}{153600} = 12.
+$$  
+
+The kernel programs the UART’s divisor latch registers with `D`.  
+
+**Using the legacy `serial_struct` ioctl (illustrative):**  
 
 ```c
-static struct cdev my_cdev;
-static dev_t       my_devno;   /* filled by alloc_chrdev_region */
+#include <linux/serial.h>
+#include <sys/ioctl.h>
+#include <fcntl.h>
+#include <unistd.h>
 
-/* In module_init: */
-alloc_chrdev_region(&my_devno, 0, 1, "mydev");
-cdev_init(&my_cdev, &my_fops);
-my_cdev.owner = THIS_MODULE;
-cdev_add(&my_cdev, my_devno, 1);   /* device is live after this line */
+int main(void) {
+    int fd = open("/dev/ttyS0", O_RDWR);
+    if (fd < 0) { perror("open"); return 1; }
 
-/* In module_exit: */
-cdev_del(&my_cdev);
-unregister_chrdev_region(my_devno, 1);
+    struct serial_struct ser;
+    if (ioctl(fd, TIOCGSERIAL, &ser) == -1) { perror("TIOCGSERIAL"); close(fd); return 1; }
+
+    // Want 230400 baud on a device whose base is 115200
+    ser.baud_base = 115200;
+    ser.custom_divisor = ser.baud_base / (230400 * 16); // = 3
+    ser.flags &= ~ASYNC_SPD_MASK;
+    ser.flags |= ASYNC_SPD_CUST;
+
+    if (ioctl(fd, TIOCSSERIAL, &ser) == -1) { perror("TIOCSSERIAL"); close(fd); return 1; }
+
+    close(fd);
+    return 0;
+}
 ```
 
-The ordering matters: `cdev_add` makes the device immediately openable. Any class/device creation for udev (`class_create`, `device_create`) must happen *before* `cdev_add` if you want udev to have created the `/dev` node before userspace can race to open it — though in practice the race window is tiny and most drivers don't bother.
+Here the divisor is calculated from the desired baud:  
 
-### The `file_operations` Table in Practice
+$$
+\text{custom\_divisor} = \frac{\text{baud\_base}}{\text{desired\_baud} \times 16}.
+$$  
 
-```c
-#include <linux/fs.h>
-#include <linux/uaccess.h>
+For 230400 baud on a 115200 base clock, `custom_divisor = 115200 / (230400 × 16) = 0.03125` → the hardware uses a fractional divisor; the kernel instead enables the `ASYNC_SPD_CUST` flag and lets the UART’s divisor latch hold the integer part (`3`) while the UART’s internal scaling yields the correct rate. This demonstrates why the ioctl path is needed for non‑standard rates.  
 
-#define BUF_SIZE 4096
-static char kernel_buf[BUF_SIZE];
+## Common Mistakes
+| # | Mistake | Why it’s Wrong | Consequence |
+|---|---------|----------------|-------------|
+| 1 | **Assuming `lseek` works on character devices** (e.g., `lseek(fd, 0, SEEK_SET)`). | Character devices have no block layout; the VFS defines `llseek` to return `-ESPIPE` for non‑seekable devices. Using `lseek` ignores this contract and may succeed only if the driver erroneously implements a seekable `llseek`. | Non‑portable code; on hardware that truly lacks seek capability you’ll get `ESPIPE` and break the application. |
+| 2 | **Neglecting to check the return value of `copy_to_user` / `copy_from_user`**. | These functions return the number of bytes **not** copied; a non‑zero result means the user buffer was not accessible (e.g., not mapped, or a fault occurred). Ignoring it writes to an invalid address or silently drops data. | Kernel oops (`BAD_ADDR`) or security vulnerability (information leak) if the driver continues as if the copy succeeded. |
+| 3 | **Performing a blocking `read` inside interrupt context or while holding a spinlock**. | Blocking operations may sleep; sleeping while holding a spinlock leads to deadlock because the scheduler cannot run other tasks to release the lock. | System lock‑up; watchdog timeout; hard‑to‑debug crashes. |
+| 4 | **Failing to call `cdev_add` after `cdev_init`**. | `cdev_init` only fills the `file_operations` pointer and links the `cdev` to the kernel object; `cdev_add` registers the device with the kobject hierarchy, creates the sysfs entry, and makes the devt visible to udev. Without it, the device node exists but no driver backs it. | Reads/writes return `-ENODEV`; the device appears “missing” even though the node is present. |
+| 5 | **Misusing ioctl direction macros** (e.g., using `_IOW` for a read‑only command). | The direction bit determines whether the kernel attempts to copy data from or to user space. Using the wrong direction causes the kernel to ignore the user buffer or to copy garbage, leading to silent failures. | The driver never sees the intended argument; userspace thinks the ioctl succeeded but the device state is unchanged. |
 
-static ssize_t my_read(struct file *file, char __user *buf,
-                       size_t count, loff_t *offset)
-{
-    size_t available = BUF_SIZE - *offset;
+## Exercises
+### Easy – User‑space evdev reader
+Write a program that:  
+1. Opens `/dev/input/event0` (or the first event node found via `ls /dev/input/event*`).  
+2. Sets the file descriptor to non‑blocking mode.  
+3. Reads a single `struct input_event`.  
+4. If `type == EV_KEY` and `value == 1`, prints the timestamp (`time.tv_sec.time.tv_usec`) and the symbolic key name (you may map `code` to a string using a static table or `libevdev`).  
+5. Exits after printing one key press.  
 
-    if (*offset >= BUF_SIZE)
-        return 0;                      /* EOF */
+*Goal:* Practice open/read, structure layout, and error handling.  
 
-    count = min(count, available);     /* clamp to what remains */
+### Medium – Minimal character device module
+Create a kernel module `simplechar.c` that:  
+1. Allocates a dynamic major number with `alloc_chrdev_region`.  
+2. Initializes a `struct cdev` with `cdev_init` and sets its `ops` to a structure providing:  
+   - `open`: increments a per‑device open counter (use `atomic_t`).  
+   - `release`: decrements the counter.  
+   - `read`: returns the string `"Hello, chardev!\n"` (up to `count` bytes) using `simple_read_from_buffer`.  
+   - `write`: discards data but returns `count` (pretend write succeeded).  
+3. Registers the device with `cdev_add`.  
+4. Creates a class and device via `device_create` so that udev automatically creates `/dev/simplechar`.  
+5. Provides a clean `module_exit` that destroys the device, deletes the cdev, and unregisters the region.  
 
-    if (copy_to_user(buf, kernel_buf + *offset, count))
-        return -EFAULT;
-
-    *offset += count;
-    return count;
+Test with:  
+```bash
+sudo insmod simplechar.ko
+cat /

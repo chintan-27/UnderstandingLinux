@@ -10,113 +10,131 @@ resources:
     title: "Microelectronic Circuits (Sedra and Smith)"
 ---
 
-## Why This Matters
-
-Every analog measurement system has a noise floor below which signals are unrecoverable — not because of poor design, but because thermodynamics and quantum mechanics forbid otherwise. If you do not understand where that floor comes from, you will build amplifier chains that faithfully amplify garbage, pick ADC resolutions that exceed what the analog front-end can actually resolve, and misread oscilloscope noise as signal artifacts. Linux interacts with this physics directly: the `hwrng` subsystem harvests shot noise and avalanche noise for entropy; ALSA and ASoC drivers expose analog front-end noise floors; IIO ADC drivers report effective resolution that thermal noise often limits before quantization does; and clock PLLs accumulate jitter that phase noise theory predicts exactly.
-
----
-
 ## Core Concepts
+Noise is an unwanted, stochastic perturbation that adds to a desired signal and limits the detectability of weak signals. Its origins lie in fundamental physical processes: thermal agitation of charge carriers, the discrete nature of electric charge, and trapping/detrapping phenomena in solids. Because these processes are random, noise is described statistically by its **power spectral density (PSD)** \(S_{xx}(f)\) (units V²/Hz for voltage, A²/Hz for current). The **noise density** is the square‑root of the one‑sided PSD:
+$$e_n = \sqrt{S_{vv}(f)}\quad\left[\frac{\text{V}}{\sqrt{\text{Hz}}}\right],\qquad
+i_n = \sqrt{S_{ii}(f)}\quad\left[\frac{\text{A}}{\sqrt{\text{Hz}}}\right].$$
+For a **white** noise source the PSD is constant over frequency, so the noise density does not depend on \(f\).
 
-### Thermal (Johnson) Noise
+The **signal‑to‑noise ratio (SNR)** compares signal power to noise power. With a sinusoidal signal of RMS voltage \(V_s\) across a resistance \(R\),
+$$P_{\text{sig}} = \frac{V_s^{2}}{R},\qquad
+P_{\text{noise}} = \frac{V_{n,\text{rms}}^{2}}{R} = \frac{e_n^{2}B}{R},$$
+where \(B\) is the measurement bandwidth. Hence
+$$\text{SNR} = \frac{V_s^{2}}{e_n^{2}B},\qquad
+\text{SNR}_{\rm dB}=10\log_{10}\!\left(\frac{V_s^{2}}{e_n^{2}B}\right)=20\log_{10}\!\left(\frac{V_s}{e_n\sqrt{B}}\right).$$
+The SNR determines the maximum usable information rate via the Shannon–Hartley theorem \(C = B\log_{2}(1+\text{SNR})\).
 
-Any resistor at temperature $T$ contains electrons in thermal equilibrium with the lattice. Their random kinetic energy produces a fluctuating open-circuit voltage — **Johnson noise** — that is independent of the resistor's material, geometry, or fabrication. It depends only on $R$ and $T$.
+### Types of Noise
+| Type | Physical Origin | PSD (one‑sided) | Typical Dependence |
+|------|----------------|----------------|-------------------|
+| **Thermal (Johnson‑Nyquist)** | Thermally driven motion of charge carriers in any conductor | \(S_{vv}=4kTR\) | White, proportional to \(T\) and \(R\) |
+| **Shot** | Discrete arrival of electrons (or holes) at a potential barrier | \(S_{ii}=2qI\) | White, proportional to average current \(I\) |
+| **Flicker (1/f)** | Carrier number/mobility fluctuations due to trapping‑detrapping | \(S_{vv}=K/f\) | Increases at low \(f\); material‑dependent constant \(K\) |
+| **Burst (popcorn)** | Random switching of discrete traps | Lorentzian bursts | Appears as random telegraph steps |
+| **Quantization** | Finite resolution of an ADC/DAC | Uniform over \([-q/2,q/2]\) | White with PSD \(q^{2}/12f_s\) (where \(q\) is LSB, \(f_s\) sample rate) |
+| **Phase noise / Jitter** | Random fluctuations of oscillator phase | \(L(f)\) (dBc/Hz) | Leads to timing variance \(\sigma_t^{2}=\int\frac{L(f)}{(2\pi f)^{2}}df\) |
 
-The noise voltage spectral density (RMS voltage per root-hertz) is:
+Each type can be derived from first principles, as shown next.
 
-$$e_n = \sqrt{4 k_B T R}$$
-
-where $k_B = 1.38 \times 10^{-23}\ \text{J/K}$ and $T$ is in Kelvin. Units: $\text{V}/\sqrt{\text{Hz}}$.
-
-**Why $\sqrt{R}$?** The fluctuation-dissipation theorem says a resistor in thermal equilibrium delivers noise *power* $k_B T$ per Hz into a matched load, independent of $R$. Power into a load $R_L = R$ is $V^2/(4R)$, so $V^2 \propto R$, giving $V \propto \sqrt{R}$.
-
-Two reference points worth memorizing (290 K):
-
-| Resistance | $e_n$ |
-|---|---|
-| $100\ \Omega$ | $1.28\ \text{nV}/\sqrt{\text{Hz}}$ |
-| $1\ \text{k}\Omega$ | $4.05\ \text{nV}/\sqrt{\text{Hz}}$ |
-
-Scale from either anchor: $e_n(R) = e_n(R_0)\cdot\sqrt{R/R_0}$.
-
-Total RMS noise over bandwidth $B$:
-
-$$V_{n,\text{rms}} = \sqrt{4 k_B T R B}$$
-
-Bandwidth $B$ here is the *noise bandwidth* of the filter, not its $-3\ \text{dB}$ point. For a single-pole RC lowpass, the noise bandwidth is $\pi/2$ times the $-3\ \text{dB}$ frequency:
-
-$$B_n = \frac{\pi}{2} f_{-3\text{dB}} = \frac{1}{4RC}$$
-
-This is why a $10\ \text{k}\Omega$ source resistor with a 10 kHz bandwidth produces:
-
-$$V_{n,\text{rms}} = \sqrt{4 \times 1.38\times10^{-23} \times 290 \times 10^4 \times 10^4} \approx 1.3\ \mu\text{V}$$
-
-That is 1.3 μV of irreducible noise on any signal measured through that source — a hard limit on the minimum detectable signal.
-
-The short-circuit noise *current* density is:
-
-$$i_n = \frac{e_n}{R} = \sqrt{\frac{4 k_B T}{R}}$$
-
-Larger $R$ → more voltage noise, less current noise. This trade-off becomes critical when choosing between transimpedance and voltage amplifier topologies for high-impedance sources like photodiodes.
-
----
+## How It Works
+### Thermal Noise (Johnson‑Nyquist)
+The fluctuation‑dissipation theorem links the dissipative element (resistor \(R\)) to its fluctuating voltage. Equipartition assigns an average energy \(\frac12kT\) to each quadratic degree of freedom. A resistor supports two orthogonal voltage quadratures (real and imaginary parts of the analytic signal), giving a mean‑square voltage
+$$\langle v^{2}\rangle = 4kTR\,\Delta f,$$
+where \(\Delta f\) is the bandwidth considered. Dividing by \(\Delta f\) yields the one‑sided PSD
+$$S_{vv}=4kTR\quad\Longrightarrow\quad
+e_n=\sqrt{4kTR}\;\;[\text{V}/\sqrt{\text{Hz}}].$$
+The RMS noise voltage over a bandwidth \(B\) is therefore
+$$V_{n,\rm rms}=e_n\sqrt{B}=\sqrt{4kTRB}.$$
 
 ### Shot Noise
+Consider a Poisson process of charge carriers crossing a barrier with average rate \(\lambda = I/q\). In a time interval \(\Delta t\) the number of carriers \(n\) has mean \(\langle n\rangle=\lambda\Delta t\) and variance \({\rm Var}(n)=\langle n\rangle\). The instantaneous current is \(I(t)=qn/\Delta t\); its variance is
+$${\rm Var}[I(t)]=\frac{q^{2}}{\Delta t^{2}}\,{\rm Var}(n)=\frac{q^{2}\lambda}{\Delta t}=2qI\,\frac{1}{2\Delta t}.$$
+Identifying the single‑sided PSD as the limit \({\rm Var}[I(t)]/(2\Delta t)\) gives
+$$S_{ii}=2qI\quad\Longrightarrow\quad
+i_n=\sqrt{2qI}\;\;[\text{A}/\sqrt{\text{Hz}}].$$
+Over a bandwidth \(B\) the RMS noise current is \(I_{n,\rm rms}=i_n\sqrt{B}\).
 
-When discrete charges cross a potential barrier — a diode junction, a BJT's base-collector depletion region, a tunnel junction — each crossing is a statistically independent Poisson event. The discreteness of charge produces current fluctuations called **shot noise**:
+### Flicker (1/f) Noise
+Empirically observed in many conductors and semiconductors, the PSD follows
+$$S_{vv}(f)=\frac{K}{f},$$
+where \(K\) scales with trap density and carrier mobility fluctuations. The mechanism involves carriers being captured and released from defect states, modulating their drift velocity. Because the PSD diverges as \(f\to0\), the total low‑frequency noise grows logarithmically with the measurement interval:
+$$\langle v^{2}\rangle_{[f_1,f_2]}=K\ln\!\left(\frac{f_2}{f_1}\right).$$
 
-$$i_n = \sqrt{2 q I_{DC}}$$
+### Noise Addition
+For uncorrelated sources, PSDs add:
+$$S_{vv,{\rm tot}}(f)=\sum_i S_{vv,i}(f).$$
+When expressed as densities, the total voltage density is
+$$e_{n,{\rm tot}}=\sqrt{\sum_i e_{n,i}^{2}}.$$
+If the sources are correlated (e.g., through a common impedance), cross‑terms must be retained.
 
-where $q = 1.6 \times 10^{-19}\ \text{C}$ and $I_{DC}$ is the mean current.
+### Noise Figure and Friis Formula
+The **noise factor** \(F\) of a device is the ratio of input SNR to output SNR:
+$$F=\frac{\text{SNR}_{\rm in}}{\text{SNR}_{\rm out}}.\qquad
+\text{NF}=10\log_{10}F\;[\text{dB}].$$
+For a cascade of stages with power gains \(G_i\) and noise factors \(F_i\),
+$$F_{\rm total}=F_1+\frac{F_2-1}{G_1}+\frac{F_3-1}{G_1G_2}+\cdots.$$
+Thus a low‑noise, high‑gain first stage dominates the overall noise performance.
 
-**Why not in resistors?** In a metallic conductor, charge carriers are not independent — Coulomb correlations between the dense electron gas suppress fluctuations orders of magnitude below the Poisson (shot noise) prediction. Shot noise requires both a potential barrier *and* statistically independent crossings. A reverse-biased diode, BJT collector junction, or vacuum tube satisfies this; a copper trace does not.
+### Jitter from Phase Noise
+An oscillator’s single‑sideband phase‑noise density \(L(f)\) (dBc/Hz) relates to timing jitter by
+$$\sigma_t^{2}= \int_{f_1}^{f_2}\frac{10^{L(f)/10}}{(2\pi f)^{2}}\,df.$$
+A flat phase‑noise floor (white frequency noise) yields \(\sigma_t\propto\sqrt{B}\); a \(1/f\) phase‑noise region gives a logarithmic dependence.
 
-For a BJT with $I_C = 100\ \mu\text{A}$:
+## Worked Examples
+### Example 1 – Thermal Noise Density and Voltage
+**Problem:** Find the noise density and RMS noise voltage of a \(10\;{\rm k\Omega}\) resistor at \(T=50^{\circ}{\rm C}\) over a \(10\;{\rm kHz}\) bandwidth.
 
-$$i_n = \sqrt{2 \times 1.6\times10^{-19} \times 10^{-4}} \approx 5.7\ \text{pA}/\sqrt{\text{Hz}}$$
+**Solution:**
+1. Convert temperature: \(T = 50 + 273.15 = 323.15\;{\rm K}\).
+2. Boltzmann constant: \(k = 1.380649\times10^{-23}\;{\rm J/K}\).
+3. Compute the product:
+   \[
+   4kTR = 4\,(1.380649\times10^{-23})\,(323.15)\,(10^{4})
+          = 1.784\times10^{-16}\;{\rm V^{2}/Hz}.
+   \]
+4. Noise density:
+   \[
+   e_n = \sqrt{1.784\times10^{-16}} = 1.336\times10^{-8}\;{\rm V/\sqrt{Hz}}
+        \approx 13.4\;{\rm nV/\sqrt{Hz}}.
+   \]
+5. RMS voltage over \(B=10\;{\rm kHz}\):
+   \[
+   V_{n,\rm rms}=e_n\sqrt{B}=13.4\times10^{-9}\times\sqrt{10^{4}}
+                =13.4\times10^{-9}\times100
+                =1.34\;\mu{\rm V\;rms}.
+   \]
 
-The BJT's intrinsic transconductance gives $r_e = k_BT/(qI_C) = 26\ \text{mV}/I_C$, so the input-referred shot noise voltage is:
+### Example 2 – Shot Noise from a Photodiode
+**Problem:** A silicon photodiode has a dark current \(I=10\;\mu{\rm A}\). Compute the shot‑noise current density, the RMS noise current in a \(1\;{\rm MHz}\) bandwidth, and the corresponding RMS noise voltage across a \(50\;\Omega\) load.
 
-$$e_{n,\text{shot}} = r_e \cdot i_n = \frac{k_BT}{qI_C}\sqrt{2qI_C} = \sqrt{\frac{2(k_BT)^2}{qI_C}} = \sqrt{\frac{2k_BT}{q} \cdot \frac{k_BT}{I_C}}$$
+**Solution:**
+1. Shot‑noise density:
+   \[
+   i_n = \sqrt{2qI}= \sqrt{2\,(1.602\times10^{-19})\,(10\times10^{-6})}
+        = \sqrt{3.204\times10^{-24}}
+        = 5.66\times10^{-12}\;{\rm A/\sqrt{Hz}}
+        = 5.66\;{\rm pA/\sqrt{Hz}}.
+   \]
+2. RMS current in \(B=1\;{\rm MHz}\):
+   \[
+   I_{n,\rm rms}=i_n\sqrt{B}=5.66\times10^{-12}\times\sqrt{10^{6}}
+                =5.66\times10^{-12}\times10^{3}
+                =5.66\;{\rm nA\;rms}.
+   \]
+3. RMS voltage across \(50\;\Omega\):
+   \[
+   V_{n,\rm rms}=I_{n,\rm rms}R = 5.66\times10^{-9}\times50
+                =2.83\times10^{-7}\;{\rm V}
+                =0.283\;\mu{\rm V\;rms}.
+   \]
 
-At 290 K, $k_BT/q \approx 25\ \text{mV}$:
+### Example 3 – SNR and Noise Figure of a Two‑Stage Amplifier
+**Problem:** Stage 1: power gain \(G_1=15\;{\rm dB}\), noise figure \(NF_1=2\;{\rm dB}\). Stage 2: gain \(G_2=10\;{\rm dB}\), NF\(_2=6\;{\rm dB}\). Input signal power \(P_{\rm in}=-30\;{\rm dBm}\). System bandwidth \(B=1\;{\rm MHz}\). Source resistance \(R_s=50\;\Omega\) at \(T=300\;{\rm K}\). Find the overall noise figure and the output SNR.
 
-$$e_{n,\text{shot}} \approx \sqrt{\frac{2 \times 25\ \text{mV} \times 25\ \text{mV}}{I_C}} = \frac{35.4\ \text{mV}/\sqrt{\text{Hz}}}{\sqrt{I_C[\text{A}]}}$$
-
-At $I_C = 1\ \text{mA}$: $e_{n,\text{shot}} \approx 1.12\ \text{nV}/\sqrt{\text{Hz}}$.
-
-The practical consequence: increasing $I_C$ lowers voltage noise because $r_e$ decreases as $1/I_C$ while shot current grows only as $\sqrt{I_C}$, so the product falls as $1/\sqrt{I_C}$. There is a cost — higher current noise $i_n$ — so the optimum bias current depends on the source impedance driving the transistor.
-
----
-
-### 1/f Noise (Flicker Noise)
-
-Johnson and shot noise are *white* — constant power spectral density across frequency. All real semiconductor devices add **flicker noise** with power spectral density that rises as $1/f$:
-
-$$S_v(f) \propto \frac{1}{f} \implies e_n(f) \propto \frac{1}{\sqrt{f}}$$
-
-The microscopic origin is carrier trapping and release at defect sites in semiconductor interfaces (primarily the Si/SiO₂ interface in MOSFETs). Carriers are randomly captured into trap states and released after a distribution of dwell times; the superposition of many such random telegraph signals with exponentially distributed time constants produces exactly $1/f$ spectral shape.
-
-The **corner frequency** $f_c$ is where flicker noise power equals white noise power. Above $f_c$, white noise dominates; below it, flicker dominates. MOSFETs have $f_c$ ranging from a few Hz (p-channel, buried-channel) to tens of MHz (n-channel MOSFET in processes with high interface state density). BJTs typically have $f_c$ below 1 kHz. This is why BJTs are preferred in low-noise audio and precision DC amplifiers despite inferior high-frequency performance.
-
----
-
-### Signal-to-Noise Ratio
-
-$$\text{SNR} = \frac{P_{\text{signal}}}{P_{\text{noise}}}$$
-
-In decibels, using RMS voltages across the same impedance:
-
-$$\text{SNR}_{\text{dB}} = 20 \log_{10}\!\left(\frac{V_{\text{signal,rms}}}{V_{\text{noise,rms}}}\right)$$
-
-For an ideal $N$-bit ADC with a full-scale sinusoidal input, quantization noise is uniformly distributed over $\pm q/2$ where $q = V_{FS}/2^N$ is the LSB voltage. The RMS quantization noise is $q/\sqrt{12}$, and the RMS value of a full-scale sine is $V_{FS}/(2\sqrt{2})$, giving:
-
-$$\text{SNR}_{\text{dB}} = 20\log_{10}\!\left(\frac{V_{FS}/(2\sqrt{2})}{(V_{FS}/2^N)/\sqrt{12}}\right) = 20\log_{10}\!\left(\frac{2^N\sqrt{12}}{2\sqrt{2}}\right) \approx 6.02N + 1.76\ \text{dB}$$
-
-Each bit adds 6.02 dB — one bit doubles the voltage resolution, which is a factor of 4 in power.
-
-However, thermal noise from the source resistance and ADC input network frequently limits the *effective* resolution. If the RMS thermal noise referred to the ADC input is $V_{n,\text{rms}}$, the effective number of bits is:
-
-$$\text{ENOB} = \frac{\text{SNR}_{\text{actual}} - 1.76}{6.02}$$
-
-A 16-bit ADC ($\text{SNR}_\text{theoretical} = 98\ \text{dB}$) with a $1\ \text{k}\Omega$ source and 1 MHz bandwidth has $V_{n,\text{rms}} = \sqrt{4 \times 1.38\times10^{-23} \times 290 \times 10^3 \times 10^6} \approx 4\ \mu\text{V}$.
+**Solution:**
+1. Convert gains and NF to linear:
+   \[
+   G_1 = 10^{15/10}=31.62,\quad
+   G_2 = 10^{10/10}=10.0,
+   \]
+   \[

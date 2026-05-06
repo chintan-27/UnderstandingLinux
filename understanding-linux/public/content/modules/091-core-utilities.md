@@ -10,142 +10,261 @@ resources:
     title: "The Linux Command Line (Shotts)"
 ---
 
-## Module 91: Core Utilities — `grep`, `sed`, `awk`, `find`, `xargs`, `sort`, `cut`, `tr`, `ps`, `top`
-
-## Why This Matters
-
-The kernel exposes its internal state as text: `/proc/net/tcp` lists every TCP socket with local/remote addresses and connection state; `/proc/$PID/maps` shows a process's entire virtual memory layout; `/proc/$PID/fd/` lists open file descriptors as symlinks. None of this is useful until you can filter it by field, join it with other output, and feed it into the next tool. These utilities are the query language for that data. When a process holds a deleted file open and is filling your disk, `lsof` is not always available — but `find /proc/*/fd -ls | grep deleted` is. Knowing the mechanics of each tool means you can compose them precisely, not just copy incantations from the internet.
-
----
-
 ## Core Concepts
+### Introduction to Core Utilities
+Core utilities are the user‑space programs that implement the Unix philosophy of *small, sharp tools* that communicate via plain text streams and file descriptors. Each utility performs a single, well‑defined operation (search, transform, select, aggregate) and can be composed with others using pipes (`|`), redirections (`<`, `>`, `>>`), and subshells. This composability lets complex system‑administration tasks be expressed as short shell pipelines rather than monolithic programs.
 
-### Text as the Universal Interface
-
-Unix tools operate on streams of bytes organized as newline-delimited records. This design is enforced by the kernel: `pipe(2)` connects stdout to stdin entirely in memory via a kernel buffer (default 64 KB on Linux), with no disk I/O. Because the wire format is just bytes with newlines as record separators, any tool that writes to stdout can pipe into any tool that reads from stdin, with no shared schema negotiated in advance.
-
-The kernel buffer size matters when you have a fast producer and slow consumer: if the producer fills the pipe buffer, it blocks on `write(2)` until the consumer drains it. This is why `xargs` batching and `sort`'s external merge strategy exist — they manage throughput, not just correctness.
-
-### Regular Expressions and Engine Complexity
-
-`grep`, `sed`, and `awk` all compile a regex into a finite automaton. The two flavors matter in practice:
-
-- **BRE (Basic Regular Expressions)**: default in `grep`, `sed`. Grouping and alternation require escaping: `\(group\)`, `\|`.
-- **ERE (Extended Regular Expressions)**: `grep -E`, `awk`. Unescaped: `(group)`, `|`, `+`, `?`.
-
-An NFA-based engine (which GNU grep uses via the `libtre`/Henry Spencer engine path) matches a regex of length $m$ against a string of length $n$ in $O(mn)$ time. PCRE's backtracking engine can degrade to $O(2^n)$ on inputs crafted to cause catastrophic backtracking. Concretely: filtering a 1 GB log file with a pathological PCRE pattern can hang; the same pattern as an NFA-compiled ERE terminates in seconds.
-
-GNU `grep` has a fast-path: when the pattern contains no regex metacharacters, it uses Boyer-Moore string search, which runs in $O(n/m)$ average time — sublinear because it skips characters. This is why `grep 'literal-string' bigfile` is faster than `grep -E 'literal.string' bigfile`.
-
-### Field-Oriented vs. Stream-Oriented Processing
-
-| Tool | Model | Unit of work | State across lines |
-|------|-------|-------------|-------------------|
-| `grep` | Filter | Whole line | None |
-| `sed` | Stream editor | Line → pattern space | Hold space (one line) |
-| `awk` | Field processor | Record → fields | Arbitrary variables |
-| `cut` | Column extractor | Fields by delimiter or byte offset | None |
-| `tr` | Byte mapper | Individual bytes | None |
-
-The "state across lines" column explains capability limits. `sed` can join two lines using its hold space (`H`, `G`, `x` commands), but accumulating 1000 lines requires `awk` because `awk` can maintain arbitrary arrays across records.
-
-### Process Observation: `/proc` as the Real Source
-
-`ps` and `top` do not query a daemon. They open files under `/proc`, which is a virtual filesystem (`procfs`) the kernel populates on-demand when the files are opened. Every field in `ps aux` output maps to a specific field in `/proc/$PID/stat` or `/proc/$PID/status`.
-
-```bash
-# What ps reads to show CPU and memory for PID 1234:
-cat /proc/1234/stat    # field 14 = utime, 15 = stime (in clock ticks)
-cat /proc/1234/status  # VmRSS = resident set size in kB
-cat /proc/1234/cmdline # argv[0..n] separated by NUL bytes
-```
-
-CPU percentage shown by `ps` is computed as:
-
-$$\text{CPU\%} = \frac{(u_{\text{time}} + s_{\text{time}}) / \text{CLK\_TCK}}{\text{elapsed wall time}} \times 100$$
-
-where `CLK_TCK` is typically 100 Hz (verify with `getconf CLK_TCK`). `top` repeats this calculation at each poll interval, which is why its percentages represent recent utilization rather than lifetime average.
+The utilities discussed here—`grep`, `sed`, `awk`, `find`, `xargs`, `sort`, `cut`, `tr`, `ps`, and `top`—are all specified by POSIX and are present in every standard Linux distribution. Their implementations rely on a common set of system calls (`open`, `read`, `write`, `lstat`, `execve`, `wait4`) and on shared libraries (GNU Regex, PCRE2, libproc). Understanding their internal mechanics explains why they are fast, predictable, and safe to use in scripts that run as root or in confined containers.
 
 ---
 
 ## How It Works
+### grep – Pattern Matching at the Kernel‑User Boundary
+`grep` does not examine the file byte‑by‑byte in user space; instead it issues a series of `read(2)` calls that fill a buffer (typically 8 KiB). The GNU implementation compiles the user‑supplied pattern to either:
+* a **fixed‑string Boyer‑Moore‑Horspool** matcher (average case ≈ O(N/M) where N = input length, M = pattern length) when the pattern contains no metacharacters, or  
+* an **NFA** (Thompson construction) that is simulated on the fly when metacharacters are present (worst‑case O(N·M) but with early‑exit optimisations).
 
-### `grep` — Pattern Matching with Engine Awareness
+The matcher works on the buffer; when a match is found the entire line (delimited by `\n`) is written to stdout via `write(2)`. If the pattern is anchored (`^` or `$`) the engine can skip to the next newline immediately, reducing work.
+
+*Why this matters:* By keeping the matching loop tight and using vectorizable character comparisons, `grep` can search multi‑gigabyte log files at > 300 MiB/s on a modern SSD.
+
+### sed – Stream Editing with Pattern and Hold Spaces
+`sed` operates in a **read‑transform‑write** cycle:
+1. Read one line (delimited by `\n`) into the **pattern space**.
+2. Apply the editing script address‑by‑address; each command may modify the pattern space, copy it to the **hold space**, or exchange the two.
+3. Output the (possibly modified) pattern space (unless suppressed by `-n`).
+4. Repeat until EOF.
+
+The editing commands are essentially a tiny imperative language: `s/regexp/replacement/flags` substitutes using the same regex engine as `grep`; `b label` branches; `t label` branches on successful substitution; `y/charlist1/charlist2/` performs per‑character translation via a 256‑byte lookup table.
+
+*Why this matters:* Because the algorithm never stores more than two lines in memory, `sed` can edit arbitrarily large files in constant space, making it safe for pipeline use in init scripts.
+
+### awk – Pattern‑Action Language with Associative Arrays
+`awk` reads input records (default: lines) and splits each record into fields (`$1`, `$2`, …) using either a single‑character delimiter (`-F`) or a regular expression (`-F` regex). For each record it evaluates a series of **pattern { action }** rules:
+* If the pattern matches (or is omitted, meaning “always”), the associated action is executed.
+* Actions may update variables, arrays, or call built‑in functions (`match`, `substr`, `system`, `printf`).
+
+Internally, `awk` maintains a hash table (open addressing, linear probing) for associative arrays; look‑ups are amortized O(1). The field‑splitting step uses `memchr` for fixed delimiters or the regex engine for regex delimiters.
+
+*Why this matters:* The combination of linear‑time scanning, constant‑time hash updates, and built‑in formatting makes `awk` ideal for rapid column‑wise summarisation of CSV or log files without writing a full program.
+
+### find – Depth‑First Tree Walk with Boolean Expression Evaluation
+`find` performs a **pre‑order depth‑first traversal** of the directory tree starting at each path argument. For each directory entry it obtains a `struct stat` via `lstat(2)` (to avoid following symlinks unless `-L` is given). The resulting metadata feeds a **postfix Boolean expression** built from primaries (`-name`, `-type`, `-size`, `-perm`, …) and operators (`-and`, `-or`, `-not`, `(`, `)`).
+
+Expression evaluation follows short‑circuit rules: as soon as the final truth value is known, traversal of that subtree may be pruned (e.g., `-prune`). The complexity is Θ(N) where N is the number of visited filesystem objects; each `lstat` costs O(1) system‑call overhead.
+
+*Why this matters:* By coupling the walk with early pruning, `find` can locate a single file among millions in sub‑second time when the criteria are selective (e.g., `-type f -name '*.conf'`).
+
+### xargs – Safe Argument‑List Construction Under `ARG_MAX`
+The kernel imposes a limit on the total size of an argument list and environment (`ARG_MAX`, typically 2 MiB on x86_64). `xargs` avoids exceeding this limit by:
+1. Reading delimited items from stdin (default: whitespace; `-0` uses NUL for safety with weird filenames).
+2. Accumulating items into an internal buffer until adding the next item would exceed `ARG_MAX - envsize`.
+3. Invoking the target command with `execve(2)` on the buffered argument vector.
+4. Repeating until stdin is exhausted.
+
+If the command returns a non‑zero status, `xargs` can terminate (`-r`) or continue (`-i`). The `-P` flag spawns up to N parallel processes, each with its own argument buffer.
+
+*Why this matters:* `xargs` turns a stream of filenames into a minimal number of `execve` calls, drastically reducing fork‑exec overhead when deleting or processing thousands of files.
+
+### sort – External Merge Sort with Runtime‑Generated Keys
+`sort` implements a **k‑way external merge sort**:
+1. **Run generation:** Read chunks of size `-S` (default ~10% of RAM) into memory, sort them with `quicksort` (introsort) using a key extraction function, and write each sorted run to a temporary file (`mkstemp` under `$TMPDIR`).
+2. **Merge phase:** Open all run files, maintain a min‑heap of the current smallest key from each run, repeatedly extract the minimum, write it to output, and refill the heap from the originating run.
+
+The key extraction can be a simple byte comparison (`-n` converts strings to `long double` via `strtold`) or a user‑provided `-k` spec that defines field numbers and delimiters. Complexity: O(N log N) comparisons; I/O cost is O(N · log_{M} N) where M is the number of runs that fit in memory.
+
+*Why this matters:* Even when the input exceeds RAM, `sort` guarantees O(N log N) time with bounded temporary‑disk usage, crucial for processing large datasets in batch jobs.
+
+### cut – Field/Column Extraction with Multibyte Awareness
+`cut` operates on three modes:
+* **`-b`** (bytes): direct index into the raw byte array.
+* **`-c`** (characters): converts the input to wide characters via `mbrtowc` (respecting `LC_CTYPE`), then indexes.
+* **`-f`** (fields): splits each line by a delimiter (`-d`, default tab) using `strsep`; fields are counted starting at 1.
+
+If the delimiter is a multibyte character, `cut` first translates the line to wide characters, splits, then optionally converts back to UTF‑8 for output. The algorithm is linear in input size with a small constant factor (single pass).
+
+*Why this matters:* Correct handling of UTF‑8 prevents data corruption when extracting columns from localisation files or JSON‑pretty‑printed output.
+
+### tr – Character Translation via Lookup Table
+`tr` builds a 256‑entry table `trans[256]` initialized to `trans[i] = i`. For each command line argument:
+* `tr SET1 SET2`: for each `c` in SET1, set `trans[c] = corresponding character from SET2` (padding/truncating as per POSIX).
+* `tr -d SET1`: marks `trans[c] = 256` (a sentinel meaning “delete”).
+* `tr -s SET1`: after translation, squeezes consecutive repeats of any character that appears in SET1.
+
+During processing, each input byte `b` is replaced by `trans[b]` if `trans[b] < 256`; otherwise the byte is omitted. The operation is a single `read`/`transform`/`write` loop, O(N) time, O(1) space.
+
+*Why this matters:* The constant‑time table makes `tr` ideal for high‑throughput tasks like normalising line endings (`tr '\r' '\n'`) or preparing data for legacy tools that expect ASCII only.
+
+### ps – Process Information Extraction from `/proc`
+`ps` does not invoke a special syscall; instead it walks the **process table** exposed via the `/proc` filesystem:
+* Each PID appears as a directory `/proc/[pid]`.
+* The file `/proc/[pid]/stat` contains whitespace‑separated fields: pid, comm, state, ppid, …, utime, stime, cutime, cstime, …
+* The file `/proc/[pid]/status` provides formatted fields (VmSize, VoluntaryCtxtSwitch, etc.) and is easier to parse for numeric values.
+
+`ps` reads these files with `open(2)`/`read(2)`, parses the ASCII decimal values into integers, and formats output according to the chosen format specifiers (e.g., `pid:user:%cpu:etime:args`). CPU utilisation percentages are calculated as:
+
+$$
+\text{\%CPU} = 100 \times \frac{(\Delta\text{utime} + \Delta\text{stime})}{\Delta\text{real\_time}} \times \frac{1}{N_{\text{online\_cpus}}}
+$$
+
+where Δ values are differences between two reads spaced by the polling interval.
+
+*Why this matters:* By relying on the virtual `/proc` interface, `ps` works uniformly across architectures and container namespaces, providing low‑overhead monitoring without requiring ptrace privileges.
+
+### top – Periodic Sampling with Incremental CPU Accounting
+`top` is essentially `ps` wrapped in a **curses‑based UI** that refreshes every `delay` seconds (default 3.0). On each refresh it:
+1. Reads `/proc/stat` to obtain global CPU times (user, nice, system, idle, iowait, irq, softirq, steal, guest, guest_nice).
+2. Reads `/proc/[pid]/stat` for each process (or a subset limited by `-p` or user filters).
+3. Computes per‑process Δutime and Δstime since the last sample, then derives `%CPU` using the formula above.
+4. Calculates memory usage from `/proc/[pid]/status` (`VmRSS`, `VmSize`).
+5. Updates the display, sorts the process list according to the current sort key (default `%CPU`), and highlights the running process.
+
+The UI uses the `ncurses` library for non‑blocking input and efficient screen redraws.
+
+*Why this matters:* The incremental algorithm avoids re‑scanning the entire `/proc` tree for each metric; only the changed counters need to be read, giving `top` sub‑second responsiveness even on systems with > 10 k threads.
+
+---
+
+## Worked Examples
+### Example 1 – Precise IPv4 Address Extraction with `grep -P`
+Goal: Extract lines containing an IPv4 address **without** leading zeros (e.g., `192.168.01.5` should be rejected).
 
 ```bash
-grep -n 'pattern' file                        # matching lines with line numbers
-grep -E '^[0-9a-f]+\s' /proc/net/tcp         # ERE: lines starting with hex field
-grep -r --include='*.c' 'open(' /usr/src/    # recursive, filename-filtered
-grep -v 'DEBUG' app.log                      # invert: lines NOT matching
-grep -c 'ERROR' /var/log/syslog              # count of matching lines
-grep -l 'OOM' /var/log/*.log                 # filenames only (for xargs)
+$ cat > ips.txt <<'EOF'
+10.0.0.1
+192.168.001.5
+172.16.254.1
+256.0.0.1
+EOF
+$ grep -P '(?<!\d)(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)\.(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)\.(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)\.(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(?!\d)' ips.txt
+10.0.0.1
+172.16.254.1
 ```
+*Explanation*: The PCRE pattern uses negative look‑behind/‑ahead `(?<!\d)`/`(?!\d)` to ensure the address is not part of a longer digit string. Each octet is `(?:25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)`, which rejects leading zeros because the alternatives `[1-9]?\d` allow a single digit or a two‑digit number that does not start with `0`. The `-P` flag activates PCRE2 (more expressive than basic or extended regex).  
 
-`-l` exists because when you pipe `find | xargs grep -l`, you want filenames to act on, not the matching lines themselves. `grep` compiles the regex once and applies the automaton to each line; the per-line cost is $O(m \cdot L)$ where $L$ is the line length and $m$ is the regex length.
-
-To see which regex engine path `grep` chose, `GREP_OPTIONS` and `strace -e trace=open grep ...` will show library calls. On GNU systems, `grep --version` reports if PCRE is linked.
-
-### `sed` — Addresses, Pattern Space, Hold Space
-
-`sed` maintains a *pattern space* (the current line) and a *hold space* (one persistent buffer). Commands are applied to lines matching an address. The address can be a line number, a regex, or a range.
+### Example 2 – In‑Place Log Rotation with `sed -i` and Backup
+Goal: Rename all occurrences of `ERROR` to `WARN` in a rotating log, preserving the original in case of rollback.
 
 ```bash
-sed -n '10,20p' file                          # print lines 10–20; -n suppresses default print
-sed 's/foo/bar/g' file                        # substitute all per line
-sed '/^#/d' config                            # delete lines matching regex
-sed -i.bak 's/localhost/127.0.0.1/g' app.conf # in-place with .bak backup
-sed -n '/START/,/END/p' file                  # print between two markers
-sed -E 's/([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)/[REDACTED]/g' access.log  # ERE capture
+$ cp app.log app.log.bak   # safety copy
+$ sed -i.bak 's/\<ERROR\>/WARN/g' app.log
+$ diff -u app.log.bak app.log   # view changes
 ```
+*Explanation*: `\<` and `\>` are word‑boundary anchors in basic regex, preventing partial matches like `ERRORS`. The `-i.bak` flag tells GNU `sed` to edit the file in place, moving the original to `app.log.bak` before writing the new content. If the substitution fails (e.g., due to a permission error), the original file remains untouched because `sed` only renames the backup after successfully creating the temporary output.
 
-`-i` rewrites the file by creating a temp file and renaming it — it is `rename(2)`, not an in-place byte overwrite. The `.bak` suffix names the backup. Without a suffix (`-i ''`), the original is unrecoverable.
-
-The substitution syntax `s/regex/replacement/flags`: replacement uses `&` for the whole match, `\1` for group 1 (BRE: `\(group\)`; ERE with `-E`: `(group)`). Flag `g` replaces all occurrences; `I` (GNU extension) makes it case-insensitive.
-
-**`sed` processing loop — what actually happens:**
-
-```
-open file
-while read_next_line into pattern_space:
-    for each command:
-        if address matches:
-            execute command (may modify pattern space, jump, branch)
-    unless -n: write pattern_space to stdout
-    clear pattern_space
-```
-
-This loop explains why `sed` cannot natively sort: it sees one line at a time with only one extra buffer. Multi-line operations require explicit `N` (append next line to pattern space) or `H`/`G` (copy to/from hold space).
-
-### `awk` — Record Processing with Persistent State
-
-`awk` is a small programming language. Each input line is a *record*, split into fields by `FS` (default: contiguous whitespace). The runtime is:
-
-```
-execute BEGIN block
-for each record:
-    split into $1..$NF
-    for each rule: if pattern matches, execute action
-execute END block
-```
+### Example 3 – Summarising CSV Columns with `awk`
+Goal: Compute the average response time (third column) for each unique endpoint (second column) from a CSV log `access.csv` where fields are comma‑separated and may contain quoted commas.
 
 ```bash
-awk '{print $1, $3}' file                            # fields 1 and 3
-awk -F: '{print $1, $3}' /etc/passwd                 # colon delimiter; username and UID
-awk -F: '$3 > 999 {print $1, $3}' /etc/passwd        # regular users (UID ≥ 1000)
-awk 'NR==1{next} {sum += $2} END{print sum}' data.txt # skip header, sum column 2
-awk '$9 == 404 {count++} END{print count}' access.log # count HTTP 404s
-awk '{bytes[$1] += $10} END{for (ip in bytes) print ip, bytes[ip]}' access.log  # per-IP byte sum
+$ cat access.csv
+"GET","/api/users",12.4
+"POST","/api/login",45.2
+"GET","/api/users",8.1
+"GET","/api/login",30.0
+$ awk -F', *' '
+{
+    gsub(/^"|"$/, "", $2)          # strip surrounding quotes from endpoint
+    gsub(/^"|"$/, "", $1)          # strip quotes from method (optional)
+    sum[$2] += $3
+    cnt[$2]++
+}
+END {
+    for (ep in sum)
+        printf "%s: avg = %.2f ms\n", ep, sum[ep]/cnt[ep]
+}' access.csv
+/PI/users: avg = 10.25 ms
+/api/login: avg = 37.60 ms
 ```
+*Explanation*: `-F', *' ` tells `awk` to split on a comma followed by optional spaces, handling the CSV spacing. The `gsub` calls remove the double quotes that quote‑encapsulate each field. Two associative arrays, `sum` and `cnt`, accumulate totals and counts; the final `printf` prints averages with two‑decimal precision. The algorithm runs in O(N) time and O(U) memory, where U is the number of unique endpoints.
 
-The last example accumulates an associative array across all records — impossible in `grep` or `sed`, trivial in `awk`. `awk` arrays are hash maps; access and insertion are $O(1)$ average.
-
-**Diagnosing a device file with `awk` field filtering:**
-
-From TLPI's inode examples: `ls -li /dev/sda1` shows fields including major and minor device numbers. `awk` applies positional logic that `grep` cannot:
+### Example 4 – Finding Large Files and Deleting Them Safely with `find` + `xargs`
+Goal: Delete all regular files larger than 100 MiB under `/var/log`, but first show what will be removed.
 
 ```bash
-ls -li /dev/ | awk '$6 == "8," && $7 == 1 {print $0}'
-# $6 is major number (with comma), $7 is minor; selects /dev/sda1
+$ find /var/log -type f -size +100M -print0 | xargs -0 -r ls -lh
+/var/log/journal/XXXXXXXX/user-1000.journal: 124M
+/var/log/apache2/access_log.1.gzs: 108M
+$ # If the list looks correct, proceed to deletion:
+$ find /var/log -type f -size +100M -print0 | xargs -0 -r rm -v --
+```
+*Explanation*: `-print0` and `xargs -0` use NUL as delimiter, guaranteeing correctness even when filenames contain spaces, newlines, or `-` characters. The `-r` flag prevents `xargs` from invoking `rm` with an empty argument list if `find` yields no matches. The `ls -lh` dry‑run shows human‑readable sizes; the final `rm -v` removes each file verbosely.
+
+### Example 5 – Sorting by Multiple Keys with `sort`
+Goal: Sort a table of employees first by department (ascending), then by salary (descending), finally by name (ascending). Input `employees.tsv` is tab‑separated.
+
+```bash
+$ cat employees.tsv
+Sales   Alice   55000
+Engineering   Bob   72000
+Engineering   Alice   68000
+Sales   Frank   61000
+$ sort -t$'\t' -k1,1 -k3,3nr -k2,2 employees.tsv
+Engineering   Bob   72000
+Engineering   Alice   68000
+Sales   Frank   61000
+Sales   Alice   55000
+```
+*Explanation*: `-t$'\t'` sets the delimiter to a literal tab. `-k1,1` sorts on the first field (department) using the default ascending order. `-k3,3nr` sorts on the third field (salary) numerically (`n`) and in reverse (`r`). `-k2,2` sorts on the second field (name) ascending as a tie‑breaker. The sort algorithm is stable, so later keys only reorder elements that compare equal on earlier keys.
+
+### Example 6 – Translating Newlines to Spaces with `tr`
+Goal: Convert a paragraph where sentences are separated by double newlines into a single line with spaces between sentences.
+
+```bash
+$ cat paragraph.txt
+Lorem ipsum dolor sit amet.
+
+Consectetur adipiscing elit.
+
+Sed do eiusmod tempor incididunt.
+$ tr '\n' ' ' < paragraph.txt | tr -s ' '
+Lorem ipsum dolor sit amet. Consectetur adipiscing elit. Sed do eiusmod tempor incididunt.
+```
+*Explanation*: The first `tr` turns every newline into a space. The second `tr -s ' '` squeezes consecutive spaces into a single one, eliminating the extra spaces that resulted from blank lines. The pipeline uses only two passes, each O(N) time and O(1) extra memory.
+
+### Example 7 – Monitoring a Specific Process with `ps` and Watching Its Thread Count
+Goal: Observe how the thread count of a Java application (`java -jar app.jar`) evolves over time.
+
+```bash
+$ # Start the app in background
+$ java -jar app.jar &
+$ # Repeatedly query its thread count (field 30 in /proc/[pid]/stat)
+$ while true; do
+      pid=$(pgrep -f app.jar)
+      if [[ -n $pid ]]; then
+          tcount=$(awk '{print $30}' /proc/$pid/stat)
+          ts=$(date +%T)
+          echo "$ts pid=$pid threads=$tcount"
+      fi
+      sleep 2
+  done
+```
+*Explanation*: Field 30 of `/proc/[pid]/stat` is `num_threads` (the number of light‑weight processes). The loop uses `pgrep` to find the PID, then extracts the field with `awk`. This provides low‑overhead visibility without pulling in heavyweight tools like `top`.
+
+### Example 8 – Calculating CPU Usage from `/proc` with `top` Batch Mode
+Goal: Capture a one‑second snapshot of total CPU utilisation for capacity planning.
+
+```bash
+$ top -bn1 | grep "Cpu(s)" | sed -e 's/.*, *\([0-9.]*\)%* id.*/\1/' | awk '{print 100 - $1"%"}'
+42.3%
+```
+*Explanation*: `-b` runs `top` in batch mode (no curses); `-n1` limits to a single iteration. The line containing `Cpu(s)` holds percentages of user, nice, system, idle, iowait, irq, softirq, steal. Extracting the idle percentage and subtracting from 100 yields the total non‑idle CPU usage. This technique is useful in cron jobs that log system load over time.
+
+---
+
+## Common Mistakes
+### Mistake 1 – Assuming `grep` Treats the Dot `.` as Literal Without Escaping
+**Wrong:**  
+```bash
+$ grep "version.2" notes.txt   # intends to match "version.2"
+```
+**Why it fails:** In basic and extended regular expressions, `.` matches *any* character. The pattern will also match `versionX2`, `version_2`, etc., producing false positives.  
+**Fix:** Escape the dot or use fixed‑string search:  
+```bash
+$ grep "version\.2" notes.txt      # BRE/ERE
+$ grep -F "version.2" notes.txt    # treat pattern as literal string
 ```
 
-`grep '8,\s*
+### Mistake 2 – Using `sed -i` Without a Backup on a Shared File
+**Wrong:**  
+```bash
+$ sed -i 's/foo/bar/'

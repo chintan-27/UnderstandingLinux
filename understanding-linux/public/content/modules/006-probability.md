@@ -10,147 +10,285 @@ resources:
     title: "Introduction to Linear Algebra (Strang)"
 ---
 
-## Why This Matters
-
-Every time the Linux kernel picks an ephemeral port, salts a hash table, schedules a process with jitter, or generates a cryptographic key, it is relying on probability with *predictable long-run structure*. Without a formal model of random variables, you cannot reason about whether your hash function resists collision attacks, whether your load balancer will saturate one CPU, or whether `/dev/urandom` is supplying entropy with the right distribution. The math here is operational: a kernel developer who does not understand variance will write hash tables that perform fine on average but catastrophically on adversarial input — exactly the kind of attack CVE-2011-4868 exploited against the Linux network stack's hash seed.
-
----
-
 ## Core Concepts
-
-### Sample Space and Probability
-
-A **probability space** consists of a sample space $\Omega$ of elementary outcomes, each with probability $\Pr(\omega) \geq 0$, normalized so:
-
-$$\sum_{\omega \in \Omega} \Pr(\omega) = 1$$
-
-The probability of a compound event $A \subseteq \Omega$ is $\Pr(A) = \sum_{\omega \in A} \Pr(\omega)$. Every other construct — random variables, expectations, generating functions — is a function defined on this space.
-
 ### Random Variables
+A **random variable** \(X\) is a measurable function \(X:\Omega\to\mathbb{R}\) from a probability space \((\Omega,\mathcal{F},\mathbb{P})\) to the real line. Measurability means that for every Borel set \(B\subseteq\mathbb{R}\), the pre‑image \(X^{-1}(B)\in\mathcal{F}\); this guarantees that probabilities \(\mathbb{P}(X\in B)\) are well‑defined.  
 
-A **random variable** $X$ is a function $X : \Omega \to \mathbb{R}$. The randomness is in $\omega$; $X$ is a deterministic measurement of the outcome. When we write $\Pr(X = x)$, we mean:
+- **Discrete**: \(\Omega\) is countable; \(X\) takes values in a set \(\{x_i\}\) with probability mass function (pmf) \(p_X(x_i)=\mathbb{P}(X=x_i)\).  
+- **Continuous**: \(\Omega\) is uncountable; \(X\) admits a probability density function (pdf) \(f_X(x)\) such that \(\mathbb{P}(a\le X\le b)=\int_a^b f_X(x)\,dx\). The pdf satisfies \(f_X(x)\ge0\) and \(\int_{-\infty}^{\infty}f_X(x)\,dx=1\).
 
-$$\Pr(X = x) = \sum_{\substack{\omega \in \Omega \\ X(\omega) = x}} \Pr(\omega)$$
+The distinction matters because expectations and variances are computed by sums for discrete variables and integrals for continuous ones.
 
-This distinction matters when you compose random variables — for instance, the number of hash collisions in a bucket is a function of which keys were inserted, not a primitive quantity.
-
-### Expected Value
-
-The **expected value** of $X$ is:
-
-$$EX = \sum_{\omega \in \Omega} X(\omega) \cdot \Pr(\omega) = \sum_{x} x \cdot \Pr(X = x)$$
-
-Expectation is **linear**: $E(aX + bY) = aEX + bEY$ for any constants $a, b$ and *any* $X, Y$, regardless of dependence. Independence is not required. This is what makes expectation so broadly useful — you can decompose a complicated quantity into a sum of simple indicator variables and take expectations termwise.
-
-For example, the expected number of hash collisions is the sum over all key pairs of the probability that pair collides. Each term is simple; independence of the pairs is not assumed.
+### Expectation
+The **expectation** (or mean) of \(X\) is the Lebesgue integral  
+\[
+\mathbb{E}[X]=\int_{\Omega} X(\omega)\,d\mathbb{P}(\omega)
+           =\begin{cases}
+                \sum_i x_i\,p_X(x_i) & \text{discrete}\\[4pt]
+                \int_{-\infty}^{\infty} x\,f_X(x)\,dx & \text{continuous}
+            \end{cases}
+\]
+Linearity follows directly from the integral: \(\mathbb{E}[aX+bY]=a\mathbb{E}[X]+b\mathbb{E}[Y]\) for constants \(a,b\).  
+Expectation is the *center of mass* of the distribution; it is the point where the probability‑weighted moments balance.
 
 ### Variance
+The **variance** measures dispersion around the mean:
+\[
+\operatorname{Var}(X)=\mathbb{E}\!\big[(X-\mathbb{E}[X])^2\big]
+                    =\mathbb{E}[X^2]-\big(\mathbb{E}[X]\big)^2 .
+\]
+The second equality is obtained by expanding the square and using linearity of expectation.  
+For a discrete variable,
+\[
+\operatorname{Var}(X)=\sum_i (x_i-\mu)^2 p_X(x_i),\qquad \mu=\mathbb{E}[X],
+\]
+and for a continuous variable the sum becomes an integral. Variance is always non‑negative; \(\operatorname{Var}(X)=0\) iff \(X\) is almost surely constant.
 
-Expectation tells you the center; **variance** tells you the spread. Two distributions with the same mean can have radically different tail behavior.
+### Distributions
+A **distribution** completely describes the law of a random variable. Common families:
 
-$$VX = E\left[(X - EX)^2\right]$$
+| Distribution | Support | PMF/PDF | Mean | Variance |
+|--------------|---------|---------|------|----------|
+| Bernoulli(\(p\)) | \(\{0,1\}\) | \(p_X(1)=p,\;p_X(0)=1-p\) | \(p\) | \(p(1-p)\) |
+| Binomial(\(n,p\)) | \(\{0,\dots,n\}\) | \(\displaystyle p_X(k)=\binom{n}{k}p^k(1-p)^{n-k}\) | \(np\) | \(np(1-p)\) |
+| Poisson(\(\lambda\)) | \(\{0,1,2,\dots\}\) | \(\displaystyle p_X(k)=\frac{e^{-\lambda}\lambda^k}{k!}\) | \(\lambda\) | \(\lambda\) |
+| Uniform(\(a,b\)) | \([a,b]\) | \(f_X(x)=\frac{1}{b-a}\) | \(\frac{a+b}{2}\) | \(\frac{(b-a)^2}{12}\) |
+| Normal(\(\mu,\sigma^2\)) | \(\mathbb{R}\) | \(f_X(x)=\frac{1}{\sqrt{2\pi\sigma^2}}e^{-(x-\mu)^2/(2\sigma^2)}\) | \(\mu\) | \(\sigma^2\) |
 
-The computationally useful form — *mean of the square minus square of the mean* — follows by expanding and applying linearity:
-
-$$VX = E(X^2) - (EX)^2$$
-
-The **standard deviation** $\sigma_X = \sqrt{VX}$ is in the same units as $X$. When the standard deviation is large relative to the mean, the average is a poor predictor of any individual outcome. This is precisely the situation with hash table bucket depths under adversarial input.
+Each distribution arises from a specific modeling assumption (e.g., Bernoulli for a single yes/no trial, Binomial for \(n\) independent Bernoulli trials, Poisson for rare events in a fixed interval).
 
 ### Independence
+Two random variables \(X,Y\) are **independent** iff their joint distribution factorises:
+\[
+\mathbb{P}(X\in A,\,Y\in B)=\mathbb{P}(X\in A)\,\mathbb{P}(Y\in B)
+\quad\forall A,B\in\mathcal{B}(\mathbb{R}).
+\]
+Equivalently, for discrete variables \(p_{X,Y}(x,y)=p_X(x)p_Y(y)\); for continuous variables \(f_{X,Y}(x,y)=f_X(x)f_Y(y)\).  
+Independence implies \(\mathbb{E}[XY]=\mathbb{E}[X]\mathbb{E}[Y]\) and \(\operatorname{Var}(X+Y)=\operatorname{Var}(X)+\operatorname{Var}(Y)\) because the covariance term vanishes.
 
-$X$ and $Y$ are **independent** if and only if:
+### Conditional Probability
+Given an event \(B\) with \(\mathbb{P}(B)>0\), the conditional probability of \(A\) is
+\[
+\mathbb{P}(A\mid B)=\frac{\mathbb{P}(A\cap B)}{\mathbb{P}(B)} .
+\]
+For random variables, the conditional distribution of \(X\) given \(Y=y\) is defined (when it exists) by
+\[
+f_{X\mid Y}(x\mid y)=\frac{f_{X,Y}(x,y)}{f_Y(y)} .
+\]
+Conditional expectation \(\mathbb{E}[X\mid Y]\) is a random variable that is the best predictor of \(X\) in the mean‑square sense given the information in \(Y\).
 
-$$\Pr(X = x \text{ and } Y = y) = \Pr(X = x) \cdot \Pr(Y = y) \quad \text{for all } x, y$$
-
-Independence gives two payoffs that do *not* hold in general:
-
-- $E(XY) = (EX)(EY)$
-- $V(X + Y) = VX + VY$
-
-The second means variance is additive for independent variables. Averaging $n$ independent, identically distributed variables with variance $\sigma^2$ gives a result with variance $\sigma^2/n$ — uncertainty shrinks as $1/\sqrt{n}$. This is why taking multiple timing samples and averaging them reduces measurement noise in `perf`.
-
-### Conditional Probability and Bayes' Theorem
-
-The **conditional probability** of $A$ given $B$:
-
-$$\Pr(A \mid B) = \frac{\Pr(A \cap B)}{\Pr(B)}$$
-
-This is not a belief update by convention — it is the only definition consistent with probability being a ratio of favorable to total outcomes when you restrict attention to the world where $B$ has occurred.
-
-**Bayes' theorem** follows immediately by symmetry of $\Pr(A \cap B)$:
-
-$$\Pr(A \mid B) = \frac{\Pr(B \mid A) \cdot \Pr(A)}{\Pr(B)}$$
-
-You observe $B$ (evidence); you want $\Pr(A \mid B)$ (posterior); you know $\Pr(B \mid A)$ (likelihood) and $\Pr(A)$ (prior). The denominator $\Pr(B) = \Pr(B \mid A)\Pr(A) + \Pr(B \mid \neg A)\Pr(\neg A)$ normalizes. This structure underlies kernel intrusion detection heuristics and packet classification: observed traffic patterns are evidence; the inference target is "is this a scan?"
-
-### The Binomial Distribution
-
-$n$ independent trials, each succeeding with probability $p$, produce a count $X$ with:
-
-$$\Pr(X = k) = \binom{n}{k} p^k (1-p)^{n-k}, \quad 0 \leq k \leq n$$
-
-$$EX = np, \qquad VX = np(1-p)$$
-
-The variance is maximized at $p = 1/2$ — fair coin flips are the most unpredictable binary process. At $p = 1/m$ with large $m$ (sparse events), the binomial approximates a **Poisson distribution** with mean $\lambda = np$, which governs rare-event counts: interrupts per millisecond, TCP retransmissions per second, hash bucket collisions with a good hash function.
-
-### Probability Generating Functions
-
-The **probability generating function (pgf)** of a non-negative integer-valued random variable $X$ is:
-
-$$P(z) = E(z^X) = \sum_{k \geq 0} \Pr(X = k) \cdot z^k$$
-
-The coefficients encode the distribution. Derivatives at $z = 1$ recover moments:
-
-$$EX = P'(1), \qquad VX = P''(1) + P'(1) - [P'(1)]^2$$
-
-The central payoff: if $X$ and $Y$ are independent, then:
-
-$$P_{X+Y}(z) = P_X(z) \cdot P_Y(z)$$
-
-Multiplication of pgfs corresponds to addition of independent random variables. This is the generating-function proof that binomial variances add, and it underlies the analysis of hash chains, coupon-collector problems, and occupancy distributions.
+### Bayes’ Theorem
+Starting from the definition of conditional probability for both orders,
+\[
+\mathbb{P}(A\mid B)=\frac{\mathbb{P}(A\cap B)}{\mathbb{P}(B)},
+\qquad
+\mathbb{P}(B\mid A)=\frac{\mathbb{P}(A\cap B)}{\mathbb{P}(A)},
+\]
+we solve for \(\mathbb{P}(A\cap B)\) in the second expression and substitute:
+\[
+\boxed{\;\mathbb{P}(A\mid B)=\frac{\mathbb{P}(B\mid A)\,\mathbb{P}(A)}{\mathbb{P}(B)}\;}
+\]
+The denominator can be expanded via the law of total probability:
+\[
+\mathbb{P}(B)=\sum_i \mathbb{P}(B\mid A_i)\,\mathbb{P}(A_i)
+\]
+when \(\{A_i\}\) partitions the sample space.
 
 ---
 
 ## How It Works
+### Linear Expectation and Variance of Sums
+For any random variables \(X_1,\dots,X_n\) and constants \(a_i\),
+\[
+\mathbb{E}\!\Big[\sum_{i=1}^n a_i X_i\Big]=\sum_{i=1}^n a_i\,\mathbb{E}[X_i].
+\]
+Proof: linearity of the integral (or sum) follows directly from the definition.
 
-### Variance: The Computational Shortcut Derived
+The variance of a sum expands to
+\[
+\operatorname{Var}\!\Big[\sum_{i=1}^n X_i\Big]
+   =\sum_{i=1}^n \operatorname{Var}(X_i)
+    +2\sum_{1\le i<j\le n}\!\operatorname{Cov}(X_i,X_j),
+\]
+where \(\operatorname{Cov}(X_i,X_j)=\mathbb{E}[X_iX_j]-\mathbb{E}[X_i]\mathbb{E}[X_j]\).  
+If the variables are independent, all covariances vanish and the variance reduces to the sum of individual variances—a key simplification used in many algorithms (e.g., estimating error of Monte‑Carlo averages).
 
-The formula $VX = E(X^2) - (EX)^2$ is not an approximation — it follows directly from expanding the definition:
+### Law of Total Probability and Conditional Expectation
+For any partition \(\{B_j\}\) of \(\Omega\) with \(\mathbb{P}(B_j)>0\),
+\[
+\mathbb{E}[X]=\sum_j \mathbb{E}[X\mid B_j]\,\mathbb{P}(B_j).
+\]
+This is obtained by writing \(\mathbb{E}[X]=\int X\,d\mathbb{P}\) and splitting the integral over each \(B_j\).  
+It underlies algorithms that condition on observed data (e.g., Expectation‑Maximization).
 
-$$VX = E\left[(X - EX)^2\right] = E\left[X^2 - 2X \cdot EX + (EX)^2\right]$$
+### From Bayes to Naïve Bayes Classification
+If we model features \(X_1,\dots,X_d\) as conditionally independent given class \(C\),
+\[
+\mathbb{P}(C\mid \mathbf{x})\propto \mathbb{P}(C)\prod_{i=1}^d \mathbb{P}(X_i=x_i\mid C).
+\]
+The independence assumption yields a computationally cheap classifier that works surprisingly well for text and network traffic.
 
-$$= E(X^2) - 2(EX)(EX) + (EX)^2 = E(X^2) - (EX)^2$$
+---
 
-**Example.** $X = 0$ with probability $0.98$, $X = 100$ with probability $0.02$:
+## Worked Examples
+### Example 1: Expectation of a Discrete Variable
+Let \(X\) take values \(\{1,2,3\}\) with probabilities \(\{0.2,0.3,0.5\}\).
 
-$$EX = 0.98 \cdot 0 + 0.02 \cdot 100 = 2$$
+**Step‑by‑step**  
+1. Write the definition: \(\displaystyle \mathbb{E}[X]=\sum_{x} x\,p_X(x)\).  
+2. Plug in each term:  
+   - \(1\times0.2 = 0.2\)  
+   - \(2\times0.3 = 0.6\)  
+   - \(3\times0.5 = 1.5\)  
+3. Sum: \(0.2+0.6+1.5 = 2.3\).  
 
-$$E(X^2) = 0.98 \cdot 0 + 0.02 \cdot 10000 = 200$$
+\[
+\boxed{\mathbb{E}[X]=2.3}
+\]
 
-$$VX = 200 - 4 = 196, \qquad \sigma_X = 14$$
+### Example 2: Variance of the Same Variable
+Using \(\mu=\mathbb{E}[X]=2.3\).
 
-The standard deviation is seven times the mean. Any system dimensioned for the average will be overwhelmed 2% of the time — which, at kernel interrupt rates, is millions of events per second.
+**Step‑by‑step**  
+1. Compute squared deviations:  
+   - \((1-2.3)^2 = (-1.3)^2 = 1.69\)  
+   - \((2-2.3)^2 = (-0.3)^2 = 0.09\)  
+   - \((3-2.3)^2 = (0.7)^2 = 0.49\)  
+2. Weight by probabilities:  
+   - \(1.69\times0.2 = 0.338\)  
+   - \(0.09\times0.3 = 0.027\)  
+   - \(0.49\times0.5 = 0.245\)  
+3. Sum: \(0.338+0.027+0.245 = 0.610\).  
 
-### Why Independence Makes Variance Additive
+\[
+\boxed{\operatorname{Var}(X)=0.61}
+\]
 
-For arbitrary $X$ and $Y$:
+(Notice the alternative formula \(\mathbb{E}[X^2]-\mu^2\) gives the same result: \(\mathbb{E}[X^2]=1^2\cdot0.2+2^2\cdot0.3+3^2\cdot0.5=0.2+1.2+4.5=5.9\); then \(5.9-2.3^2=5.9-5.29=0.61\).)
 
-$$V(X + Y) = E\left[(X+Y)^2\right] - (E(X+Y))^2$$
+### Example 3: Bayes’ Theorem with Numbers
+Given: \(\mathbb{P}(A)=0.4\), \(\mathbb{P}(B)=0.6\), \(\mathbb{P}(B\mid A)=0.8\).
 
-$$= E(X^2) + 2E(XY) + E(Y^2) - (EX)^2 - 2(EX)(EY) - (EY)^2$$
+**Step‑by‑step**  
+1. Compute numerator: \(\mathbb{P}(B\mid A)\mathbb{P}(A)=0.8\times0.4=0.32\).  
+2. Divide by \(\mathbb{P}(B)\): \(0.32/0.6 = 0.533\overline{3}\).  
 
-$$= VX + VY + 2\underbrace{\left[E(XY) - (EX)(EY)\right]}_{\text{Cov}(X,Y)}$$
+\[
+\boxed{\mathbb{P}(A\mid B)=0.533\text{ (approximately)}}
+\]
 
-When $X \perp Y$, $E(XY) = (EX)(EY)$, so $\text{Cov}(X,Y) = 0$ and $V(X+Y) = VX + VY$.
+If we wanted to verify via the law of total probability, we would need \(\mathbb{P}(B\mid A^c)\); assuming \(\mathbb{P}(B\mid A^c)=0.5\) gives \(\mathbb{P}(B)=0.8\cdot0.4+0.5\cdot0.6=0.32+0.30=0.62\), which would slightly change the result—highlighting the importance of knowing the full partition.
 
-When $X$ and $Y$ are *not* independent — for example, two hash probes into the same table where one collision increases the probability of another — the covariance term is nonzero and the simple additive formula breaks down. Ignoring this is a common source of incorrect load estimates.
+---
 
-### The Binomial Distribution via PGFs
+## Common Mistakes
+| # | Mistake | Why It’s Wrong | Correct Approach |
+|---|---------|----------------|------------------|
+| 1 | **Treating \(\mathbb{E}[X^2]\) as \((\mathbb{E}[X])^2\)** | Only true when \(X\) is constant; generally \(\mathbb{E}[X^2]\ge(\mathbb{E}[X])^2\) by Jensen’s inequality (variance ≥ 0). | Compute \(\mathbb{E}[X^2]\) directly from the distribution, or use \(\operatorname{Var}(X)=\mathbb{E}[X^2]-(\mathbb{E}[X])^2\). |
+| 2 | **Assuming pairwise independence ⇒ mutual independence** | Pairwise independence does not guarantee that the joint distribution factorises; counter‑example: three binary variables where each pair is independent but the triple is not. | Verify the full joint factorisation or use known constructions (e.g., mutual independence requires all \(2^n\) joint probabilities to equal the product of marginals). |
+| 3 | **Using the pdf value as a probability** | For continuous variables, \(f_X(x)\) is a density; \(\mathbb{P}(X=x)=0\). Probabilities are obtained by integrating over intervals. | To find \(\mathbb{P}(a\le X\le b)\), integrate \(f_X\) from \(a\) to \(b\). Use the pdf only for expectation or likelihood calculations. |
+| 4 | **Applying Bayes’ theorem without checking \(\mathbb{P}(B)>0\)** | The formula involves division by \(\mathbb{P}(B)\); if \(\mathbb{P}(B)=0\) the conditional probability is undefined (or defined via limits). | Ensure the conditioning event has positive probability; if it may be zero, work with regular conditional probabilities or use limiting arguments. |
+| 5 | **Ignoring covariance when summing variances** | \(\operatorname{Var}(X+Y)=\operatorname{Var}(X)+\operatorname{Var}(Y)+2\operatorname{Cov}(X,Y)\). Assuming independence when it does not hold underestimates variance. | Compute covariance (or correlation) explicitly, or verify independence via joint distribution before dropping the term. |
 
-A single Bernoulli trial has pgf $H(z) = (1-p) + pz$. For $n$ independent trials, independence makes the pgf a product:
+---
 
-$$P(z) = H(z)^n = \left[(1-p) + pz\right]^n = \sum_{k=0}^{n} \binom{n}{k} p^k (1-p)^{n-k} z^k$$
+## Exercises
+1. **Easy** – Let \(X\sim\text{Bernoulli}(p=0.7)\). Compute \(\mathbb{E}[X]\) and \(\operatorname{Var}(X)\).  
+2. **Medium** – Suppose \(X\) and \(Y\) are independent with \(\mathbb{E}[X]=3,\ \operatorname{Var}(X)=2\) and \(\mathbb{E}[Y]=-1,\ \operatorname{Var}(Y)=5\). Find \(\mathbb{E}[2X-3Y]\) and \(\operatorname{Var}(2X-3Y)\).  
+3. **Hard** – A system generates packets according to a Poisson process with rate \(\lambda=2\) packets/ms. Each packet is dropped independently with probability \(p=0.1\). Let \(N\) be the number of packets arriving in a 10 ms interval and \(D\) the number of dropped packets.  
+   a) Determine the distribution of \(N\).  
+   b) Determine the distribution of \(D\) (hint: use thinning of a Poisson process).  
+   c) Compute \(\mathbb{E}[D]\) and \(\operatorname{Var}(D)\).  
 
-The binomial probabilities appear as coefficients — no separate derivation needed. Differentiating:
+---
 
-$$P'(z) = np\left[(1-p) + pz\right]^{n-1} \implies EX = P'(1) = np$$
+## Linux Connection
+Probability is not just abstract; it is baked into the kernel, utilities, and security subsystems.
+
+### Random Number Generation
+- **`/dev/random`** and **`/dev/urandom`** provide access to the kernel’s entropy pool.  
+  - `/dev/random` blocks when the estimated entropy falls below the requested number of bits.  
+  - `/dev/urandom` never blocks; it re‑seeds a CSPRNG (ChaCha20) when entropy is low.  
+
+```bash
+# Check current available entropy (in bits)
+cat /proc/sys/kernel/random/entropy_avail
+
+# Pull 256 bits of non‑blocking random data
+dd if=/dev/urandom bs=32 count=1 of=urandom.bin status=none
+hexdump -C urandom.bin
+```
+
+- The **`getrandom(2)`** syscall (available since Linux 3.17) lets a program request random bytes without dealing with device files:
+
+```c
+#include <sys/random.h>
+#include <unistd.h>
+#include <stdio.h>
+
+int main(void) {
+    unsigned char buf[16];
+    ssize_t n = getrandom(buf, sizeof(buf), 0);
+    if (n == -1) {
+        perror("getrandom");
+        return 1;
+    }
+    for (size_t i = 0; i < n; ++i)
+        printf("%02x", buf[i]);
+    putchar('\n');
+    return 0;
+}
+```
+
+Compile with `gcc -Wall -O2 getrand.c -o getrand`.
+
+### Probabilistic Algorithms in Userspace
+- **`shuf`** implements Fisher–Yates shuffle to produce a uniform random permutation.  
+- **`awk`** can compute sample moments from data collected via `/dev/urandom`:
+
+```bash
+# Generate 10 000 uniform floats in [0,1) and compute sample mean
+awk 'BEGIN { s=0; for(i=1;i<=10000;i++) s+=rand(); print s/10000 }'
+```
+
+- **`rngtest`** (from `rng-tools`) applies statistical tests (FIPS 140‑2) to verify that a source behaves like a true RNG:
+
+```bash
+rngtest < /dev/urandom
+```
+
+### Probability in Kernel Subsystems
+| Subsystem | Probabilistic Mechanism | Example |
+|-----------|------------------------|---------|
+| **CFS Scheduler** | Uses a *virtual runtime* (`vruntime`) that is updated proportionally to the slice of CPU time; tasks with lower `vruntime` are more likely to be selected, approximating *weighted fair queuing* — a stochastic priority system. | `cat /proc/sched_debug` shows per‑task `vruntime`. |
+| **Network Stack (Random Early Detection – RED)** | Packet drop probability is a function of average queue length; early random dropping mitigates TCP global synchronization. | `sysctl -n net.ipv4.tcp_available_congestion_control` shows `reno`, `cubic`; RED can be enabled via `tc qdisc add dev eth0 root handle 1: red ...`. |
+| **Memory Overcommit** | The kernel allows `malloc` to succeed beyond physical RAM, relying on the probability that not all allocated pages will be touched. Overcommit ratio is tunable via `/proc/sys/vm/overcommit_memory` and `/proc/sys/vm/overcommit_ratio`. | `cat /proc/sys/vm/overcommit_memory` (0 = heuristic, 1 = always, 2 = never). |
+| **Filesystem Journaling (ext4)** | When committing a transaction, ext4 may probabilistically delay flushing metadata to batch writes, reducing I/O at the small risk of increased data loss on power failure. | Controlled by `/sys/fs/ext4/<dev>/commit_interval`. |
+
+### Practical Exercise: Estimating Entropy via Compression
+A rough entropy estimator: compress a sample and compare size.
+
+```bash
+# 1 MiB of urandom
+dd if=/dev/urandom of=rand.bin bs=1M count=1 status=none
+# Compress with gzip (level 1)
+gzip -1 -c rand.bin > rand.gz
+# Ratio close to 1 indicates high entropy
+orig=$(stat -c%s rand.bin)
+comp=$(stat -c%s rand.gz)
+echo "Compression ratio: $comp/$orig = $(awk "BEGIN {printf \"%.3f\", $comp/$orig}")"
+```
+
+If the ratio is significantly < 1, the source may be biased or low‑entropy.
+
+---
+
+## Why This Matters
+Probability gives us a **principled language for uncertainty** that appears at every layer of a Linux system:
+
+- **Correctness**: Randomized algorithms (e.g., hash tables, Bloom filters, probabilistic counters) rely on provable bounds that hold *in expectation* or with high probability. Misunderstanding variance or independence leads to under‑provisioned hash tables and unexpected collisions.  
+- **Performance**: The CFS scheduler’s virtual runtime, TCP’s RED, and the overcommit heuristic all trade off deterministic guarantees for *average‑case* efficiency. Knowing how expectations and variances compose lets you tune sysctls (`vm.overcommit_ratio`, `net.core.rmem_max`) to hit target latency or throughput goals.  
+- **Security**: Cryptographic primitives demand entropy that is *indistinguishable* from uniform. The distinction between `/dev/random` (blocking, entropy‑estimating) and `/dev/urandom` (non‑blocking, CSPRNG‑driven) is rooted in the probability of guessing internal state; misusing them can weaken key generation or nonce creation.  
+- **Observability**: Tools like `perf`, `eBPF`, and `ftrace` often rely on statistical sampling. Interpreting their output requires grasping concepts such as confidence intervals, the law of large numbers, and the effect of sample variance on measurement error.  
+
+By mastering the formal definitions (random variable, expectation, variance, independence, Bayes) and seeing how they manifest in concrete Linux mechanisms—device files, syscalls, scheduler metrics, and network queuing—you acquire the mental toolkit to **design, analyse, and troubleshoot** systems where randomness is not a nuisance but a fundamental resource. This bridges theory and practice, turning abstract probability into actionable insight for performance tuning, capacity planning, and secure system administration.

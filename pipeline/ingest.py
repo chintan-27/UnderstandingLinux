@@ -1,9 +1,10 @@
 """
-ingest.py — PDF → text chunks → SQLite
+ingest.py — PDF → text chunks → SQLite (+ embeddings)
 
 Usage:
     python ingest.py                  # process all PDFs in books/
     python ingest.py books/tlpi.pdf   # process one PDF
+    python ingest.py --embed-only     # only compute embeddings for existing chunks
 """
 
 import sys
@@ -11,12 +12,18 @@ import os
 import json
 import sqlite3
 import re
+import time
 from pathlib import Path
 
+import numpy as np
 import fitz  # pymupdf
+from openai import OpenAI
 from tqdm import tqdm
 
-from config import BOOKS_DIR, CHUNKS_DB, CHUNK_WORDS, CHUNK_OVERLAP
+from config import BOOKS_DIR, CHUNKS_DB, CHUNK_WORDS, CHUNK_OVERLAP, API_KEY, BASE_URL, EMBED_MODEL
+
+
+client = OpenAI(api_key=API_KEY, base_url=BASE_URL)
 
 
 def init_db(db_path: str) -> sqlite3.Connection:
@@ -28,6 +35,12 @@ def init_db(db_path: str) -> sqlite3.Connection:
             page     INTEGER,
             section  TEXT,
             text     TEXT NOT NULL
+        )
+    """)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS chunk_embeddings (
+            chunk_id INTEGER PRIMARY KEY REFERENCES chunks(id),
+            embedding BLOB NOT NULL
         )
     """)
     conn.execute("CREATE INDEX IF NOT EXISTS idx_book ON chunks(book)")
@@ -95,28 +108,75 @@ def ingest_pdf(pdf_path: str, conn: sqlite3.Connection):
     print(f"  {book}: {len(chunks)} chunks stored.")
 
 
+def embed_chunks(conn: sqlite3.Connection, batch_size: int = 20):
+    """Compute embeddings for all chunks that don't have one yet."""
+    rows = conn.execute("""
+        SELECT c.id, c.text FROM chunks c
+        LEFT JOIN chunk_embeddings ce ON c.id = ce.chunk_id
+        WHERE ce.chunk_id IS NULL
+    """).fetchall()
+
+    if not rows:
+        print("All chunks already have embeddings.")
+        return
+
+    print(f"Embedding {len(rows)} chunks in batches of {batch_size}...")
+    for i in tqdm(range(0, len(rows), batch_size), desc="embedding"):
+        batch = rows[i:i + batch_size]
+        texts = [text[:8000] for _, text in batch]
+        ids = [row_id for row_id, _ in batch]
+
+        for attempt in range(5):
+            try:
+                resp = client.embeddings.create(model=EMBED_MODEL, input=texts)
+                break
+            except Exception as e:
+                if attempt == 4:
+                    raise
+                wait = min(60 * (attempt + 1), 120)
+                tqdm.write(f"  Embed error (attempt {attempt+1}/5): {e} — retrying in {wait}s")
+                time.sleep(wait)
+
+        for row_id, emb_data in zip(ids, resp.data):
+            vec = np.array(emb_data.embedding, dtype=np.float32)
+            conn.execute(
+                "INSERT OR REPLACE INTO chunk_embeddings (chunk_id, embedding) VALUES (?, ?)",
+                (row_id, vec.tobytes())
+            )
+
+        conn.commit()
+        time.sleep(3.0)
+
+    print(f"Embedded {len(rows)} chunks.")
+
+
 def main():
     os.makedirs(os.path.dirname(CHUNKS_DB) or ".", exist_ok=True)
     conn = init_db(CHUNKS_DB)
 
-    if len(sys.argv) > 1:
-        pdfs = sys.argv[1:]
-    else:
-        pdfs = sorted(Path(BOOKS_DIR).rglob("*.pdf"))
+    embed_only = "--embed-only" in sys.argv
+    args = [a for a in sys.argv[1:] if not a.startswith("--")]
 
-    if not pdfs:
-        print(f"No PDFs found in {BOOKS_DIR}/. Put your book PDFs there and re-run.")
-        return
+    if not embed_only:
+        if args:
+            pdfs = args
+        else:
+            pdfs = sorted(Path(BOOKS_DIR).rglob("*.pdf"))
 
-    for pdf in pdfs:
-        ingest_pdf(str(pdf), conn)
+        if not pdfs:
+            print(f"No PDFs found in {BOOKS_DIR}/. Put your book PDFs there and re-run.")
+            return
 
-    total = conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
-    books = conn.execute("SELECT book, COUNT(*) FROM chunks GROUP BY book").fetchall()
-    print(f"\nTotal: {total} chunks across {len(books)} books")
-    for b, n in books:
-        print(f"  {b}: {n} chunks")
+        for pdf in pdfs:
+            ingest_pdf(str(pdf), conn)
 
+        total = conn.execute("SELECT COUNT(*) FROM chunks").fetchone()[0]
+        books = conn.execute("SELECT book, COUNT(*) FROM chunks GROUP BY book").fetchall()
+        print(f"\nTotal: {total} chunks across {len(books)} books")
+        for b, n in books:
+            print(f"  {b}: {n} chunks")
+
+    embed_chunks(conn)
     conn.close()
 
 

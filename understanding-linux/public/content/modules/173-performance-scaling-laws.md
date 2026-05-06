@@ -10,142 +10,323 @@ resources:
     title: "The Linux Programming Interface (Kerrisk)"
 ---
 
-## Why This Matters
+## Core Concepts  
+Performance scaling laws quantify how the execution time of a workload changes when computational resources (cores, threads, sockets) are increased.  
+The starting point is a simple decomposition of the serial execution time \(T_1\) into a *serial* portion that cannot be parallelised (\(T_s\)) and a *parallel* portion that can be divided among \(N\) processing elements (\(T_p\)):  
 
-When you add CPUs, threads, or nodes to a system, performance rarely scales the way you expect. Without a mathematical model for *why*, you will make bad capacity decisions: buying hardware that doesn't help, parallelizing code that can't benefit, or misattributing a bottleneck to the wrong subsystem. Amdahl's Law and Gustafson's Law give you the vocabulary to reason about these limits before you run a single benchmark. The goal is not to memorize formulas — it is to recognize, from first principles, why your eight-core system only runs 2× faster, and which lever to pull to fix it.
+\[
+T_1 = T_s + T_p
+\]
+
+Assuming ideal parallel execution (zero overhead, perfect load balance) the parallel portion scales as \(T_p/N\). The execution time on \(N\) processors is therefore  
+
+\[
+T(N) = T_s + \frac{T_p}{N}
+\]
+
+*Speedup* \(S(N)\) is the ratio of the baseline time to the parallel time:  
+
+\[
+S(N) = \frac{T_1}{T(N)} = \frac{T_s + T_p}{T_s + \frac{T_p}{N}}
+\]
+
+Introducing the *parallel fraction*  
+
+\[
+P = \frac{T_p}{T_s+T_p}\qquad\text{(so }1-P = \frac{T_s}{T_s+T_p}\text{)}
+\]
+
+and normalising \(T_1=1\) yields the classic forms below.
+
+### Amdahl’s Law (fixed workload)  
+If the problem size stays constant, only the parallel part can be shrunk by adding processors. Substituting the definitions above:
+
+\[
+\begin{aligned}
+S_{\text{Amdahl}}(N) 
+&= \frac{1}{(1-P) + \frac{P}{N}} \\
+&= \frac{1}{\text{serial fraction} + \frac{\text{parallel fraction}}{N}}
+\end{aligned}
+\]
+
+*Why it matters*: as \(N\to\infty\), the term \(\frac{P}{N}\to0\) and the speedup asymptotically approaches \(\frac{1}{1-P}\). No matter how many cores you add, the serial fraction caps the gain.
+
+### Gustafson’s Law (scaled workload)  
+Gustafson observed that in practice we increase the problem size to keep the parallel portion busy. Let the *scaled* parallel work be \(P' = P\cdot N\) (i.e., we do \(N\) times more parallel work while keeping the serial work unchanged). The parallel time on \(N\) processors becomes  
+
+\[
+T_{\text{scaled}}(N) = T_s + \frac{P\cdot T_1}{N}=T_s + P
+\]
+
+Normalising again to \(T_1=1\) gives  
+
+\[
+\begin{aligned}
+S_{\text{Gustafson}}(N) 
+&= \frac{T_s + P\cdot N}{T_s + P} \\
+&= N \cdot \frac{P}{(1-P) + \frac{P}{N}}
+\end{aligned}
+\]
+
+*Why it matters*: when the workload grows with \(N\), the serial fraction becomes a smaller *percentage* of the total work, allowing speedup that scales roughly linearly with \(N\).
 
 ---
 
-## Core Concepts
+## How It Works  
+The two laws arise from two different *assumptions* about what is held constant when we vary \(N\).
 
-### Serial Fraction: The Governor on Parallelism
+| Assumption | Amdahl | Gustafson |
+|------------|--------|-----------|
+| **Problem size** | Fixed (same absolute work) | Scales linearly with \(N\) (more work) |
+| **Serial work** | Constant absolute time | Constant absolute time (but becomes smaller fraction) |
+| **Parallel work** | Divided evenly among cores | Increased proportionally to keep each core busy |
 
-Every program contains work that must execute in sequence — initialization, final aggregation, acquiring a mutex, writing to a single log file. Call this the *serial fraction*, $\sigma$, expressed as a proportion of total single-threaded execution time. The parallel fraction is $(1 - \sigma)$.
+### Derivation details  
 
-The serial fraction is not always an implementation artifact you can engineer away. Some serial work is algorithmic: a prefix-sum reduction requires $O(\log N)$ sequential steps regardless of how you implement it. Some is architectural: DRAM refresh, PCIe enumeration at boot, journal commits in ext4. Knowing *which kind* of serial work you are dealing with determines whether optimization is possible.
+1. **Start from the time model**  
+   \[
+   T(N) = T_s + \frac{T_p}{N} + \underbrace{O_{\text{comm}}(N)}_{\text{optional overhead}}
+   \]
+   For the pure laws we set \(O_{\text{comm}}=0\).
 
-### Amdahl's Law: Fixed Problem Size
+2. **Amdahl** – keep \(T_1 = T_s+T_p\) constant.  
+   Divide numerator and denominator by \(T_1\) and substitute \(P = T_p/T_1\) to obtain the formula above.
 
-Amdahl's Law answers: given a fixed workload, how much faster does it get as we add processors?
+3. **Gustafson** – keep *parallel* time per processor constant:  
+   \[
+   \frac{T_p}{N} = \text{constant} \;\Longrightarrow\; T_p = P\cdot T_1 \cdot N
+   \]
+   Plug this into \(T(N) = T_s + T_p/N\) and simplify.
 
-$$S(N) = \frac{1}{\sigma + \dfrac{1 - \sigma}{N}}$$
-
-As $N \to \infty$, the denominator approaches $\sigma$, so the speedup ceiling is $1/\sigma$. This is a hard limit: a program that is 5% serial can never exceed $1/0.05 = 20\times$ speedup no matter how many cores you add. The 95% parallelizable portion completes in negligible time; you are left waiting on the 5%.
-
-Amdahl's Law is pessimistic by construction because it holds *total work constant*. You are asking: how much faster can I finish this exact computation?
-
-### Gustafson's Law: Scaled Problem Size
-
-Gustafson observed that in practice, when you get more hardware, you often solve a *bigger* problem in the same time — not the same problem faster. His law answers: if the problem size scales with $N$, what is the effective speedup relative to the same problem on one processor?
-
-If the serial work takes time $s$ and parallel work takes time $p$ on $N$ processors, the total time on $N$ processors is $T_N = s + p$. The same job on one processor would take $T_1 = s + Np$ (the parallel portion runs sequentially). Speedup is:
-
-$$S(N) = \frac{s + Np}{s + p} = N - \sigma(N - 1)$$
-
-where $\sigma = s/(s+p)$ is the serial fraction of the *scaled* workload. Because $p$ grows with $N$, the serial fraction shrinks as a proportion of total work, and speedup is nearly linear in $N$.
-
-The two laws are not contradictions — they model different regimes. Amdahl governs latency-bound tasks (finish this HTTP request faster). Gustafson governs throughput-bound tasks (process more data in the same time window, e.g., a nightly batch job, a climate simulation with a finer mesh, a database vacuum that processes more rows).
-
-### Contention and Coherence: What Neither Law Models
-
-Real systems degrade in two ways that Amdahl and Gustafson ignore:
-
-**Contention** — $N$ threads competing for a single resource (a spinlock, a memory bus, a NIC queue) create a serialization point. The expected wait time for a single-server queue under load $\rho$ is $W = \rho / (\mu(1 - \rho))$ by the M/M/1 model. As $\rho \to 1$ (the resource approaches saturation), wait time diverges. Adding threads increases $\rho$, which increases $W$, which eats the parallelism gain.
-
-**Coherence** — In NUMA and SMP systems, every write to a shared cache line triggers an invalidation broadcast to all other sockets or cores holding that line (MESI protocol). The overhead is $O(N)$ per write in the worst case. With $N$ cores all dirtying shared state, coherence traffic grows as $O(N^2)$, eventually saturating the interconnect.
-
-These produce a *knee* in the speedup curve: a value of $N$ beyond which adding cores reduces throughput. The Universal Scalability Law (USL) models both effects explicitly.
-
-### The Universal Scalability Law
-
-The USL extends Amdahl with two parameters:
-
-$$S(N) = \frac{N}{1 + \sigma(N-1) + \kappa N(N-1)}$$
-
-- $\sigma$ is the serialization penalty (same as Amdahl).
-- $\kappa$ is the coherence/crosstalk penalty: the cost of coordinating $N$ workers with each other, growing as $N(N-1)$ because each of the $N$ nodes must coordinate with each of the other $N-1$.
-
-When $\kappa > 0$, $S(N)$ reaches a maximum and then *decreases*. The peak occurs at:
-
-$$N_{\text{max}} = \sqrt{\frac{1 - \sigma}{\kappa}}$$
-
-This is a measurable phenomenon. Fit USL to throughput measurements at $N = 1, 2, 4, 8, \ldots$ and you can predict the knee before you buy the hardware.
+4. **Including overhead** (real‑world refinement)  
+   A common additive model is  
+   \[
+   O_{\text{comm}}(N) = \alpha + \beta\,(N-1)
+   \]
+   where \(\alpha\) is latency (fixed cost per sync) and \(\beta\) is per‑byte transfer cost scaled by message size.  
+   The speedup then becomes  
+   \[
+   S(N) = \frac{T_s+T_p}{T_s + \frac{T_p}{N} + \alpha + \beta(N-1)}
+   \]
+   This expression shows why adding cores beyond a certain point can *decrease* speedup.
 
 ---
 
-## How It Works
+## Worked Examples  
 
-### Amdahl in Practice
+### Example 1 – Amdahl’s Law (fixed problem)  
+A rendering pipeline has 75 % parallelisable code (\(P=0.75\)) and runs in 20 s on a single core.  
+Compute the speedup on 8 cores and the new wall‑clock time.
 
-A program takes 100 s on one core: 10 s of serial setup/teardown, 90 s of parallelizable computation. So $\sigma = 0.10$.
+**Solution**  
 
-$$S(8) = \frac{1}{0.10 + \frac{0.90}{8}} = \frac{1}{0.10 + 0.1125} = \frac{1}{0.2125} \approx 4.7\times$$
+\[
+\begin{aligned}
+S_{\text{Amdahl}}(8) &= \frac{1}{(1-0.75) + \frac{0.75}{8}} \\
+&= \frac{1}{0.25 + 0.09375} = \frac{1}{0.34375} \approx 2.91
+\end{aligned}
+\]
 
-The ceiling is $1/0.10 = 10\times$, unreachable at any core count. At $N = 64$:
+Parallel time:  
 
-$$S(64) = \frac{1}{0.10 + \frac{0.90}{64}} = \frac{1}{0.1141} \approx 8.8\times$$
+\[
+T(8) = \frac{T_1}{S}= \frac{20\text{ s}}{2.91}\approx 6.87\text{ s}
+\]
 
-You spend 54 extra cores to gain 4.1× over the 8-core case.
+*Interpretation*: Even with eight cores the serial 25 % caps the gain at ~2.9×.
 
-```python
-def amdahl_speedup(sigma: float, N: int) -> float:
-    """
-    sigma: serial fraction of single-threaded runtime (0 < sigma <= 1)
-    N:     number of processors
-    Returns: speedup relative to single processor
-    """
-    return 1.0 / (sigma + (1.0 - sigma) / N)
+---
 
-def amdahl_ceiling(sigma: float) -> float:
-    """Theoretical maximum speedup as N -> inf."""
-    return 1.0 / sigma
+### Example 2 – Gustafson’s Law (scaled problem)  
+A climate model spends 20 % of its time in serial I/O (\(1-P=0.20\)).  
+We run it on 16 cores and increase the grid resolution so that the *parallel* work per core stays the same as the original single‑core run.
 
-sigma = 0.05
-print(f"Ceiling at sigma={sigma}: {amdahl_ceiling(sigma):.1f}x")
-for n in [1, 2, 4, 8, 16, 64, 256, 1024]:
-    print(f"  N={n:5d}  S={amdahl_speedup(sigma, n):.2f}x")
+**Solution**  
+
+\[
+\begin{aligned}
+S_{\text{Gustafson}}(16) 
+&= 16 \times \frac{0.80}{0.20 + \frac{0.80}{16}} \\
+&= 16 \times \frac{0.80}{0.20 + 0.05} = 16 \times \frac{0.80}{0.25} \\
+&= 16 \times 3.2 = 51.2
+\end{aligned}
+\]
+
+If the original run took 100 s, the scaled run would finish in  
+
+\[
+T_{\text{scaled}} = \frac{T_1 \times (1-P + P)}{S}= \frac{100\text{ s}}{51.2}\approx 1.95\text{ s}
+\]
+
+*Interpretation*: By enlarging the problem we keep each core busy, yielding ~51× speedup.
+
+---
+
+### Example 3 – Including Communication Overhead  
+Suppose a parallel FFT library has \(P=0.90\), \(\alpha = 0.005\) s (barrier latency) and \(\beta = 0.0002\) s per core (cost of exchanging halo data).  
+Calculate speedup on 4, 16, and 64 cores.
+
+**Solution** (using the overhead model)
+
+\[
+S(N)=\frac{1}{(1-P)+\frac{P}{N}+\alpha+\beta(N-1)}
+\]
+
+| \(N\) | Denominator | \(S(N)\) |
+|------|-------------|----------|
+| 4    | \(0.1 + 0.225 + 0.005 + 0.0002\times3 = 0.3356\) | \(2.98\) |
+| 16   | \(0.1 + 0.05625 + 0.005 + 0.0002\times15 = 0.16925\) | \(5.91\) |
+| 64   | \(0.1 + 0.0140625 + 0.005 + 0.0002\times63 = 0.1330625\) | \(7.52\) |
+
+*Interpretation*: Beyond ~16 cores the latency and per‑core exchange cost dominate, limiting returns.
+
+---
+
+## Common Mistakes  
+
+| # | Mistake | Why it’s Wrong | Consequence |
+|---|---------|----------------|-------------|
+| 1 | Treating \(P\) as a *percentage* (e.g., using 90 instead of 0.90) in the formulas | The derivation assumes a *fraction* of total time; inserting 90 inflates the denominator by a factor of 100 | Speedup values become nonsensical (often < 1) |
+| 2 | Assuming Amdahl’s law predicts *linear* scaling when \(P\approx 1\) | Even with \(P=0.99\), the asymptote is \(1/(1-P)=100\); you never exceed that no matter how many cores | Over‑optimistic capacity planning, leading to under‑provisioned systems |
+| 3 | Applying Gustafson’s law when the problem size cannot be increased (e.g., fixed‑size database query) | Gustafson’s premise is that you scale the work; if you cannot, the serial fraction stays the same proportionally, and Amdahl is the correct bound | Misleading speedup expectations, wasted effort on adding cores |
+| 4 | Ignoring *load imbalance* and treating all cores as equally busy | The model assumes perfect division of \(T_p\); real static scheduling can leave some cores idle while others finish | Measured speedup lower than predicted; need dynamic scheduling or work‑stealing |
+| 5 | Using wall‑clock time from `time` command without separating *user* vs *sys* time | Parallel programs may spend extra time in kernel synchronization (futexes, etc.) that appears as sys time, skewing the perceived speedup | Incorrect attribution of overhead to the application algorithm |
+| 6 | Forgetting to pin threads/cores, letting the scheduler migrate tasks | Migration incurs cache‑invalidations and extra latency, effectively increasing \(\alpha\) in the overhead model | Observed speedup degrades with core count, especially on NUMA machines |
+| 7 | Assuming \(N\) equals the number of *logical* processors (hyper‑threads) without checking sharing of execution resources | Hyper‑threads share pipelines, caches, and bandwidth; the effective \(N\) for compute‑bound work is lower | Overestimation of speedup for HT‑enabled CPUs |
+
+---
+
+## Exercises  
+
+### Easy  
+1. A program has 60 % parallelisable code. Using Amdahl’s law, compute the theoretical speedup on 4 and 32 cores.  
+2. For the same program, use Gustafson’s law to find the speedup on 4 and 32 cores assuming the workload scales with core count.
+
+### Medium  
+3. Derive the number of cores \(N\) required to achieve at least 8× speedup with Amdahl’s law when \(P=0.85\). Show the algebraic steps.  
+4. A parallel application measures a speedup of 5.2 on 8 cores. Assuming Amdahl’s law holds, estimate the parallel fraction \(P\).  
+
+### Hard  
+5. Extend the speedup model to include a latency term \(\alpha = 0.001\) s and a per‑core bandwidth term \(\beta = 0.00005\) s. For \(P=0.92\), determine the core count \(N\) that maximises speedup (treat \(N\) as continuous, differentiate, solve for \(N\)).  
+6. Write a single C program that (a) measures the execution time of a user‑defined workload with `clock_gettime(CLOCK_MONOTONIC, …)`, (b) varies the number of OpenMP threads from 1 to the number of hardware cores, (c) prints the observed speedup, and (d) compares it to the Amdahl prediction using the measured serial fraction from the 1‑thread run.  
+
+---
+
+## Linux Connection  
+
+Linux provides explicit interfaces to control and observe the resources that the scaling laws model.
+
+### Core affinity & placement  
+
+```c
+#define _GNU_SOURCE
+#include <sched.h>
+#include <stdio.h>
+#include <stdlib.h>
+
+int main(void) {
+    cpu_set_t set;
+    CPU_ZERO(&set);
+    /* bind to cores 0-3 */
+    for (int i = 0; i < 4; ++i) CPU_SET(i, &set);
+    if (sched_setaffinity(0, sizeof(set), &set) == -1) {
+        perror("sched_setaffinity");
+        exit(EXIT_FAILURE);
+    }
+    /* now do parallel work … */
+    return 0;
+}
 ```
 
+*Why*: Prevents the scheduler from migrating threads, removing a source of variability in the effective \(N\) and keeping cache hierarchy stable.
+
+### Shell‑level affinity  
+
+```bash
+# Run ./app on cores 4-7 only
+taskset -c 4-7 ./app
+
+# Verify placement
+ps -o pid,taskset -p $(pgrep -f ./app)
 ```
-Ceiling at sigma=0.05: 20.0x
-  N=    1  S=1.00x
-  N=    2  S=1.90x
-  N=    4  S=3.48x
-  N=    8  S=5.93x
-  N=   16  S=8.83x
-  N=   64  S=13.91x
-  N=  256  S=17.87x
-  N= 1024  S=19.16x
+
+### Memory policy (NUMA)  
+
+```bash
+# Allocate memory on node 0 and run on node 0 CPUs
+numactl --cpunodebind=0 --membind=0 ./app
 ```
 
-The marginal return from doubling cores falls off sharply past the knee. Going from 1→2 buys you 0.90×; going from 512→1024 buys you roughly 0.10×.
+Inspect NUMA statistics:
 
-### Gustafson in Practice
+```bash
+numastat -p $(pgrep -f ./app)
+```
 
-A climate model on 1 node runs a 100 km grid in 1 hour. On 64 nodes you run a 12.5 km grid (64× the cells, same wall time). Serial overhead — reading the initial conditions file, writing the compressed NetCDF output — stays fixed at 2 minutes. So $\sigma = 2/60 \approx 0.033$ of the *scaled* runtime.
+### Measuring parallel overhead  
 
-$$S(64) = 64 - 0.033 \times (64 - 1) = 64 - 2.08 \approx 61.9\times$$
+`perf` can capture barrier latency and context‑switch costs:
 
-The equivalent single-node job would take $61.9$ hours. You did not run that job faster; you ran a qualitatively better job in the same time. The distinction matters for procurement decisions.
+```bash
+# Count synchronization events (futexes) and cycles
+perf stat -e futex,context-switches,cycles,instructions ./app
+```
 
-### The USL and the Scalability Cliff
+The `futex` count gives a proxy for \(\alpha\); dividing total futex time by the number of cores yields an estimate of per‑core latency.
 
-Fit the USL to empirical data to extract $\sigma$ and $\kappa$:
+### OpenMP affinity  
 
-```python
-import numpy as np
-from scipy.optimize import curve_fit
+```bash
+export OMP_NUM_THREADS=16
+export KMP_AFFINITY=granularity=fine,compact,1,0
+./omp_app
+```
 
-def usl(N, sigma, kappa):
-    return N / (1 + sigma * (N - 1) + kappa * N * (N - 1))
+`KMP_AFFINITY` controls how OpenMP maps threads to cores, directly influencing the effective \(N\) in the scaling equations.
 
-# Example throughput measurements (requests/sec normalized to N=1)
-N_vals   = np.array([1, 2, 4, 8, 16, 32, 64])
-throughput = np.array([1.0, 1.8, 3.1, 4.9, 6.2, 6.8, 5.9])  # note drop at 64
+### MPI rank placement  
 
-(sigma_fit, kappa_fit), _ = curve_fit(usl, N_vals, throughput,
-                                       p0=[0.05, 0.001],
-                                       bounds=([0, 0], [1, 1]))
+```bash
+# Spread ranks evenly across two sockets
+mpirun -np 24 --bind-to core --map-by socket ./mpi_app
+```
 
-N_peak = np.sqrt((1 - sigma_fit) / kappa_fit)
-print(f"sigma={sigma_fit:.4f}  kappa={kappa_fit:.6
+`--map-by` and `--bind-to` let you enforce the *processor count* \(N\) used in the formulas.
+
+### Verifying the model  
+
+A quick script to collect speedup vs. core count and fit Amdahl’s law:
+
+```bash
+#!/usr/bin/env bash
+MAX_CORES=$(nproc)
+for n in $(seq 1 $MAX_CORES); do
+    export OMP_NUM_THREADS=$n
+    /usr/bin/time -f "%e" ./omp_app 2>time_$n.txt
+done
+paste -d, <(seq 1 $MAX_CORES) <(cat time_*.txt) > speedup.csv
+# Now fit S = 1/((1-P)+P/n) using e.g. Python's scipy.optimize.curve_fit
+```
+
+The resulting fit yields an empirical \(P\) that can be compared to the theoretical fraction obtained from profiling (`perf record -g ./omp_app`).
+
+---
+
+## Why This Matters  
+
+Performance scaling laws are not abstract formulae; they are the *first‑principles* lens through which we judge whether adding more silicon will actually improve a workload’s execution time.  
+
+- **Amdahl’s law** tells us the *hard ceiling* imposed by any serial fraction—whether it be a legacy library call, a global lock, or a sequential I/O stage. Knowing that ceiling guides engineering effort: attack the serial part (e.g., lock‑free algorithms, asynchronous I/O) rather than blindly throwing cores at the problem.  
+- **Gustafson’s law** shifts the focus to *problem scaling*: in many HPC and data‑analytics contexts we can increase resolution, ensemble size, or batch length to keep each core busy. Recognising when this is possible lets us size clusters and allocate budgets effectively.  
+- **Communication‑overhead extensions** expose the hidden cost of moving data between cores or sockets. On modern NUMA machines the latency term \(\alpha\) and per‑byte term \(\beta\) often dominate beyond a modest core count, explaining why simply enabling Hyper‑Threading can sometimes *decrease* throughput.  
+- **Linux‑specific tooling** (taskset, numactl, perf, OpenMP/MPI affinity settings) gives us the knobs to realise the assumptions of the models—fixing core placement, controlling memory locality, and measuring the very quantities (serial fraction, barrier latency, synchronization events) that appear in the equations.  
+
+By internalising these laws, a developer moves from “adding more cores makes it faster” to a disciplined process:  
+
+1. **Profile** to measure \(T_s\) and \(T_p\) (or directly obtain \(P\)).  
+2. **Choose** the appropriate scaling model (fixed vs. scaled workload).  
+3. **Predict** speedup for a target core count, including overhead terms.  
+4. **Validate** with actual runs and affinity‑controlled experiments.  
+5. **Iterate**—reduce \(T_s\), improve data locality, or redesign the algorithm to shift work into the parallel domain.  
+
+This loop is the essence of high‑performance software engineering on Linux, and it rests squarely on the solid mathematical foundation laid out by Amdahl and Gustafson.

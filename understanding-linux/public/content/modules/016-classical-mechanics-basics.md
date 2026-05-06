@@ -10,158 +10,187 @@ resources:
     title: "Introduction to Solid State Physics (Kittel)"
 ---
 
-## Why This Matters
-
-Every physical simulation, every thermal throttling decision in a CPU driver, and every vibration sensor in a hard drive protection system runs on classical mechanics. Conservation of momentum explains why a rocket accelerates in vacuum — and why a process cannot "borrow" CPU time without another process losing it. Energy conservation explains why a spring stops oscillating: the energy hasn't vanished, it has become disordered atomic vibration, which is exactly what thermal noise in your hardware is. These are not analogies. They are the same physics at different scales.
-
----
-
 ## Core Concepts
+Classical mechanics describes the deterministic evolution of a system of particles under forces, grounded in three empirical laws formulated by Newton.  
+- **First law (inertia):** A body remains at rest or in uniform motion unless acted upon by a net force. This defines an *inertial reference frame*—a coordinate system in which Newton’s second law holds without fictitious forces.  
+- **Second law (momentum):** The net force equals the time‑rate of change of linear momentum,  
+  $$\mathbf{F} = \frac{d\mathbf{p}}{dt},\qquad \mathbf{p}=m\mathbf{v}.$$  
+  For constant mass this reduces to the familiar $\mathbf{F}=m\mathbf{a}$, linking force directly to the second time‑derivative of position.  
+- **Third law (action‑reaction):** Forces occur in equal‑and‑opposite pairs, guaranteeing conservation of momentum for an isolated system.  
 
-### Force and Newton's Second Law
+From these laws we derive the kinematic and dynamic quantities used to describe motion.  
 
-Force is the rate of change of momentum:
+**Kinematics** is the geometric description of motion, independent of forces. For a particle with trajectory $\mathbf{r}(t)$:  
 
-$$F = \frac{dp}{dt}$$
+- Displacement: $\Delta\mathbf{r} = \mathbf{r}(t)-\mathbf{r}(t_0)$  
+- Velocity (instantaneous): $\mathbf{v}(t)=\dfrac{d\mathbf{r}}{dt}$  
+- Acceleration: $\mathbf{a}(t)=\dfrac{d\mathbf{v}}{dt}=\dfrac{d^2\mathbf{r}}{dt^2}$  
 
-For constant mass this reduces to $F = ma$, but the momentum form is prior. It correctly handles variable-mass systems — a rocket expelling propellant, a raindrop accumulating mass — without modification. The quantity $J = \int F \, dt = \Delta p$ is **impulse**: a brief large force and a long small force are interchangeable if their time-integrals are equal.
+These are vector quantities; in one dimension we drop the bold notation and work with signed scalars.  
 
-### Conservation of Momentum
+**Dynamics** applies the second law to relate forces to motion. Besides force we introduce:  
 
-Newton's Third Law states that for every internal force $F_{12}$ particle 1 exerts on particle 2, there is an equal and opposite force $F_{21} = -F_{12}$. Therefore:
+- Impulse: $\mathbf{J}=\int_{t_0}^{t_1}\mathbf{F}\,dt = \Delta\mathbf{p}$  
+- Work: $W=\int_{\mathbf{r}_0}^{\mathbf{r}_1}\mathbf{F}\cdot d\mathbf{r}$  
 
-$$\frac{dp_1}{dt} + \frac{dp_2}{dt} = F_{12} + F_{21} = 0$$
+When the force is conservative it can be written as the negative gradient of a scalar potential $U(\mathbf{r})$: $\mathbf{F}=-\nabla U$.  
 
-$$\frac{d(p_1 + p_2)}{dt} = 0$$
+**Energy** follows from the work‑energy theorem. Integrating Newton’s second law along the trajectory gives  
 
-Total momentum is conserved. This is not an assumption — it is a direct consequence of Newton's Third Law. The constraint is that *no net external force* acts. Internal forces, regardless of their complexity, cancel exactly.
+$$W = \int \mathbf{F}\cdot d\mathbf{r}
+    = \int m\mathbf{a}\cdot d\mathbf{r}
+    = m\int \frac{d\mathbf{v}}{dt}\cdot\mathbf{v}\,dt
+    = \frac12 m\bigl(v^2-v_0^2\bigr)
+    = \Delta K,$$  
 
-### Conservative Forces and Potential Energy
+where kinetic energy is defined as $K=\frac12 mv^2$. For a conservative force, $W=-\Delta U$, so  
 
-A force is **conservative** if the work it does between two points is path-independent. This is equivalent to the force having zero curl: $\nabla \times F = 0$. For such forces, a scalar potential $U(\mathbf{r})$ exists satisfying:
+$$\Delta K + \Delta U = 0\quad\Longrightarrow\quad E = K+U = \text{constant}.$$  
 
-$$\mathbf{F} = -\nabla U$$
-
-The sign is not arbitrary: $\mathbf{F}$ points in the direction of decreasing $U$, so moving with the force releases potential energy as kinetic energy. The reference level $U = 0$ can be placed anywhere because conservation depends only on differences:
-
-$$\Delta T = -\Delta U \implies T + U = \text{const}$$
-
-Non-conservative forces (friction, drag) do path-dependent work. They don't violate energy conservation — they transfer energy into microscopic degrees of freedom that we stop tracking.
-
-### Equilibrium and Small Oscillations
-
-At a potential minimum, $\frac{dU}{dr} = 0$: the force is zero. Displacing the system slightly produces a restoring force because the potential is curving upward. Taylor-expanding any smooth $U(x)$ around its minimum $x_0$:
-
-$$U(x) \approx U(x_0) + \frac{1}{2}U''(x_0)(x - x_0)^2$$
-
-The linear term vanishes because $x_0$ is a minimum. The effective spring constant is $k = U''(x_0)$, giving angular frequency:
-
-$$\omega = \sqrt{\frac{k}{m}} = \sqrt{\frac{U''(x_0)}{m}}$$
-
-This is universal: atomic bonds, pendulums, quartz oscillators, LC circuits — near any stable equilibrium, every system reduces to the same equation. The approximation breaks down when displacement is large enough that higher-order terms in the Taylor expansion become significant.
-
-### Thermal Motion
-
-Heat is the kinetic energy of random, phase-incoherent microscopic motion. The equipartition theorem assigns $\frac{1}{2}k_B T$ of average energy to each quadratic degree of freedom, where $k_B = 1.38 \times 10^{-23}\ \text{J/K}$. A monatomic ideal gas atom has three translational degrees of freedom, giving average kinetic energy $\frac{3}{2}k_B T$.
-
-When a macroscopic oscillator damps out, energy flows into these incoherent microscopic modes. The total energy is conserved; we lose track of it because we stop counting $\sim 10^{23}$ degrees of freedom.
+Thus mechanical energy is conserved iff all forces derive from a potential (no friction, air resistance, etc.).  
 
 ---
 
 ## How It Works
+### Kinematic equations for constant acceleration  
+Assume $a$ is constant. Starting from the definitions  
 
-### Rocket Propulsion
+$$a = \frac{dv}{dt}\quad\Longrightarrow\quad v(t)=v_0 + at\tag{1}$$  
 
-A rocket of mass $M$ at rest ejects a mass element $dm$ at exhaust velocity $V_e$ (relative to the rocket). Momentum conservation over this ejection:
+Integrate once more:  
 
-$$0 = -V_e \, dm + M \, dv$$
+$$v = \frac{ds}{dt}\quad\Longrightarrow\quad 
+s(t)=s_0 + v_0t + \frac12 a t^2\tag{2}$$  
 
-$$dv = V_e \frac{dm}{M}$$
+Eliminate $t$ between (1) and (2):  
 
-Integrating from initial mass $M_0$ to final mass $M_f$:
+$$v^2 = v_0^2 + 2a\,(s-s_0)\tag{3}$$  
 
-$$\Delta v = V_e \ln\left(\frac{M_0}{M_f}\right)$$
+These three relations are sufficient to solve any one‑dimensional constant‑acceleration problem.  
 
-This is the **Tsiolkovsky rocket equation**. The logarithm is brutal: to double $\Delta v$, you must square the mass ratio. To reach Earth orbit ($\Delta v \approx 9.4\ \text{km/s}$) with a chemical engine ($V_e \approx 4.5\ \text{km/s}$), the mass ratio is $e^{9.4/4.5} \approx 8.1$ — over 87% of launch mass must be propellant. No air is involved anywhere in the derivation. The rocket pushes against its own ejected mass, which is why vacuum operation is not a special case; it is the baseline.
+### Work‑energy derivation  
+The infinitesimal work done by a force $\mathbf{F}$ over displacement $d\mathbf{r}$ is $dW=\mathbf{F}\cdot d\mathbf{r}$. Using $\mathbf{F}=m\mathbf{a}$ and $d\mathbf{r}=\mathbf{v}dt$,  
 
-### The Interatomic Potential
+$$dW = m\mathbf{a}\cdot\mathbf{v}\,dt
+    = m\frac{d\mathbf{v}}{dt}\cdot\mathbf{v}\,dt
+    = \frac{d}{dt}\!\left(\frac12 m v^2\right)dt
+    = dK.$$  
 
-The Lennard-Jones potential models the interaction between two neutral atoms:
+Integrating from state 0 to 1 yields $W=K_1-K_0$. If $\mathbf{F}=-\nabla U$, then $W=-(U_1-U_0)$ and $K+U$ is invariant.  
 
-$$U(r) = 4\varepsilon\left[\left(\frac{\sigma}{r}\right)^{12} - \left(\frac{\sigma}{r}\right)^{6}\right]$$
+### Gravitational potential near Earth’s surface  
+For a uniform gravitational field $\mathbf{F}=-mg\hat{\mathbf{y}}$, the potential satisfying $-\nabla U = \mathbf{F}$ is  
 
-The $r^{-6}$ attractive term arises from induced dipole–dipole (van der Waals) interaction. The $r^{-12}$ repulsive term is a computationally convenient approximation to Pauli exclusion repulsion (the true repulsion is exponential, but $r^{-12}$ is cheap to compute as the square of $r^{-6}$).
+$$U(y)=mgy + C,$$  
 
-```
-U(r)
-  |
-  |   \
-  |    \
---+-----\-----------  0
-  |      \      /
-  |       \    /
-  |        \  /   ← minimum at r = 2^(1/6)σ ≈ 1.12σ
-  |         \/
-  |
-  +----------------------------> r
-```
+where the additive constant $C$ is irrelevant; only differences matter.  
 
-At the minimum, $F = -dU/dr = 0$: equilibrium bond length. Because the repulsive wall is steeper than the attractive tail, the potential minimum is asymmetric. At higher energy, the atom spends more time on the shallow attractive side than the steep repulsive side, so the time-averaged position shifts outward — this is the mechanism of **thermal expansion**.
+---
 
-### Simple Harmonic Motion
+## Worked Examples
+### Example 1 – Constant velocity  
+A car travels at $v_0=30\ \text{m/s}$ with zero acceleration for $t=10\ \text{s}$.  
 
-A mass $m$ displaced by $x$ from equilibrium on a spring of constant $k$:
+1. Since $a=0$, Eq. (2) reduces to $s = s_0 + v_0 t$.  
+2. Take $s_0=0$ (origin at start).  
+3. $s = 0 + (30\ \text{m/s})(10\ \text{s}) = 300\ \text{m}$.  
 
-$$m\ddot{x} = -kx \implies \ddot{x} + \omega^2 x = 0, \quad \omega = \sqrt{\frac{k}{m}}$$
+**Answer:** $300\ \text{m}$.  
 
-Solution: $x(t) = A\cos(\omega t + \phi)$. The period is $T = 2\pi/\omega$, independent of amplitude — this is what makes harmonic oscillators useful as clocks.
+### Example 2 – Constant force on a block  
+A $5\ \text{kg}$ block is pulled by a horizontal force $F=10\ \text{N}$, starting from rest.  
 
-Energy oscillates between kinetic and potential at twice the oscillation frequency, but the total is constant:
+1. Acceleration from Newton’s second law:  
+   $$a = \frac{F}{m} = \frac{10\ \text{N}}{5\ \text{kg}} = 2\ \text{m/s}^2.$$  
+2. Velocity after $t=2\ \text{s}$ using Eq. (1):  
+   $$v = v_0 + at = 0 + (2\ \text{m/s}^2)(2\ \text{s}) = 4\ \text{m/s}.$$  
+3. Displacement using Eq. (2):  
+   $$s = 0 + 0\cdot t + \frac12 (2\ \text{m/s}^2)(2\ \text{s})^2
+     = \frac12 \cdot 2 \cdot 4 = 4\ \text{m}.$$  
 
-$$E = \frac{1}{2}mv^2 + \frac{1}{2}kx^2 = \frac{1}{2}kA^2$$
+**Answer:** $a=2\ \text{m/s}^2$, $v=4\ \text{m/s}$ after $2\ \text{s}$, having traveled $4\ \text{m}$.  
 
-```python
-import numpy as np
+### Example 3 – Falling ball (energy conversion)  
+A $2\ \text{kg}$ ball is dropped from rest at height $h=10\ \text{m}$. Take $g=9.8\ \text{m/s}^2$.  
 
-k = 1.0
-m = 1.0
-omega = np.sqrt(k / m)
-A = 1.0
+1. Potential energy at release:  
+   $$U_i = mgh = (2\ \text{kg})(9.8\ \text{m/s}^2)(10\ \text{m}) = 196\ \text{J}.$$  
+2. Just before impact the height is zero, so $U_f=0$. Mechanical energy conservation gives $K_f = U_i - U_f = 196\ \text{J}$.  
+3. Verify via kinematics: final speed from Eq. (3) with $v_0=0$, $a=g$, $s-s_0 = h$:  
+   $$v^2 = 0 + 2gh = 2(9.8)(10) = 196\ \text{(m/s)}^2
+     \;\Longrightarrow\; v = \sqrt{196}=14\ \text{m/s}.$$  
+   Then $K_f = \tfrac12 m v^2 = \tfrac12 (2)(196)=196\ \text{J}$, matching the energy method.  
 
-t = np.linspace(0, 4 * np.pi / omega, 10000)
-x = A * np.cos(omega * t)
-v = -A * omega * np.sin(omega * t)
+**Answer:** Kinetic energy just before impact $=196\ \text{J}$ (speed $=14\ \text{m/s}$).  
 
-KE = 0.5 * m * v**2
-PE = 0.5 * k * x**2
-E_total = KE + PE
-E_expected = 0.5 * k * A**2
+---
 
-print(f"Expected total energy:          {E_expected:.6f}")
-print(f"Mean computed total energy:     {np.mean(E_total):.6f}")
-print(f"Max deviation from E_expected:  {np.max(np.abs(E_total - E_expected)):.2e}")
-# Deviation should be ~1e-15 (floating point noise), not zero error by construction.
-# If you see larger values, your time step is too coarse.
-```
+## Common Mistakes
+| # | Misconception | Why it’s wrong | Correct approach |
+|---|---------------|----------------|------------------|
+| 1 | **Using $F=ma$ for variable‑mass systems** (e.g., a rocket ejecting fuel). | Newton’s second law in the form $F=ma$ assumes constant mass. For changing mass the correct law is $F = \frac{dp}{dt}= m a + v_{\text{rel}}\dot{m}$, where $v_{\text{rel}}$ is the exhaust velocity relative to the body. | Apply the momentum form $F=\dot{p}$ or include the thrust term $v_{\text{rel}}\dot{m}$ explicitly. |
+| 2 | **Assuming mechanical energy is always conserved** even when friction or air resistance acts. | Non‑conservative forces do work that converts mechanical energy into internal (thermal) energy; the work‑energy theorem reads $\Delta K = W_{\text{cons}} + W_{\text{nc}}$, with $W_{\text{nc}}\neq0$. | Compute work done by non‑conservative forces separately, or include a dissipated energy term $E_{\text{th}}$ in the energy balance. |
+| 3 | **Using $s = vt$ when acceleration is present** (treating velocity as constant). | The relation $s=vt$ holds only for constant $v$. If $a\neq0$, the average velocity over the interval is $\bar v = (v_0+v)/2$, and $s = \bar v\,t$. | Use the full kinematic equations (Eqs. 1‑3) or integrate $v(t)$ when $a$ varies. |
+| 4 | **Believing potential energy depends on the path taken**. | Potential energy is defined only for conservative forces, for which the work done is path‑independent. For non‑conservative forces no scalar potential exists; attempting to assign one leads to contradictions. | Check whether $\nabla\times\mathbf{F}=0$ (in 3‑D) or $\partial F_x/\partial y = \partial F_y/\partial x$ (in 2‑D). If not, treat the force as non‑conservative and use work‑energy directly. |
 
-### Angular Momentum
+---
 
-For a particle at position $\mathbf{r}$ with momentum $\mathbf{p}$:
+## Exercises
+1. **Easy** – A train accelerates uniformly from rest at $a=1.5\ \text{m/s}^2$.  
+   (a) How far does it travel in $t=20\ \text{s}$?  
+   (b) What is its speed at that instant?  
 
-$$\mathbf{L} = \mathbf{r} \times \mathbf{p}$$
+2. **Medium** – A $12\ \text{kg}$ crate is pulled across a horizontal floor by a force $F=50\ \text{N}$ applied $30^\circ$ above the horizontal. The coefficient of kinetic friction is $\mu_k=0.25$. The crate starts from rest.  
+   (a) Determine the net horizontal acceleration.  
+   (b) Find the speed after $t=5\ \text{s}$.  
 
-In 2D: $L = xp_y - yp_x$. Only the momentum component *perpendicular* to the radial direction contributes. A particle moving radially toward or away from an axis has $L = 0$ about that axis regardless of its speed. Angular momentum is conserved when no net external torque acts — the same structure as linear momentum, with torque $\boldsymbol{\tau} = \mathbf{r} \times \mathbf{F} = d\mathbf{L}/dt$.
+3. **Hard** – A particle of mass $m=0.5\ \text{kg}$ moves along the $x$‑axis under the Hooke‑law force $F(x) = -k x$ with $k=200\ \text{N/m}$. It is released from rest at $x=0.10\ \text{m}$.  
+   (a) Using energy conservation, compute the speed when the particle passes the equilibrium point $x=0$.  
+   (b) What is the period of small‑oscillation motion? (You may quote the result $T=2\pi\sqrt{m/k}$ after verifying it from the energy solution.)  
 
 ---
 
 ## Linux Connection
+Classical mechanics is not just abstract theory; it appears in concrete Linux tools, kernel interfaces, and measurement techniques.
 
-### CPU Thermal Throttling
+### 1. High‑resolution timing with `clock_gettime`
+The monotonic clock provides the time base needed for numerical integration of $s(t)$, $v(t)$, etc.
 
-The Linux kernel's `cpufreq` subsystem implements thermal management through `drivers/thermal/` and `drivers/cpufreq/`. When junction temperature approaches $T_J^{\text{max}}$, the thermal governor reduces clock frequency to cut power dissipation. Dynamic power scales as:
+```c
+/* timer.c – prints monotonic time with nanosecond resolution */
+#define _POSIX_C_SOURCE 199309L
+#include <time.h>
+#include <stdio.h>
+int main(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    printf("%.9f s\n", ts.tv_sec + ts.tv_nsec * 1e-9);
+}
+```
+Compile and run:  
+```bash
+gcc -Wall -O2 timer.c -o timer
+./timer
+```
+The output can be fed into a simulation loop that updates $s$ using Eq. (2).
 
-$$P = C V^2 f$$
+### 2. Reading process CPU time from `/proc`
+The file `/proc/<pid>/stat` contains user and system times (in clock ticks). Converting to seconds yields the effective “action” integral $\int \mathbf{F}\cdot d\mathbf{r}$ for a process (approximated by CPU cycles).
 
-where $C$ is switching capacitance, $V$ is supply voltage, and $f$ is clock frequency. Halving the frequency halves dynamic power, but the chip also runs cooler, allowing voltage reduction — since $V$ scales roughly with $f$ to maintain timing margins, power scales closer to $f^3$ in practice.
+```bash
+pid=$$                              # current shell PID
+clktck=$(getconf CLK_TCK)           # ticks per second (usually 100)
+awk -v clk=$clktck '
+    {printf "utime=%.3f s, stime=%.3f s\n", $14/clk, $15/clk}
+' /proc/$pid/stat
+```
+If you run a CPU‑bound program, you can see how the accumulated user time grows linearly with the simulated “force” (work) performed.
 
-The thermal
+### 3. Performance counters with `perf`
+A tiny program that numerically integrates $v = v_0 + at$ lets us see how many CPU cycles are spent per integration step—directly linking the **force‑acceleration** cycle to hardware work.
+
+`simulate.c`:
+```c
+#include <stdio.h>
+int main(void) {
+    double s = 0.0, v = 0.0, a =

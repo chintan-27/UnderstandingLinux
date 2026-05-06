@@ -10,161 +10,430 @@ resources:
     title: "Computer Organization and Design (Patterson and Hennessy)"
 ---
 
-## Why This Matters
+## Core Concepts  
+### Hardware Description Languages (HDLs) as Precise Behavioral Specifications  
+An HDL is not a general‑purpose programming language; it is a **formal notation** that maps directly onto **gate‑level netlists** and **timing‑aware hardware**. Every construct has a well‑defined semantics in terms of **signal drivers**, **update semantics**, and **delta‑cycle scheduling**. This precision enables two distinct flows:  
 
-Every CPU, GPU, and peripheral on your Linux machine was designed in an HDL before a single transistor was fabricated. When you write a device driver, you are writing software that talks to a register map someone defined in Verilog or VHDL. Understanding how that hardware was *specified* tells you why certain register fields are read-only, why a status bit requires a write-1-to-clear sequence, why a DMA descriptor must be cache-line-aligned, and why the datasheet says "wait 3 clock cycles after enabling before reading status." These are not arbitrary API choices — they are direct consequences of the underlying RTL.
+* **Simulation** – an event‑driven scheduler evaluates assignments in zero‑time delta cycles until a fixed point is reached, then advances simulated time.  
+* **Synthesis** – a set of rewrite rules transforms the abstract syntax tree (AST) into a technology‑mapped netlist obeying **area**, **power**, and **timing** constraints.  
 
-A bug caught in simulation costs one engineer-day. The same bug after tape-out costs a silicon respin: six to twelve weeks of fab time and hundreds of thousands of dollars. HDLs exist to make hardware describable, simulatable, and formally verifiable before anything physical exists.
+The two dominant HDLs differ in philosophy:  
 
----
+| Feature | Verilog‑2001/SystemVerilog | VHDL‑2008 |
+|---------|---------------------------|----------|
+| Type system | weakly typed, implicit `logic`/`wire`/`reg` | strongly typed, explicit subtypes |
+| Concurrency model | `always`/`initial` blocks with sensitivity lists | `process` with explicit sensitivity |
+| Package system | `packages` (SystemVerilog) | `packages` + `libraries` |
+| Assertions | `assert property` (SVA) | `assert` + `cover` statements |
 
-## Core Concepts
+Understanding these differences matters when mixing languages in a **co‑simulation** environment (e.g., Verilog testbench driving a VHDL DUT).
 
-### HDLs Are Not Programming Languages
+### Modules, Entities, and Hierarchy  
+A **module** (Verilog) or **entity/architecture** (VHDL) declares a **interface** (ports) and a **body** that defines concurrent statements. Hierarchy is created by **instantiation**:
 
-A program is a sequence of instructions that a processor executes one at a time. An HDL is a *description of concurrent hardware*. When you write:
-
-```systemverilog
-assign y = a & b;
-```
-
-you are not scheduling an AND operation — you are declaring that the wire `y` is permanently connected to the AND of wires `a` and `b`. Every `assign` statement in a module is active simultaneously, always. There is no program counter, no instruction fetch, no concept of "this line runs before that line" at the hardware level.
-
-This concurrency is the foundational conceptual shift. A 1000-line Verilog module describes 1000 things happening in parallel. Reading it sequentially, as you would C, produces completely wrong mental models.
-
-### The Three HDLs in Practice
-
-**VHDL** is strongly typed, verbose, and standard in defense, aerospace, and European industry. Its type system catches a class of bugs at compile time that Verilog silently ignores — a 4-bit value assigned to an 8-bit port is a type error in VHDL. The language separates interface (`entity`) from implementation (`architecture`), which enforces a clean boundary that Verilog leaves optional.
-
-**Verilog** is C-like in syntax and historically dominant in North American commercial chip design. Its permissiveness is a liability: implicit net declarations, 4-state logic coerced silently, and `reg` used for both combinational and sequential logic create ambiguity the synthesizer resolves by convention rather than enforcement.
-
-**SystemVerilog** (IEEE 1800) is a superset of Verilog that fixes its worst problems. The `logic` type replaces the ambiguous `reg`/`wire` split. `always_ff`, `always_comb`, and `always_latch` replace the generic `always` block with constructs whose synthesis intent is explicit and tool-checkable. Interfaces bundle related signals. Assertions embed correctness properties directly in the RTL. Industry is converging on SystemVerilog for both design and verification.
-
-### Behavioral vs. Structural Description
-
-**Structural** HDL instantiates submodules and connects them with wires, mirroring a schematic exactly. You specify *how* the circuit is assembled.
-
-**Behavioral** HDL describes *what* the circuit computes and lets the synthesis tool infer the gate-level implementation. A behavioral `always_comb` block with a priority encoder written as a `case` statement will synthesize to a gate network the tool selects based on timing and area constraints.
-
-Both styles produce equivalent netlists for equivalent logic. Behavioral HDL is preferred for complex logic because it lets the synthesizer apply technology-specific optimizations (gate sizing, logic restructuring) that a structural description would prevent.
-
-### Simulation vs. Synthesis
-
-**Simulation** runs HDL as a program to check logical correctness. All language constructs are valid — you can print to the console, read files, and insert arbitrary time delays.
-
-**Synthesis** translates HDL into a netlist of physical gates for a target process node. Only a *synthesizable subset* is valid. The gap between these subsets is a source of real bugs: code that simulates correctly can synthesize to wrong hardware if it uses constructs the synthesizer interprets differently than the simulator does.
-
-The canonical example: `initial` blocks are legal in simulation (set up initial state) and illegal or ignored in synthesis (hardware has no "initial" moment — it powers up to an undefined state unless a reset network drives it to a known value). Relying on `initial` for reset logic is a simulation/synthesis mismatch that passes all tests and ships broken silicon.
-
-### Blocking vs. Non-Blocking Assignments
-
-This distinction causes more bugs than any other single HDL concept.
-
-Inside `always` blocks in SystemVerilog:
-
-- `=` is **blocking**: the left-hand side updates immediately; subsequent lines in the same block see the new value. Execution within the block is sequential.
-- `<=` is **non-blocking**: all right-hand sides are evaluated first using *current* values; all left-hand sides update simultaneously at the end of the simulation time step.
-
-**Rule**: use `<=` in `always_ff` (sequential logic), use `=` in `always_comb` (combinational logic). The rule exists because flip-flops in silicon update simultaneously on the clock edge — non-blocking assignment models that. Combinational logic computes a function of its current inputs with no memory — blocking assignment is correct there.
-
-Mixing them incorrectly produces the worst category of HDL bug: a circuit that simulates correctly (because the simulator processes statements in order) but synthesizes to something different (because the synthesizer reads the non-blocking assignments as register boundaries the designer did not intend). The RTL and the gate netlist disagree silently.
-
----
-
-## How It Works
-
-### Combinational Logic: Continuous Assignment
-
-Consider the Boolean function:
-
-$$y = \bar{a}\bar{b}\bar{c} + a\bar{b}\bar{c} + a\bar{b}c$$
-
-This is sum-of-products form. Each product term maps directly to an AND gate; the OR of the terms maps to an OR gate. In SystemVerilog:
-
-```systemverilog
-module sillyfunction (
-    input  logic a, b, c,
-    output logic y
+```verilog
+// top.v
+module top (
+    input  wire clk,
+    input  wire rst_n,
+    output wire [7:0] led
 );
-    assign y = (~a & ~b & ~c)
-             | ( a & ~b & ~c)
-             | ( a & ~b &  c);
+    // instance of a 8‑bit counter
+    counter_8bit u0 (
+        .clk   (clk),
+        .rst_n (rst_n),
+        .q     (led)
+    );
 endmodule
 ```
 
-The synthesizer sees three product terms OR'd together. It maps them to NAND-NAND or AND-OR-INVERT logic depending on what the target library provides. The circuit exists permanently and continuously. A glitch on `a` propagates to `y` after the combinational path delay $t_{pd}$, a physical property of the process node — typically $200\,\text{ps}$ to $2\,\text{ns}$ depending on gate type and fanout.
+The synthesizer treats each instance as a separate **design unit**, preserving hierarchy for **design‑for‑test** (scan chains) and **partial reconfiguration** on FPGAs.
 
-The equivalent VHDL:
+### Combinational vs. Sequential Logic – Formal Definitions  
+*Combinational logic* is a **pure function** \( f : \{0,1\}^k \rightarrow \{0,1\}^m \) with **no internal state**. Its output at time \(t\) depends only on the current input vector:  
 
-```vhdl
-library IEEE;
-use IEEE.STD_LOGIC_1164.all;
+\[
+y(t) = f\bigl(a(t),b(t),\dots\bigr)
+\]
 
-entity sillyfunction is
-    port (a, b, c : in  STD_LOGIC;
-          y       : out STD_LOGIC);
-end;
+*Sequential logic* implements a **finite‑state machine** (FSM) defined by a tuple \((S, s_0, \delta, \lambda)\) where  
 
-architecture synth of sillyfunction is
-begin
-    y <= (not a and not b and not c)
-       or (    a and not b and not c)
-       or (    a and not b and     c);
-end;
+* \(S\) – finite set of states, \(|S| = 2^n\) for an \(n\)-bit state register,  
+* \(s_0 \in S\) – reset state,  
+* \(\delta : S \times \{0,1\}^k \rightarrow S\) – next‑state function,  
+* \(\lambda : S \times \{0,1\}^k \rightarrow \{0,1\}^m\) – output function (Mealy) or \(\lambda : S \rightarrow \{0,1\}^m\) (Moore).  
+
+The clocked update is:  
+
+\[
+s[t+1] = \delta\bigl(s[t], x[t]\bigr) \\
+y[t]   = \lambda\bigl(s[t], x[t]\bigr)
+\]
+
+Thus sequential logic inevitably contains **storage elements** (flip‑flops or latches) that enforce a **propagation delay** bounded by the clock period.
+
+### Simulation and Synthesis – From First Principles  
+**Simulation** proceeds in **delta cycles**:  
+
+1. All active processes evaluate their RHS using current signal values.  
+2. Assignments are scheduled (nonblocking `<=` for FFs, blocking `=` for comb).  
+3. After all RHS evaluations, LHS updates are applied; if any signal changed, another delta cycle begins.  
+4. When no signal changes, time advances to the next scheduled event (e.g., next posedge).  
+
+This guarantees **deterministic** behavior matching the hardware semantics (assuming no race conditions).
+
+**Synthesis** can be viewed as a series of **source‑to‑source transformations**:  
+
+* **Unrolling** of loops → explicit bit‑width operations.  
+* **FSM encoding** → state register + next‑state logic.  
+* **Resource sharing** → multiplexers and adders mapped to LUTs/DSPs.  
+* **Technology mapping** → Boolean expressions decomposed into target cell library (e.g., 6‑input LUT + carry chain for Xilinx 7‑series).  
+
+Each step preserves functional equivalence while optimizing a cost function (area, delay, power).  
+
+---
+
+## How It Works  
+### HDL Syntax – Signals, Types, and Concurrency  
+#### Nets vs. Variables  
+* `wire` (net) – continuously driven, models physical connections.  
+* `reg` (variable) – holds value only within a procedural block; synthesizes to a flip‑flop if assigned inside an `always @(posedge clk)` block, otherwise to a latch.  
+
+#### Blocking vs. Nonblocking Assignments  
+Within an `always` block:  
+
+* `=` (blocking) – immediate update; subsequent statements in the same block see the new value.  
+* `<=` (nonblocking) – RHS evaluated with old values; LHS updated after the block ends.  
+
+**Why it matters:** Nonblocking assignments model **parallel register updates**, preventing race conditions in sequential logic. Using blocking assignments inside a clocked block inadvertently creates latches or incorrect timing.
+
+#### Sensitivity Lists and `@(*)`  
+In Verilog‑2001, `@(*)` (or `always_comb` in SystemVerilog) tells the simulator to trigger the block on any change of any signal read inside the block, guaranteeing correct combinational behavior. Omitting a signal leads to **latch inference** (the simulator holds the previous value when the omitted signal changes).
+
+### Simulation Workflow – Command‑Line Details  
+```bash
+# 1. Compile Verilog sources into a VVP object
+iverilog -g2005-sv -Wall -o example.vvp top.v counter_8bit.v
+
+# 2. Run the simulation, dumping a VCD for waveform viewing
+vvp example.vvp +vcd=wave.vcd
+
+# 3. Examine waveforms (GTKWave)
+gtkwave wave.vcd &
 ```
 
-The `entity`/`architecture` split is not stylistic overhead — it enforces interface/implementation separation. A top-level schematic instantiates the `entity`; the `architecture` can be swapped (e.g., from behavioral to structural) without changing any instantiation that uses it.
+*`-g2005-sv`* selects SystemVerilog‑2005; `-Wall` enables all warnings (critical for catching latch inference).  
+The VCD file contains time‑stamped signal changes; the period between successive rising edges of `clk` can be measured directly to verify timing constraints.
 
-### Sequential Logic: Registers and Clocks
+### Synthesis Workflow – From RTL to Netlist  
+```bash
+# 1. Read RTL, elaborate hierarchy, and produce an abstract netlist
+yosys -p "read_verilog -sv top.v counter_8bit.v; \
+          hierarchy -check -top top; \
+          proc; fsm; opt; techmap; \
+          stat" -o example.json
 
-A D flip-flop captures `d` on the rising clock edge and holds it at `q` until the next edge. In the time domain: the output is constant between edges, and $q[n] = d[n-1]$ where $n$ indexes clock cycles.
+# 2. Map to a target FPGA architecture (e.g., Xilinx 7‑series)
+yosys -p "read_json example.json; \
+          synth_xilinx -top top -edif example.edif"
 
-The maximum clock frequency is set by the critical path — the longest combinational delay between any two registers:
+# 3. Place & route with vendor tools (vivado in batch mode)
+vivado -mode batch -source run_impl.tcl
+```
 
-$$f_{\max} = \frac{1}{t_{pcq} + t_{pd,\max} + t_{setup}}$$
+*Key passes:*  
+- `proc` converts `always` blocks to RTL netlist (flip‑flops + combinational logic).  
+- `fsm` detects and encodes state registers (one‑hot, binary, or gray).  
+- `techmap` breaks down complex operators into LUT‑compatible primitives.  
 
-where $t_{pcq}$ is the clock-to-output delay of the source register, $t_{pd,\max}$ is the worst-case combinational path delay, and $t_{setup}$ is the setup time of the destination register. The synthesizer's timing analysis identifies which path determines $f_{\max}$ and reports it as the critical path.
+The resulting EDIF netlist can be fed to the vendor placer/router, which attempts to meet a **user‑specified clock period** \(T_{clk}\). If the worst‑case path delay \(t_{pd}^{max} > T_{clk} - t_{setup}\), synthesis will fail with a timing violation report.
 
-```systemverilog
-module flopr #(parameter WIDTH = 8) (
-    input  logic             clk, reset,
-    input  logic [WIDTH-1:0] d,
-    output logic [WIDTH-1:0] q
+### Timing Analysis – Setup/Hold and Clock Period  
+For a flip‑flop with data‑to‑clock propagation \(t_{pd}\), setup time \(t_{su}\), and hold time \(t_{h}\):  
+
+\[
+\begin{aligned}
+\text{Setup constraint:}&\quad T_{clk} \ge t_{pd}^{max} + t_{su}^{max} \\
+\text{Hold constraint:}&\quad t_{pd}^{min} \ge t_{h}^{min}
+\end{aligned}
+\]
+
+If the design uses a **clock enable** \(ce\), the effective clock period for the data path becomes \(T_{clk}/ce\) only when \(ce=1\); timing tools model this via **clock gating** cells that add a small delay \(t_{gate}\).  
+
+---
+
+## Worked Examples  
+### Example 1: 4‑Bit Binary Counter with Synchronous Reset  
+**Goal:** Produce a 4‑bit count that increments each rising edge of `clk` when `rst_n` is low; output `q[3:0]`.  
+
+**Step‑by‑step reasoning:**  
+
+1. Determine required flip‑flop width: \(n = \lceil\log_2(2^4)\rceil = 4\).  
+2. Next‑state function: \(q_{next} = q + 1\) (mod \(2^4\)).  
+3. Reset overrides next state: \(q_{next} = 0\) when `rst_n == 0`.  
+4. Output assignment: `assign y = q;` (optional, can expose `q` directly).  
+
+**Verilog‑SystemVerilog implementation:**  
+
+```verilog
+module counter_4bit (
+    input  wire        clk,
+    input  wire        rst_n,   // active low reset
+    output logic [3:0] q
 );
-    always_ff @(posedge clk, posedge reset)
-        if (reset) q <= '0;
-        else       q <= d;
+    // synchronous reset, nonblocking update
+    always_ff @(posedge clk) begin
+        if (!rst_n)
+            q <= 4'b0;
+        else
+            q <= q + 1'b1;
+    end
 endmodule
 ```
 
-`always_ff` is not cosmetic — it is a synthesis directive. The tool will emit an error if this block does not infer flip-flops, catching structural mistakes before simulation. `@(posedge clk, posedge reset)` makes reset asynchronous: `q` goes to zero immediately when `reset` rises, independent of the clock. Synchronous reset would instead be `@(posedge clk)` with `reset` checked inside the block, and `q` would only clear on the next rising clock edge. The choice affects timing closure and reset network fanout, both of which appear in synthesis reports.
+*Why `always_ff`?* It signals to the synthesizer that the block describes sequential logic, preventing latch inference.  
 
-### Finite State Machines
+*Timing check:* Assume a Xilinx Artix‑7 LUT+FF with \(t_{pd}^{max}=0.45\text{ ns}\), \(t_{su}=0.12\text{ ns}\). For a 100 MHz clock (\(T_{clk}=10\text{ ns}\)):  
 
-A Moore FSM encodes state in registers and computes outputs as a function of state only. The next-state logic and output logic are both combinational; only the state register is sequential.
+\[
+T_{clk} - (t_{pd}^{max}+t_{su}) = 10 - (0.45+0.12) = 9.43\text{ ns} \gg 0
+\]
 
-```systemverilog
-typedef enum logic [1:0] {
-    S0 = 2'b00,
-    S1 = 2'b01,
-    S2 = 2'b10
-} state_t;
+Thus timing is comfortably met.
 
-module fsm (
-    input  logic clk, reset, in,
-    output logic out
+### Example 2: One‑Hot FSM – Traffic Light Controller  
+**States:** `{RED, YELLOW, GREEN}` encoded as one‑hot (`state[2:0]`).  
+**Inputs:** `timer_exp` (pulse when a programmable timer expires).  
+**Outputs:** `red_light`, `yellow_light`, `green_light`.  
+
+**State transition table:**  
+
+| Current State | `timer_exp` | Next State |
+|---------------|-------------|------------|
+| RED (001)     | 0           | RED        |
+| RED (001)     | 1           | GREEN      |
+| GREEN (100)   | 0           | GREEN      |
+| GREEN (100)   | 1           | YELLOW     |
+| YELLOW (010)  | 0           | YELLOW     |
+| YELLOW (010)  | 1           | RED        |
+
+**Moore output:** each state directly drives the lights.  
+
+**SystemVerilog implementation:**  
+
+```verilog
+module traffic_light_fsm (
+    input  wire        clk,
+    input  wire        rst_n,
+    input  wire        timer_exp,
+    output logic       red_light,
+    output logic       yellow_light,
+    output logic       green_light
 );
-    state_t state, next;
+    typedef enum logic [2:0] {
+        S_RED   = 3'b001,
+        S_GREEN = 3'b100,
+        S_YELLOW= 3'b010
+    } state_e;
 
-    // State register
-    always_ff @(posedge clk, posedge reset)
-        if (reset) state <= S0;
-        else       state <= next;
+    state_e state, state_next;
 
-    // Next-state logic (combinational)
-    always_comb
-        case (state)
-            S0: next = in ? S1 : S0;
-            S1: next = in ? S1 : S2;
-            S2: next = in ? S1 : S0;
-            default: next = S
+    // state register (sequential)
+    always_ff @(posedge clk or negedge rst_n) begin
+        if (!rst_n)
+            state <= S_RED;
+        else
+            state <= state_next;
+    end
+
+    // next-state logic (combinational)
+    always_comb begin
+        unique case (state)
+            S_RED:   state_next = timer_exp ? S_GREEN : S_RED;
+            S_GREEN: state_next = timer_exp ? S_YELLOW : S_GREEN;
+            S_YELLOW:state_next = timer_exp ? S_RED : S_YELLOW;
+        endcase
+    end
+
+    // output logic (Moore)
+    always_comb begin
+        red_light   = (state == S_RED);
+        green_light = (state == S_GREEN);
+        yellow_light= (state == S_YELLOW);
+    end
+endmodule
+```
+
+*Why `unique case`?* It guarantees mutual exclusivity, helping the synthesizer avoid priority encoder inference and producing a clean one‑hot decoder.  
+
+*Resource estimate:* One‑hot encoding uses 3 flip‑flops; the next‑state logic is a 3‑input multiplexer per bit → ~6 LUTs on a 6‑LUT FPGA.
+
+### Example 3: Pipelined Multiply‑Accumulate (MAC)  
+**Goal:** Compute \(y = \sum_{i=0}^{N-1} a_i \cdot b_i\) with a throughput of one MAC per clock.  
+
+**Pipeline stages:**  
+
+1. **Stage 1:** Register inputs `a_reg`, `b_reg`.  
+2. **Stage 2:** Compute partial product `pp = a_reg * b_reg` (DSP slice).  
+3. **Stage 3:** Accumulate `acc_reg <= acc_reg + pp`.  
+
+**Verilog:**  
+
+```verilog
+module mac_pipe #(
+    parameter WIDTH = 18   // matches DSP48E1 width
+) (
+    input  wire               clk,
+    input  wire               rst_n,
+    input  wire signed [WIDTH-1:0] a,
+    input  wire signed [WIDTH-1:0] b,
+    output logic signed [2*WIDTH-1:0] acc
+);
+    // pipeline registers
+    logic signed [WIDTH-1:0] a1, b1;
+    logic signed [2*WIDTH-1:0] pp;
+
+    // stage 1
+    always_ff @(posedge clk or negedge rst_n) begin
+        if (!rst_n) begin
+            a1 <= '0;
+            b1 <= '0;
+        end else begin
+            a1 <= a;
+            b1 <= b;
+        end
+    end
+
+    // stage 2 – DSP multiplication (inferred)
+    assign pp = $signed(a1) * $signed(b1);
+
+    // stage 3 – accumulation
+    always_ff @(posedge clk or negedge rst_n) begin
+        if (!rst_n)
+            acc <= '0;
+        else
+            acc <= acc + pp;
+    end
+endmodule
+```
+
+*Why pipeline?* The combinational delay of an 18×18‑bit multiply is ~1.2 ns in a 7‑series DSP; without pipelining the max clock would be ≈800 MHz, unrealistic for routing. Adding registers splits the critical path, allowing a 300 MHz target with ample slack.
+
+*Throughput analysis:* With latency = 3 cycles, after the pipeline fills, one result per clock → **1 MAC/clk**. For \(N=1024\), total cycles = 3 + (N‑1) = 1026 → **≈3.42 µs** at 300 MHz.
+
+---
+
+## Common Mistakes  
+| # | Mistake | What’s Wrong | Why It Causes Errors |
+|---|---------|--------------|----------------------|
+| 1 | **Missing reset in an `always_ff` block** | Flip‑flop inferred without reset → power‑up state undefined. | On FPGA/ASIC, uninitialized registers may toggle randomly, causing functional simulation‑silicon mismatch. Synthesis may still infer a reset‑less FF, but formal verification will flag unknown states. |
+| 2 | **Using blocking (`=`) inside a clocked `always` block for sequential logic** | Updates propagate immediately within the same delta cycle, mimicking a latch. | Leads to **race conditions**: the order of statements affects the final value, which is not synthesizable to flip‑flops; simulation may pass but netlist fails timing or produces glitches. |
+| 3 | **Omitting a signal from the sensitivity list (or forgetting `@(*)`)** | Block only evaluates when listed signals change; omitted signal changes are ignored. | Causes **latch inference** because the simulator holds the previous value when the omitted signal toggles, leading to extra memory elements and unexpected behavior in hardware. |
+| 4 | **Mixing signed and unsigned arithmetic without explicit casting** | Verilog treats unsized literals as unsigned; signedness propagation can be surprising. | Results in **incorrect magnitude** (e.g., `-1 * 2` yields a large positive number due to two’s‑complement wrap), causing functional bugs that are hard to spot in simulation if test vectors don’t exercise sign bits. |
+| 5 | **Assuming combinational loops are synthesizable** | Writing `assign y = ~y;` or feedback via `always_comb`. | Creates **oscillators** or unstable logic; synthesis tools either reject the design or generate a latch with undefined behavior, violating timing analysis and causing excess power. |
+| 6 | **Neglecting clock‑enable gating when using a multi‑cycle path** | Treating a multi‑cycle path as a single‑cycle path. | Timing analysis will report a **setup violation** because the data path delay exceeds the clock period; the fix is to introduce a false path constraint or pipeline register. |
+| 7 | **Using `reg` for purely combinational signals** | Declaring a combinational signal as `reg` and driving it outside a procedural block. | Synthesizer may infer a latch; simulation works but hardware yields unintended memory. The fix is to use `wire` for nets driven continuously. |
+
+---
+
+## Exercises  
+
+### Easy  
+1. **Combinational AND‑OR** – Write a Verilog module `maj3` that outputs the majority of three 1‑bit inputs (`y = (a&b) | (a&c) | (b&c)`). Show the truth table and derive the Boolean expression using Karnaugh map.  
+2. **Reset‑Synchronizer** – Create a two‑flip‑flop synchronizer for an asynchronous reset signal. Explain why two stages reduce metastability probability.  
+
+### Moderate  
+3. **Parameterizable Shift Register** – Design a shift register with parameter `WIDTH` and input `shift_left`. When `shift_left=1`, shift left; otherwise shift right. Provide synthesis report snippet showing LUT/FF utilization for `WIDTH=8` and `WIDTH=32`.  
+4. **FSM with Edge Detector** – Implement a Moore FSM that detects a rising edge on input `sig` and asserts a one‑clock pulse `tick`. Use one‑hot state encoding and show the state transition diagram.  
+
+### Hard  
+5. **Pipelined FIR Filter** – Given coefficients `c[0..3] = {1,2,2,1}`, design a 4‑tap FIR filter with a pipeline register after each multiply‑add. Derive the maximum achievable clock frequency assuming a DSP slice multiply latency of 1.2 ns and an adder latency of 0.45 ns.  
+6. **Clock‑Domain Crossing (CDC) FIFO** – Build a synchronous FIFO with dual‑clock write (`wclk`) and read (`rclk`) ports using Gray‑code pointers. Explain why Gray coding prevents metastability and calculate the FIFO depth needed to tolerate a worst‑case write‑read rate mismatch of 10 % over 1 ms.  
+
+---
+
+## Linux Connection  
+Linux treats programmable logic as **first‑class devices** via the **FPGA subsystem** (since kernel 4.4). Key components:
+
+| Subsystem | Purpose | Typical Path |
+|-----------|---------|--------------|
+| `fpga-manager` | Loads bitstreams into FPGA fabric (partial or full reconfiguration) | `/sys/class/fpga-manager/` |
+| `fpga-region` | Represents a reusable FPGA region that can host multiple accelerators | `/sys/fpga/region0/` |
+| `fpga-bridge` | Exposes AXI‑Lite / AXI‑Stream master/slave interfaces to the CPU | `/sys/class/fpga-bridge/bridge0/` |
+| `uio` (Userspace I/O) | Allows mmap‑based access to FPGA registers without writing a kernel driver | `/dev/uio0` |
+| `devmem` / `mmap` | Direct access to physical addresses (requires root or `CAP_SYS_RAWIO`) | `/dev/mem` (use with caution) |
+
+### Example: Loading a Bitstream via `fpga-manager`  
+```bash
+# 1. Identify the manager (usually one per FPGA)
+ls /sys/class/fpga-manager/
+# → fpga0
+
+# 2. Load a bitstream (e.g., built with Vivado)
+cat /lib/firmware/my_design.bit > /sys/class/fpga-manager/fpga0/data
+
+# 3. Trigger configuration (write 1 to the control attribute)
+echo 1 > /sys/class/fpga-manager/fpga0/loading
+# Wait for status to become "done"
+cat /sys/class/fpga-manager/fpga0/state
+# → done
+```
+
+### Example: Accessing Control Registers with `uio`  
+Assume the FPGA exposes a simple 32‑bit control register at offset `0x0` within an AXI‑Lite region.
+
+```c
+/* uio_example.c */
+#include <fcntl.h>
+#include <unistd.h>
+#include <sys/mman.h>
+#include <stdio.h>
+#include <stdint.h>
+
+int main(void) {
+    int fd = open("/dev/uio0", O_RDWR);
+    if (fd < 0) { perror("open uio"); return 1; }
+
+    /* Get the size of the UIO region (from sysfs) */
+    size_t len;
+    FILE *f = fopen("/sys/class/uio/uio0/maps/map0/size", "r");
+    fscanf(f, "%zu", &len);
+    fclose(f);
+
+    void *addr = mmap(NULL, len, PROT_READ|WRITE, MAP_SHARED, fd, 0);
+    if (addr == MAP_FAILED) { perror("mmap"); return 1; }
+
+    volatile uint32_t *ctrl = addr;   // offset 0
+    *ctrl = 0xA5A5A5A5;               // write test pattern
+    printf("Readback: 0x%08x\n", *ctrl);
+
+    munmap(addr, len);
+    close(fd);
+    return 0;
+}
+```
+Compile and run:  
+
+```bash
+gcc -Wall -O2 uio_example.c -o uio_example
+sudo ./uio_example   # needs access to /dev/uio0
+```
+
+### Example: Reading FPGA Temperature via SysFS  
+Many Xilinx FPGAs expose a thermal sensor:
+
+```bash
+cat /sys/class/hwmon/hwmon0/temp1_input   # value in millidegrees Celsius
+```
+
+### Why These Interfaces Matter  
+* **FPGA‑manager** enables **runtime reconfiguration**, letting Linux swap accelerators without reboot (useful for cloud workloads).  
+* **UIO** provides a low‑overhead, deterministic path for high‑speed control loops (e.g., motor control, SDR).  
+* **Sysfs** offers discovery and monitoring (bitstream version, temperature, error counters) essential for system health and debugging.  
+
+---
+
+## Why This Matters  
+Understanding HDLs is not an academic exercise; it is the bridge between **software‑driven Linux systems** and the **hardware that actually executes them**.  
+
+* By mastering the **formal semantics** of HDL constructs (blocking vs nonblocking, sensitivity lists, clocked resets), you avoid subtle bugs that only appear after synthesis—bugs that can silently corrupt data in a production server or cause a safety‑critical controller to

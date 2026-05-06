@@ -10,150 +10,366 @@ resources:
     title: "The Linux Programming Interface (Kerrisk)"
 ---
 
-## Why This Matters
-
-Every keypress must travel from a hardware interrupt to a userspace file descriptor through a path that is completely device-agnostic. The mechanism that makes this possible is a strict separation of concerns: the code that understands a PS/2 scancode sequence has no knowledge of what `evdev` or X11 will do with it, and `evdev` has no knowledge of PS/2. Without this split, every new input device would require changes in every application that handles input — a combinatorial problem that scales as $O(D \times A)$ where $D$ is the number of device types and $A$ is the number of applications. The input subsystem reduces this to $O(D + A)$ by inserting a single, stable abstraction layer between them.
-
-The cost of getting this wrong is visible in pre-subsystem history: X11's xf86-input drivers were essentially per-device application-layer shims because no kernel abstraction existed. The input subsystem, introduced in 2.4, moved that complexity into the kernel where it belongs.
-
 ## Core Concepts
+### Input Subsystem Architecture
+The Linux input subsystem is not a monolithic driver but a layered framework that decouples **hardware detection**, **event generation**, and **event consumption**.  
+- **Device layer**: Low‑level bus drivers (USB, HID, I²C, platform) probe hardware and allocate an `struct input_dev`.  
+- **Core layer**: `input_register_device()` registers the device with the input core, which assigns a minor number, creates `/dev/input/eventX`, and publishes sysfs attributes under `/sys/class/input/inputX/`.  
+- **Handler layer**: Generic handlers (evdev, keyboard, mouse, joystick, tablet) bind to devices via `input_register_handler()`. Each handler receives events through its `event()` callback.  
+- **Client layer**: User‑space programs open `/dev/input/eventX` (or use libevdev) and read `struct input_event` packets.
 
-### The Two-Layer Split
+### Event Flow (First‑Principles View)
+1. **Hardware interrupt** → bus driver’s ISR fills an `input_event` (timestamp, type, code, value).  
+2. Driver calls an input‑core helper (`input_event()`, `input_report_key()`, `input_report_rel()`, …).  
+3. Input core **validates** the event against the device’s capability bitmaps (`evbit`, `keybit`, …) and **injects** it into the handler’s wait queue.  
+4. Handler’s `event()` callback runs in process context (often a kernel thread) and may:  
+   - Transform the raw event (e.g., apply acceleration).  
+   - Forward it to another handler (evdev → uinput).  
+   - Update internal state (LED, repeat).  
+5. Handler may invoke `input_event()` on a *virtual* device (e.g., uinput) to synthesize events for other consumers.  
 
-The input subsystem enforces a clean separation:
+The **causal chain** is therefore:  
+`hardware → bus driver → input core → handler → client`.
 
-- **Input drivers** own hardware protocol knowledge. A PS/2 driver (`drivers/input/keyboard/atkbd.c`) decodes scancodes from the 8042 controller. A USB HID driver parses HID report descriptors. Neither knows what happens to the events it produces.
-- **Input handlers** own event consumption policy. `evdev` buffers events and exposes them via file descriptors. `kbd` translates keycodes to UTF-8 for the VT console. `mousedev` synthesizes a legacy `/dev/input/mouseX` interface for programs that still use it.
+### Capability Bitmaps
+Each `input_dev` contains six bitmap arrays (each `BITS_TO_LONGS(EVENT_TYPE_MAX)` bits):
+- `evbit` – which event *types* the device can generate (`EV_KEY`, `EV_REL`, …).  
+- `keybit`, `relbit`, `absbit`, `mscbit`, `ledbit`, `sndbit` – which *codes* within a type are supported.  
+Setting a bit tells the input core to allocate space for that event class and to reject unsupported events early (preventing bogus values from reaching handlers).
 
-The connection between a driver and handler is established at **registration time**, not at open time. When a driver calls `input_register_device()`, the kernel immediately evaluates every registered handler against the new device's declared capabilities. If they match, the handler's `connect()` is called. This means a handler that was registered before the device existed will still connect correctly — and it means device capability declarations are binding, not advisory.
+### Hotplugging via the Driver Model
+When a USB HID device is plugged:
+1. `usbcore` calls the HID driver’s `probe()`.  
+2. HID driver allocates `input_dev`, fills capability bitmaps, registers it.  
+3. `input_register_device()` triggers a **uevent** (`INPUT_DEVICE_ADD`) that udev receives, creating persistent symlinks (`/dev/input/by-id/…`, `/dev/input/by-path/…`).  
+4. On removal, the driver’s `disconnect()` calls `input_unregister_device()`, which sends `INPUT_DEVICE_REMOVE` and tears down the character device and sysfs entries.
 
-### Event Types and Codes
+### Why the Subsystem Exists (Design Rationale)
+- **Standardization**: All input devices present the same `input_event` ABI, so a single evdev handler can serve keyboards, touchscreens, and gamepads.  
+- **Decoupling**: Bus drivers need not know about policies (key repeat, acceleration, multi‑touch); those live in handlers.  
+- **Hotplug safety**: The input core holds a reference to `struct input_dev`; handlers get a `struct input_handle` that remains valid even if the underlying device disappears (they receive a `EVIOCGRAB`‑style disconnect event).  
+- **Security**: Access to `/dev/input/event*` is governed by file‑system permissions and udev rules, preventing unprivileged clients from sniffing keystrokes unless explicitly allowed.
 
-Every input event is a triple $(t, c, v)$: a *type*, a *code*, and a *value*. Types are broad categories:
-
-| Type | Meaning |
-|------|---------|
-| `EV_KEY` | Key or button state: press, release, repeat |
-| `EV_REL` | Relative axis displacement (signed delta) |
-| `EV_ABS` | Absolute axis position (raw coordinate) |
-| `EV_MSC` | Miscellaneous: raw scancodes, LED states |
-| `EV_SYN` | Synchronization boundary |
-
-The code refines the type. For `EV_KEY`, the code is a key identifier like `KEY_A` (30) or `BTN_LEFT` (272). For `EV_REL`, it is an axis like `REL_X` (0) or `REL_WHEEL` (8). The value encodes state: for `EV_KEY`, 0 = release, 1 = press, 2 = autorepeat; for `EV_REL`, a signed displacement; for `EV_ABS`, a raw integer coordinate.
-
-The triple is sufficient to represent every input event from every device class in a hardware-independent form. Everything else in the subsystem is bookkeeping around this fact.
-
-`EV_SYN / SYN_REPORT` events deserve special attention: they are not optional punctuation. They tell the consumer that all events before this point belong to the same logical moment. A mouse motion generates `EV_REL/REL_X` and `EV_REL/REL_Y` as separate events, but they are causally linked — both came from one hardware report. The `EV_SYN` after them lets userspace treat them atomically. A program that processes events without waiting for `EV_SYN` will see motion on one axis at a time and compute incorrect deltas.
-
-### The `input_dev` Structure
-
-A driver's sole obligation to the input core is to allocate, populate, and register an `input_dev`. The structure's capability bitmaps are what the matching logic reads:
-
-```c
-struct input_dev {
-    const char *name;          /* human-readable, appears in /proc/bus/input/devices */
-    const char *phys;          /* stable physical path, e.g. "usb-0000:00:14.0-1/input0" */
-    const char *uniq;          /* serial number if available */
-
-    unsigned long evbit[BITS_TO_LONGS(EV_CNT)];    /* which event types */
-    unsigned long keybit[BITS_TO_LONGS(KEY_CNT)];  /* which key codes */
-    unsigned long relbit[BITS_TO_LONGS(REL_CNT)];  /* which relative axes */
-    unsigned long absbit[BITS_TO_LONGS(ABS_CNT)];  /* which absolute axes */
-    unsigned long mscbit[BITS_TO_LONGS(MSC_CNT)];
-    unsigned long ledbit[BITS_TO_LONGS(LED_CNT)];
-    unsigned long sndbit[BITS_TO_LONGS(SND_CNT)];
-
-    struct input_absinfo *absinfo;  /* min/max/fuzz/flat/res per ABS axis */
-
-    int  (*open)(struct input_dev *dev);   /* called when first handler connects */
-    void (*close)(struct input_dev *dev);  /* called when last handler disconnects */
-    int  (*event)(struct input_dev *dev, unsigned int type,
-                  unsigned int code, int value); /* for output events (LEDs, force-feedback) */
-
-    /* ... */
-};
-```
-
-Each `*bit` field is a bitmap. Setting bit $n$ in `evbit` declares that this device produces event type $n$. Setting bit $k$ in `keybit` declares that it produces `EV_KEY` events with code $k$.
-
-The array length for each bitmap is:
-
-$$\text{len} = \left\lceil \frac{N}{\text{BITS\_PER\_LONG}} \right\rceil$$
-
-On a 64-bit system, `BITS_PER_LONG = 64`. With `KEY_CNT = 768`:
-
-$$\text{len(keybit)} = \left\lceil \frac{768}{64} \right\rceil = 12 \text{ unsigned longs} = 96 \text{ bytes}$$
-
-With `EV_CNT = 32` (there are fewer event types than keys):
-
-$$\text{len(evbit)} = \left\lceil \frac{32}{64} \right\rceil = 1 \text{ unsigned long} = 8 \text{ bytes}$$
-
-This is why `set_bit(EV_KEY, mydev->evbit)` and `set_bit(KEY_A, mydev->keybit)` are separate calls — they address separate bitmaps. Forgetting to set `EV_KEY` in `evbit` while setting `KEY_A` in `keybit` produces a device that declares it can emit specific keys but never declared it emits key events at all. Handlers that check `evbit` first will not connect.
-
-### `evdev`: The Universal Handler
-
-`evdev` (`drivers/input/evdev.c`) matches every device and exposes each as `/dev/input/eventN`. It is the handler that Xorg, Wayland compositors, SDL, and virtually all modern userspace use. The others (`mousedev`, `joydev`) exist for legacy compatibility.
-
-Reading from an `evdev` file descriptor yields a stream of:
-
-```c
-struct input_event {
-    struct timeval time;  /* kernel timestamp at event generation */
-    __u16 type;
-    __u16 code;
-    __s32 value;
-};
-```
-
-The struct is 24 bytes on 64-bit (`struct timeval` is 16 bytes: two 64-bit fields). On 32-bit kernels it is 16 bytes. This mismatch is a real portability issue — 32-bit userspace running on a 64-bit kernel via `compat` mode uses a different struct layout, which is why `libevdev` exists: it handles this transparently. Writing `read(fd, &ev, sizeof(ev))` directly in a cross-architecture program is a latent bug.
-
-Querying device capabilities without opening the event stream uses ioctls:
-
-```c
-/* Get the evbit bitmap */
-unsigned long evbits[BITS_TO_LONGS(EV_CNT)];
-ioctl(fd, EVIOCGBIT(0, sizeof(evbits)), evbits);
-
-/* Get key state (which keys are currently pressed) */
-unsigned long keystates[BITS_TO_LONGS(KEY_CNT)];
-ioctl(fd, EVIOCGKEY(sizeof(keystates)), keystates);
-
-/* Get axis info for ABS_X */
-struct input_absinfo absinfo;
-ioctl(fd, EVIOCGABS(ABS_X), &absinfo);
-```
+---
 
 ## How It Works
-
-### Driver Registration Walk-Through
-
-A minimal keyboard driver that reports a single key:
-
+### Device Registration – Step‑by‑Step
 ```c
-static struct input_dev *mykey_dev;
+/* 1. Allocate device structure */
+struct input_dev *dev = input_allocate_device();
+if (!dev)
+    return -ENOMEM;
 
-static int __init mykey_init(void)
+/* 2. Set basic info */
+dev->name = "Example Keyboard";
+dev->phys = "example/keyboard0";
+dev->id.bustype = BUS_USB;
+dev->id.vendor  = 0x1234;
+dev->id.product = 0xabcd;
+dev->id.version = 0x0100;
+
+/* 3. Define capabilities */
+__set_bit(EV_KEY, dev->evbit);
+__set_bit(KEY_A,  dev->keybit);
+__set_bit(KEY_B,  dev->keybit);
+/* … add more keys as needed */
+
+/* 4. Register with core */
+int ret = input_register_device(dev);
+if (ret) {
+    input_free_device(dev);
+    return ret;
+}
+/* dev is now visible under /sys/class/input/inputX and /dev/input/eventX */
+```
+**Key points**  
+- `input_allocate_device()` zeroes the structure and increments a global `input_dev_count`.  
+- `__set_bit()` manipulates the bitmap in `dev->evbit` etc.; the core checks these before queuing events.  
+- `input_register_device()` performs:  
+  1. `minor = input_allocate_minor()` → creates char device with major `INPUT_MAJOR (13)`.  
+  2. `device_add()` → registers with driver model, creates sysfs dir.  
+  3. Calls `input_handler_connect()` for all existing handlers that match the device’s capabilities (via `input_match_device()`).  
+
+### Event Reporting – Core Helpers
+| Helper | Typical Use | Underlying Action |
+|--------|-------------|-------------------|
+| `input_event(dev, type, code, value)` | Generic event (e.g., MSC_SCAN) | `dev->event(dev, type, code, value)` → handler callback |
+| `input_report_key(dev, code, value)` | Key press/release (`EV_KEY`) | Calls `input_event(dev, EV_KEY, code, value?1:0)` |
+| `input_report_rel(dev, axis, value)` | Relative motion (`EV_REL`) | Calls `input_event(dev, EV_REL, axis, value)` |
+| `input_report_abs(dev, axis, value)` | Absolute position (`EV_ABS`) | Calls `input_event(dev, EV_ABS, axis, value)` |
+| `input_sync(dev)` | Marks end of a **event set** | Guarantees handlers see a consistent state; internally calls `input_event(dev, EV_SYN, SYN_REPORT, 0)` |
+
+**Why `input_sync()` is mandatory**  
+Handlers often accumulate multiple sub‑events (e.g., `REL_X`, `REL_Y`, `BTN_LEFT`) before acting. Without a `SYN_REPORT`, a handler could process a partial set, leading to jerky cursor motion or missed button states. The sync event tells the handler: “all preceding values belong to the same logical instant.”
+
+### Timing and Timestamp Generation
+```c
+struct input_event {
+    struct timeval time;   /* seconds, microseconds */
+    __u16          type;
+    __u16          code;
+    __s32          value;
+};
+```
+- The input core fills `time` with `ktime_get_boottime()` → converted to `timespec64` then `timeval`.  
+- Resolution is **1 µs** (limited by `getnstimeofday()`).  
+- **Event rate calculation**: If a mouse reports at 125 Hz, the inter‑event interval is  
+  $$\Delta t = \frac{1}{125\text{ Hz}} = 8\text{ ms}$$  
+  To debounce a noisy switch with a 2 ms window, the driver must ignore any `EV_KEY` transition occurring less than 2 ms after the previous stable state:
+  ```c
+  static ktime_t last_change;
+  if (ktime_to_ms(ktime_sub(ktime_get(), last_change)) < 2)
+      return;   /* discard bounce */
+  last_change = ktime_get();
+  ```
+
+### Memory Layout Math
+On a 64‑bit kernel:
+- `struct timeval` = `__kernel_long_t tv_sec` (8 bytes) + `__kernel_suseconds_t tv_usec` (8 bytes) → 16 bytes (packed, no padding because both members are 8‑byte aligned).  
+- `type` (2 bytes) + `code` (2 bytes) + `value` (4 bytes) = 8 bytes.  
+- Total size = **24 bytes** (the kernel adds 8 bytes of padding after `value` to align the structure to an 8‑byte boundary for array allocation).  
+Thus an array of 100 events occupies 2400 bytes, easily fitting in a single page.
+
+### Handler Registration Example (evdev)
+```c
+static int evdev_connect(struct input_handler *handler,
+                         struct input_dev *dev,
+                         const struct input_device_id *id)
 {
+    struct evdev *evdev;
     int err;
 
-    mykey_dev = input_allocate_device();
-    if (!mykey_dev)
+    evdev = kzalloc(sizeof(*evdev), GFP_KERNEL);
+    if (!evdev)
         return -ENOMEM;
 
-    mykey_dev->name = "My Keyboard";
-    mykey_dev->phys = "isa0060/serio0/input0";
-    mykey_dev->id.bustype = BUS_ISA;
-    mykey_dev->id.vendor  = 0x0001;
-    mykey_dev->id.product = 0x0001;
-    mykey_dev->id.version = 0x0100;
+    evdev->dev = input_get_device(dev);
+    evdev->handle.dev = dev;
+    evdev->handle.name = "evdev";
+    evdev->handle.handler = handler;
+    evdev->handle private = evdev;
 
-    /* Must set the type bit before the code bits, or matching breaks */
-    set_bit(EV_KEY, mykey_dev->evbit);
-    set_bit(KEY_A,  mykey_dev->keybit);
+    err = input_register_handle(&evdev->handle);
+    if (err)
+        goto err_free;
 
-    err = input_register_device(mykey_dev);
+    /* Create /dev/input/eventX */
+    evdev->dev = input_allocate_device();
+    /* set evdev-specific capabilities … */
+    err = input_register_device(evdev->dev);
+    if (err)
+        goto err_unreg_handle;
+
+    return 0;
+/* error handling omitted for brevity */
+}
+```
+The handler’s `event()` callback simply copies the incoming `input_event` to its own virtual device’s queue, allowing any user‑space client to read it via `/dev/input/event*`.
+
+---
+
+## Worked Examples
+### Example 1: Minimal USB Keyboard Driver (Step‑by‑Step)
+**Goal**: Register a device that reports only `KEY_A` and `KEY_B`.  
+**Assumptions**: USB HID driver already provides `usb_int->dev` and an interrupt endpoint delivering 8‑byte reports where bit 0 = KEY_A, bit 1 = KEY_B.
+
+```c
+/*--- probe() -----------------------------------------------------------*/
+static int kb_probe(struct usb_interface *intf,
+                    const struct usb_device_id *id)
+{
+    struct usb_device *udev = interface_to_usbdev(intf);
+    struct input_dev *input;
+    int err;
+
+    input = input_allocate_device();
+    if (!input)
+        return -ENOMEM;
+
+    input->name = "USB Mini Keyboard";
+    input->phys = "usb-*/input0";
+    usb_to_input_id(udev, &input->id);
+
+    /* Capabilities */
+    __set_bit(EV_KEY, input->evbit);
+    __set_bit(KEY_A,  input->keybit);
+    __set_bit(KEY_B,  input->keybit);
+
+    /* Register */
+    err = input_register_device(input);
     if (err) {
-        input_free_device(mykey_dev);
+        input_free_device(input);
         return err;
     }
-    return
+    usb_set_intfdata(intf, input);
+    return 0;
+}
+
+/*--- interrupt callback ------------------------------------------------*/
+static void kb_irq(struct urb *urb)
+{
+    struct usb_interface *intf = urb->context;
+    struct input_dev *input = usb_get_intfdata(intf);
+    unsigned char *data = urb->transfer_buffer;
+    bool a, b;
+
+    a = data[0] & 0x01;
+    b = data[0] & 0x02;
+
+    /* Report changes only – prevents flooding */
+    static bool last_a, last_b;
+    if (a != last_a)
+        input_report_key(input, KEY_A, a);
+    if (b != last_b)
+        input_report_key(input, KEY_B, b);
+    last_a = a;
+    last_b = b;
+
+    input_sync(input);   /* end of this event set */
+    usb_submit_urb(urb, GFP_ATOMIC);
+}
+
+/*--- disconnect --------------------------------------------------------*/
+static void kb_disconnect(struct usb_interface *intf)
+{
+    struct input_dev *input = usb_get_intfdata(intf);
+    usb_set_intfdata(intf, NULL);
+    input_unregister_device(input);
+}
+```
+**Why each step matters**  
+- Setting only the needed bits in `keybit` prevents the core from accepting spurious codes (e.g., `KEY_C`) that the hardware never sends.  
+- Reporting only on change (`if (a != last_a)`) reduces bus traffic and avoids generating duplicate key events that would confuse the keyboard handler’s autorepeat logic.  
+- `input_sync()` guarantees that the two key events (if both changed) are seen as a simultaneous set; without it, the handler could process `KEY_A` then `KEY_B` as two separate instants, breaking chorded‑key semantics.  
+
+### Example 2: Relative Mouse with Basic Acceleration
+**Goal**: Convert raw `REL_X/Y` from a device reporting at 100 Hz into accelerated cursor motion for the evdev handler.
+
+```c
+static void mouse_report(struct input_dev *dev,
+                         int dx, int dy, bool left, bool right)
+{
+    static const int threshold = 10;   /* pixels */
+    static const float accel = 1.5f;   /* factor above threshold */
+
+    /* Apply simple piecewise‑linear acceleration */
+    if (abs(dx) > threshold)
+        dx = threshold + (dx - threshold) * accel;
+    if (abs(dy) > threshold)
+        dy = threshold + (dy - threshold) * accel;
+
+    input_report_rel(dev, REL_X, dx);
+    input_report_rel(dev, REL_Y, dy);
+    input_report_key(dev, BTN_LEFT,  left);
+    input_report_key(dev, BTN_RIGHT, right);
+    input_sync(dev);
+}
+```
+**Derivation of acceleration formula**  
+For small movements (`|dx| ≤ threshold`) we keep 1:1 mapping (preserves precision).  
+For larger movements we add a linear gain:  
+$$\text{output} = \text{threshold} + (\text{input} - \text{threshold}) \times \alpha$$  
+where $\alpha = 1.5$. This yields a smooth curve without a discontinuity at the threshold because both sides evaluate to `threshold` when `input = threshold`.
+
+**Usage in driver’s interrupt**  
+```c
+static void mouse_irq(struct urb *urb)
+{
+    struct usb_interface *intf = urb->context;
+    struct input_dev *dev = usb_get_intfdata(intf);
+    unsigned char *buf = urb->transfer_buffer;
+    /* Assuming 3‑byte Microsoft mouse protocol: button, dx, dy */
+    bool left  = buf[0] & 0x01;
+    bool right = buf[0] & 0x02;
+    signed char dx = (signed char)buf[1];
+    signed char dy = (signed char)buf[2];
+
+    mouse_report(dev, dx, dy, left, right);
+    usb_submit_urb(urb, GFP_ATOMIC);
+}
+```
+
+### Example 3: Multi‑Touch Slot Handling (Advanced)
+**Goal**: Support a touchscreen that reports contact slots via ABS_MT_* axes.
+
+```c
+static int mt_probe(struct platform_device *pdev)
+{
+    struct input_dev *input = input_allocate_device();
+    if (!input)
+        return -ENOMEM;
+
+    input->name = "Example MT Touchscreen";
+    input->phys = "mt-touchscreen0";
+
+    /* Tell core we will use MT protocol B */
+    __set_bit(EV_ABS, input->evbit);
+    __set_bit(ABS_X,    input->absbit);
+    __set_bit(ABS_Y,    input->absbit);
+    __set_bit(ABS_MT_TRACKING_ID, input->absbit);
+    __set_bit(ABS_MT_POSITION_X, input->absbit);
+    __set_bit(ABS_MT_POSITION_Y, input->absbit);
+    __set_bit(ABS_MT_TOUCH_MAJOR, input->absbit);
+    __set_bit(ABS_MT_TOUCH_MINOR, input->absbit);
+
+    /* Initialize MT slots – we expect up to 10 contacts */
+    input_mt_init_slots(input, 10, INPUT_MT_DIRECT);
+    /* Optional: set resolution if known */
+    input_set_abs_params(input, ABS_X, 0, 800, 0, 0);
+    input_set_abs_params(input, ABS_Y, 0, 480, 0, 0);
+    input_set_abs_params(input, ABS_MT_TRACKING_ID, 0, 0xFFFF, 0, 0);
+    input_set_abs_params(input, ABS_MT_POSITION_X, 0, 800, 0, 0);
+    input_set_abs_params(input, ABS_MT_POSITION_Y, 0, 480, 0, 0);
+    /* Pressure/major/minor ranges … */
+
+    return input_register_device(input);
+}
+
+/* In the ISR, for each contact i: */
+static void mt_report_contact(struct input_dev *dev,
+                              int slot, int tracking_id,
+                              int x, int y, int major, int minor)
+{
+    input_mt_slot(dev, slot);
+    input_mt_report_slot_state(dev, MT_TOOL_FINGER, tracking_id >= 0);
+    if (tracking_id >= 0) {
+        input_report_abs(dev, ABS_MT_TRACKING_ID, tracking_id);
+        input_report_abs(dev, ABS_MT_POSITION_X, x);
+        input_report_abs(dev, ABS_MT_POSITION_Y, y);
+        input_report_abs(dev, ABS_MT_TOUCH_MAJOR, major);
+        input_report_abs(dev, ABS_MT_TOUCH_MINOR, minor);
+    }
+    /* after processing all slots */
+    input_mt_sync(dev);
+    input_sync(dev);
+}
+```
+**Why `input_mt_*` helpers are required**  
+The MT protocol expects the core to see a **slot‑synchronised** stream: each slot’s ABS_MT_* values must be grouped, followed by an `INPUT_MT_SYNC` (implemented by `input_mt_sync()`). Without this, the evdev handler would interleave values from different contacts, producing impossible coordinate jumps.
+
+---
+
+## Common Mistakes
+| # | Mistake | What’s Wrong | Why It Breaks |
+|---|---------|--------------|---------------|
+| 1 | **Omitting `input_sync()` after a batch of events** | Handler receives a partial set (e.g., only `REL_X` but not `REL_Y`). | Cursor jumps on one axis only; evdev may drop the unsynced packet, causing lost motion. |
+| 2 | **Setting a capability bit but never reporting that event type** | Driver declares `EV_REL` and `REL_X` but only ever calls `input_report_key()`. | The input core will still accept the device, but handlers expecting relative motion (e.g., mouse) will never move the pointer; users report a “dead” mouse. |
+| 3 | **Failing to release `input_dev` on disconnect** | `input_unregister_device()` omitted in `.disconnect()`. | The device struct stays registered; subsequent hotplug attempts fail with `-EBUSY` because the minor number is still in use. Leads to “input: unable to register device” kernel messages. |
+| 4 | **Using `input_event()` directly for key events without checking `keybit`** | Driver calls `input_event(dev, EV_KEY, KEY_Z, 1)` but never set `KEY_Z` in `keybit`. | Core validates the event; if the bit is missing, it discards the event silently (or prints `input: unknown key event`). The driver wonders why keys don’t appear. |
+| 5 | **Not handling `INPUT_MT_SYNC` in MT drivers** | Calls `input_report_abs()` for each slot but omits `input_mt_sync()`. | Evdev receives interleaved ABS_MT_* values from different slots, corrupting tracking ID assignment; multitouch gestures become jittery or are interpreted as single‑touch with wild jumps. |
+| 6 | **Assuming `struct timeval` microsecond resolution equals jitter‑free timing** | Driver uses `event->time.tv_usec` for debounce without converting to monotonic time. | If the system clock is adjusted (NTP step), timestamps can jump backward, causing false debounce triggers or missed events. Proper debounce uses `ktime_get()` and compares monotonic intervals. |
+| 7 | **Registering a device with `input_allocate_device()` but never setting `name` or `phys`** | Leaves those fields `NULL`. | Sysfs shows empty strings; udev rules that rely on `ENV{ID_INPUT_NAME}` fail to match, resulting in missing `/dev/input/by-*` symlinks. Users see the device in `lsinput` but no convenient symlinks. |
+
+---
+
+## Exercises
+### Easy
+1. **Single‑key poller** – Write a platform driver that allocates an `input_dev`, sets only `EV_KEY`/`KEY_A`, and toggles the key state every 500 ms using a timer. Verify with `evtest /dev/input/event*` that you see a repeating key press/release.  
+2. **lsinfo wrapper** – Create a Bash script that parses `/sys/class/input/input*/device/name` and prints a table matching the output of `lsinput`.  
+
+### Medium
+3. **Mouse with acceleration** – Implement a USB mouse driver (as in Worked Example 2) that applies a piecewise‑linear acceleration curve. Tune the threshold and factor until cursor motion feels subjectively linear on your test hardware. Use `xinput --list-props "Device Name"` to verify the reported acceleration property (if using Xorg) or `libinput debug-events` for Wayland.  
+4. **Hot‑plug detection** – Add a `udev` rule that symlinks `/dev/input/my-keyboard` to the appropriate `/dev/input/eventX` when a device with a specific `idVendor`/`idProduct` appears. Test by unplugging/replugging the device and checking the symlink target.  
+
+### Hard
+5. **Multi‑touch slot manager** – Write a driver for a touchscreen that provides raw contact points (x, y, pressure) via an IIO buffer. Convert each buffer packet into MT slots using `input_mt_init_slots()`, `input_mt_report_slot_state()`, and `input_m

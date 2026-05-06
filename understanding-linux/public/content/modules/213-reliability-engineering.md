@@ -10,146 +10,226 @@ resources:
     title: "The Linux Programming Interface (Kerrisk)"
 ---
 
-## Why This Matters
-
-A system that works perfectly at 10 requests per second can collapse at 10,000 — not because the code changes, but because queueing dynamics are nonlinear. A service that runs flawlessly in isolation fails unpredictably under hardware degradation or cascading dependency failures. Without a formal framework for defining what "working" means, measuring deviation from it, and deciding when to stop shipping features and fix stability, teams react to outages rather than preventing them. Reliability engineering gives you that framework: it converts "the site should be fast" into a measurable contract, spends failure margin deliberately, and predicts capacity exhaustion before traffic exposes it.
-
----
-
 ## Core Concepts
+### Reliability Engineering in Computer Systems
+Reliability engineering quantifies the probability that a system will continue to deliver its specified service **without failure** for a given interval. The underlying cause is the stochastic nature of hardware faults, software bugs, and external disturbances. By modeling failures as a Poisson process with rate λ (failures per hour), the probability of zero failures in time *t* is $P_{0}(t)=e^{-\lambda t}$. Minimizing λ (through fault‑tolerant design, redundancy, and rigorous testing) directly raises this probability.
 
-### Service Level Objectives (SLOs)
+### Service Level Objective (SLO)
+An SLO is a **target** expressed as a probabilistic bound on a Service Level Indicator (SLI). For availability, the SLI is the fraction of time the system is able to respond to requests. If we monitor uptime over a measurement window *W*, the SLI is  
+$$\text{SLI} = \frac{W - D}{W}$$  
+where *D* is accumulated downtime. An SLO of 99.9% availability therefore imposes the inequality  
+$$\frac{W - D}{W} \ge 0.999 \;\Longrightarrow\; D \le 0.001W.$$  
+Thus the SLO translates directly into a **maximum allowable downtime** derived from first‑principles reliability theory.
 
-An SLO is a precise, measurable target for a single behavioral dimension — latency, availability, error rate — with an explicit measurement window. The distinction between indicator and objective is load-bearing:
-
-- **SLI (Service Level Indicator):** the raw ratio being measured
-- **SLO:** the threshold that ratio must satisfy
-- **SLA:** a contractual consequence (often financial) if the SLO is breached
-
-$$\text{SLI} = \frac{\text{good events}}{\text{valid events}}$$
-
-A valid event is one that should be counted — excluding health checks, synthetic probes, and requests from internal scanners that would pollute the denominator. If you count every request including automated noise, your SLI will look better than users actually experience.
-
-Example: "99.9% of non-health-check HTTP requests complete with status < 500 and latency < 200 ms, measured over a rolling 28-day window." The measurement window matters: a 7-day window recovers budget faster after an incident, which reduces conservatism; a 90-day window smooths transient spikes but makes alerting sluggish.
-
-### Error Budgets
-
-If your SLO is 99.9% availability, you are permitted $1 - 0.999 = 0.001$ of requests to fail. Over a 28-day window ($28 \times 24 \times 60 = 40{,}320$ minutes):
-
-$$\text{error budget (time)} = 40{,}320 \times 0.001 = 40.32 \text{ minutes}$$
-
-The error budget is not a safety margin — it is a resource you spend intentionally. Deployments consume it. Experiments consume it. Scheduled maintenance consumes it. When it depletes, the correct response is not a policy discussion; it is a mechanical rule: freeze deployments, halt experiments, investigate. This removes the recurring argument between reliability and velocity: the budget arbitrates automatically.
-
-Budget consumption rate matters more than remaining balance. If you have burned 10% of budget in 1% of the window, you are on track to exhaust it 10× faster than the SLO tolerates.
+### Error Budget
+The error budget is the complement of the SLO: the amount of downtime (or error rate) that can be “spent” without violating the SLO. From the inequality above, the error budget for a window *W* is  
+$$\text{EB} = W \times (1 - \text{SLO}).$$  
+If the SLO is 99.95%, the error budget is 0.05% of *W*. Consuming more than this budget means the observed SLI has fallen below the SLO, triggering a reliability violation. Treating the error budget as a **spendable resource** creates a clear decision boundary: feature work can proceed while budget remains; once exhausted, work must shift to reliability‑improving tasks.
 
 ### Incident Response
-
-An incident is any event consuming error budget faster than the permitted rate, or threatening SLO breach before the window closes. The response sequence is fixed:
-
-**detect → contain → diagnose → fix → postmortem**
-
-Containment precedes root cause analysis because users are affected during diagnosis. Rolling back a deployment you do not yet understand is correct — it stops budget consumption while investigation continues. A postmortem that produces no structural change (no monitoring improvement, no runbook update, no architectural fix) is a ritual without effect.
+Incident response is the organized reaction to a deviation from expected behavior that threatens the SLO. Its effectiveness hinges on minimizing **Mean Time to Detect (MTTD)** and **Mean Time to Contain (MTTC)**, because the total downtime *D* ≈ MTTD + MTTC + MTTR (Mean Time to Repair). Reducing any of these terms directly reduces *D* and preserves the error budget.
 
 ### Capacity Planning
-
-Capacity planning answers: at what load does a specific resource become the bottleneck, and when will current growth reach that load? It requires three inputs: a resource consumption model, a measured baseline, and a growth projection. Without the model, you cannot extrapolate. Without the baseline, you have no origin point. Without the projection, you cannot compute when.
+Capacity planning ensures that the provisioned service rate μ exceeds the arrival rate λ of work, keeping utilization ρ = λ/μ below a stability threshold (typically ρ < 0.70 for latency‑sensitive services). Using Little’s Law, $L = \lambda W$, where *L* is the average number of jobs in the system and *W* the average response time. If *W* must stay below a target *T*, we require  
+$$\mu \ge \frac{\lambda}{1 - \lambda T}.$$  
+Thus capacity planning is a deterministic calculation derived from queueing theory, not guesswork.
 
 ---
 
 ## How It Works
+### SLOs and Error Budgets in Practice
+Consider a web service with an SLO of 99.9% availability measured over a 30‑day window (*W* = 30 days × 24 h × 60 min = 43 200 min). The allowable downtime is  
+$$D_{\max}=W\times(1-0.999)=43.2\text{ min}.$$  
+If the service experiences *d* minutes of downtime, the fraction of the error budget consumed is  
+$$\frac{d}{D_{\max}}\times100\%.$$  
+For example, 30 min downtime yields  
+$$\frac{30}{43.2}\times100\% \approx 69.4\%$$  
+of the budget used, leaving 30.6 % for future incidents.
 
-### SLIs in Practice: Latency Percentiles
+The derivation follows directly from the SLO inequality:  
+$$\text{SLI}=1-\frac{d}{W}\ge0.999 \;\Longrightarrow\; d\le0.001W.$$  
 
-Averages suppress the distribution. A mean latency of 50 ms is consistent with a $P_{99}$ of 10 seconds if the distribution is heavy-tailed. SLOs must be expressed against percentiles because percentiles bound the fraction of users experiencing a given behavior:
+### Incident Response Process (Detailed)
+1. **Detection** – Instrumentation emits metrics (e.g., Prometheus alerts) when SLI deviates beyond a threshold. The alert triggers a paging system; MTTD is the time from anomaly onset to first responder acknowledgment.  
+2. **Containment** – Immediate actions limit blast radius:  
+   * Network‑level: `iptables -A INPUT -s <bad_ip> -j DROP`  
+   * Service‑level: Kubernetes pod deletion (`kubectl delete pod <pod>`) or circuit‑breaker activation via Istio (`destinationrule` with `outlierDetection`).  
+   The goal is to reduce ongoing error accrual, lowering MTTC.  
+3. **Eradication** – Root cause is isolated via logs (`journalctl -u <service>`), core dumps, or eBPF traces. Removing the cause may involve:  
+   * Rolling back a faulty deployment (`kubectl rollout undo deployment/<deploy>`)  
+   * Applying a security patch (`yum update -y <vulnerable-package>`)  
+   * Killing a runaway process (`kill -9 <pid>`).  
+4. **Recovery** – System is brought back to a known good state:  
+   * Restoring from backups (`restic restore latest --target /mnt`)  
+   * Re‑syncing replicated data (`ceph osd pool create <pool> 128`)  
+   * Verifying health checks return 200 OK.  
+   MTTR is measured here.  
+5. **Post‑incident Review** – A blameless meeting produces an action item tracker; metrics such as “percentage of incidents with automated rollback” are recorded to improve future MTTD/MTTC/MTTR.
 
-$$P_n = \text{smallest value } v \text{ such that } n\% \text{ of observations} \leq v$$
+### Capacity Planning Techniques (Quantitative)
+* **Load Testing** – Tools like `wrk` or `k6` generate a controlled request rate *R*. Measured latency *L* at each *R* yields the empirical service curve μ(*R*).  
+* **Monitoring** – Time‑series databases (Prometheus) store per‑second counters: `rate(http_requests_total[1m])` gives λ; `avg(http_request_duration_seconds)` gives *W*.  
+* **Modeling** – Assuming an M/M/1 queue, average response time is $W = \frac{1}{\mu-\lambda}$. Solving for μ given a target *W* yields $\mu = \lambda + \frac{1}{W}$.  
+* **Trend Analysis** – Apply linear regression to historic λ(t) to forecast λ₍future₎; then recompute μ using the model above.  
+* **Utilization Bound** – For tail‑latency SLOs (e.g., 99th‑percentile < 100 ms), use the Kingman approximation for G/G/1 queues:  
+  $$W_{q} \approx \frac{\rho^{2}}{1-\rho}\cdot\frac{C_{s}^{2}+C_{a}^{2}}{2}\cdot\frac{1}{\mu},$$  
+  where ρ = λ/μ, $C_{s}$ and $C_{a}$ are service and arrival variability coefficients. Plugging a target $W_{q}$ solves for the required μ (or number of parallel servers *n* where μ = n·μ₁).
 
-A typical latency SLO stack:
+---
 
-- $P_{50} < 20\text{ ms}$ — median user experience
-- $P_{99} < 200\text{ ms}$ — 1 in 100 requests
-- $P_{99.9} < 1{,}000\text{ ms}$ — 1 in 1000 requests (the tail)
+## Worked Examples
+### Example 1: SLO Calculation (Detailed)
+**Problem**: A micro‑service has an SLO of 99.95% uptime over a 7‑day window. It experiences 45 minutes of downtime. What fraction of its error budget is consumed?
 
-The $P_{99.9}$ matters because at 1,000 requests/second, it fires once per second. Users on degraded paths, overloaded backends, or slow networks are disproportionately represented in the tail. Ignoring $P_{99.9}$ means your dashboard is green while a specific population of users is consistently failed.
+**Solution**  
+1. Convert window to minutes:  
+   $W = 7 \text{ days} \times 24 \text{ h/day} \times 60 \text{ min/h} = 10\,080 \text{ min}$.  
+2. Compute error budget:  
+   $\text{EB} = W \times (1 - \text{SLO}) = 10\,080 \times (1 - 0.9995) = 10\,080 \times 0.0005 = 5.04 \text{ min}$.  
+3. Fraction used:  
+   $\frac{45 \text{ min}}{5.04 \text{ min}} = 8.93$ → **893 %** of the budget consumed.  
+   The SLO is violated; the service must spend the next interval repairing reliability before earning new budget.
 
-**Histogram accuracy:** naive percentile computation over pre-aggregated data introduces errors. If you average percentiles from multiple hosts — $\frac{P_{99}^{\text{host1}} + P_{99}^{\text{host2}}}{2}$ — the result is not the fleet-wide $P_{99}$. You must aggregate the underlying distributions, not the percentiles. HDR Histogram and t-digest exist for this reason; Prometheus `histogram_quantile` operates on raw bucket counts for the same reason.
+### Example 2: Incident Response Timeline
+**Scenario**: An e‑commerce site suffers a SQL injection that leaks customer emails.
 
-### Error Budget Burn Rate
+| Phase | Action | Command / Tool | Approx. Time |
+|-------|--------|----------------|--------------|
+| Detection | Alert on surge of 500 errors + unusual DB query pattern | `alertmanager` fires when `rate(http_errors_5xx[5m]) > 0.1` | 2 min |
+| Containment | Block offending IP at edge; enable WAF rule | `iptables -I INPUT -s 203.0.113.45 -j DROP`<br>`kubectl annotate ingress my-ingress nginx.org/waf-modsec="on"` | 5 min |
+| Eradication | Identify vulnerable parameter, patch code, redeploy | `git diff -p app/db.go` shows missing `sql.DB.QueryContext` fix<br>`kubectl rollout restart deployment/frontend` | 15 min |
+| Recovery | Validate DB integrity, restore any corrupted rows from snapshot | `psql -c "SELECT COUNT(*) FROM users WHERE email LIKE '%@attacker.com%'"`<br>`pg_restore --dbname=ecommerce --table=users latest.dump` | 10 min |
+| Post‑mortem | Write blameless report, add automated SQLi scanner to CI | Confluence page; add `bandit -r .` to CI pipeline | — |
 
-Define burn rate as the ratio of the current error rate to the permitted error rate:
+Total downtime ≈ 32 min; if the SLO permits 20 min/month, the incident consumes 160 % of the monthly error budget, prompting a reliability‑focused sprint.
 
-$$\text{burn rate} = \frac{\text{current error rate}}{\text{SLO error rate}}$$
+### Example 3: Capacity Planning via Queueing Model
+**Problem**: A REST endpoint receives Poisson requests with average rate λ = 120 req/s. Current 99th‑percentile latency must stay under 150 ms. Each server (single‑core) can process μ₀ = 200 req/s with service‑time variability $C_s = 1$ (exponential). Arrival variability $C_a = 1$ (Poisson). How many identical servers *n* are needed?
 
-If the SLO permits 0.1% errors ($\epsilon = 0.001$) and you are observing 1% errors ($\epsilon_{\text{obs}} = 0.01$):
+**Solution**  
+1. Utilization per server: $\rho = \frac{\lambda}{n\mu_0}$.  
+2. Kingman approximation for average waiting time in queue:  
+   $$W_q \approx \frac{\rho^{2}}{1-\rho}\cdot\frac{C_s^{2}+C_a^{2}}{2}\cdot\frac{1}{\mu_0}.$$  
+   Total response time $W = W_q + 1/\mu_0$.  
+3. Set $W \le 0.150$ s and solve for *n*.  
+   Plug numbers:  
+   $$\frac{1}{\mu_0}=0.005\text{ s}.$$  
+   Let $x = \rho$. Then  
+   $$W_q = \frac{x^{2}}{1-x}\cdot\frac{1+1}{2}\cdot0.005 = \frac{x^{2}}{1-x}\cdot0.005.$$  
+   So $W = 0.005 + \frac{x^{2}}{1-x}\cdot0.005 \le 0.150$.  
+   Rearranged: $\frac{x^{2}}{1-x} \le 29$.  
+   Solve numerically: $x \approx 0.945$ gives LHS ≈ $0.945^2/(0.055) ≈ 16.2 < 29$.  
+   Try $x=0.98$: $0.9604/0.02 = 48.0 > 29$. So $\rho_{max} \approx 0.965$.  
+4. Compute required *n*:  
+   $n \ge \frac{\lambda}{\mu_0 \rho_{max}} = \frac{120}{200 \times 0.965} \approx 0.622$.  
+   Since *n* must be integer ≥ 1, one server already satisfies the latency SLO under these assumptions.  
+   If we instead target 99th‑percentile (using $W_{99} \approx W_q \cdot \ln(100)$ for exponential), we repeat with factor ~4.6, yielding $n≈3$.  
+   **Result**: To be safe against variability, provision **3 servers** (giving $\rho = 120/(3·200)=0.20$ and ample headroom).
 
-$$\text{burn rate} = \frac{0.01}{0.001} = 10\times$$
+---
 
-At $10\times$ burn rate, the 28-day budget exhausts in $\frac{28}{10} = 2.8$ days. Alert on burn rate over a short window (e.g., 1-hour burn rate $> 14.4\times$, which exhausts a 30-day budget in 2 hours) rather than on instantaneous error rate — this catches fast-burning incidents early while suppressing noise from brief transients. A two-window alert (fast window catches the spike, slow window confirms sustained burn) reduces both false positives and detection latency simultaneously.
+## Common Mistakes
+| Mistake | Why It’s Wrong | Consequence |
+|---------|----------------|-------------|
+| Treating the error budget as a “permission to fail” rather than a **finite reserve**. | The budget is derived from the SLO inequality; spending it reduces future tolerance. Repeatedly consuming the budget drives the observed SLI below the SLO, causing chronic violations and customer churn. |
+| Using **average** utilization (λ/μ) for capacity planning when latency SLOs concern tail percentiles. | Averages hide variance; under bursty arrivals the queue can blow up even if ρ<0.7. Tail‑latency SLOs require variability terms ($C_s, C_a$) as in the Kingman or Hall approximations. |
+| Relying solely on **manual** incident response runbooks without automation. | Manual steps increase MTTD and MTTC; humans are slower and error‑prone under stress. Automated containment (e.g., Istio outlier detection, auto‑scale‑down) reduces human latency and improves repeatability. |
+| Ignoring **idempotency** when designing recovery actions (e.g., restoring backups without checking for duplicate writes). | Non‑idempotent recovery can corrupt state, extending MTTR or causing data loss. Proper recovery must be safe to replay multiple times. |
+| Assuming **static** resource provisioning based on peak load observed in a single load test. | Workloads are often non‑stationary; diurnal patterns, flash crowds, or seasonal spikes can exceed the tested peak. Continuous monitoring and predictive scaling (e.g., HPA with custom metrics) are required. |
+| Misinterpreting **MTBF** as a guarantee of no failure within that interval. | MTBF is the *mean* of an exponential distribution; the probability of zero failure in time *t* is $e^{-t/MTBF}$. Even with high MTBF, there is a non‑zero chance of early failure; reliability engineering must design for detection and fast recovery, not just prevention. |
 
-The budget-consumption equation for a window of length $W$ with sustained burn rate $b$:
+---
 
-$$\text{budget consumed} = b \times \epsilon_{\text{SLO}} \times W$$
+## Exercises
+### Exercise 1 (Easy) – SLO & Error Budget
+A database cluster promises 99.99% availability measured monthly (30 days). If it experiences 12 minutes of downtime in a month, what percentage of its error budget has been used? Show all steps.
 
-### Queueing Theory and Capacity
+### Exercise 2 (Medium) – Incident Response Design
+You receive an alert that a Kubernetes node is reporting `NodeNotReady` due to a disk‑full condition (`/var/log` at 95%).  
+1. List the exact commands you would run to **detect**, **contain**, **eradicate**, and **recover** using only standard Linux tools (`journalctl`, `systemctl`, `find`, `df`, `lvm`, etc.).  
+2. Explain how each step reduces MTTD, MTTC, or MTTR.
 
-Resources under load behave as queueing systems. The **Utilization Law** from operational analysis:
-
-$$U = X \cdot S$$
-
-where $U \in [0, 1]$ is utilization, $X$ is throughput (requests/sec), and $S$ is mean service time per request (seconds). This is a tautology — it holds for any stable system regardless of arrival distribution.
-
-The M/M/1 result (Poisson arrivals, exponential service, single server) gives mean residence time (wait plus service):
-
-$$R = \frac{S}{1 - U}$$
-
-Substituting concrete utilization values:
-
-| $U$ | $R / S$ |
-|-----|---------|
-| 0.50 | 2× |
-| 0.80 | 5× |
-| 0.90 | 10× |
-| 0.95 | 20× |
-| 0.99 | 100× |
-
-This is why systems appear fine and then suddenly do not — $R$ is hyperbolic in $U$ near saturation. At 80% CPU utilization, mean response time is already 5× the service time at zero load. The practical implication: never plan to run a resource above 70% sustained utilization if you have latency SLOs. Leave headroom for traffic bursts and garbage collection pauses.
-
-For a multi-server system (M/M/m), adding servers reduces $R$ superlinearly near saturation, which is why horizontal scaling is more effective than vertical scaling when $U > 0.7$: each additional server disproportionately reduces queue depth.
-
-**Little's Law** relates queue depth, throughput, and residence time:
-
-$$N = X \cdot R$$
-
-where $N$ is the mean number of requests in the system. If throughput doubles with no change in queue depth, residence time halved — latency improved. If queue depth grows faster than throughput, residence time is rising — degradation in progress. Both relationships hold at any measurement granularity.
-
-### Incident Detection: What to Instrument
-
-The signals that predict SLI violations, in order of lead time:
-
-1. **Saturation signals** — CPU run queue depth, memory pressure, I/O queue depth. These lead SLI violations by seconds to minutes because they reflect resource contention before user-visible latency degrades.
-2. **SLI violations** — directly measure user experience; zero lead time by definition.
-3. **Error rates** — `ENOSPC`, TCP retransmit rate, storage I/O errors — indicate specific resource failures and can occur simultaneously with or before latency degradation.
-
-A CPU run queue growing from $1 \times$ CPU count to $4 \times$ CPU count predicts latency degradation before the latency alert fires, because threads are waiting to run rather than running. By the time $P_{99}$ latency crosses its threshold, the queue has been growing for tens of seconds.
+### Exercise 3 (Hard) – Capacity Planning with Variability
+A micro‑service processes requests with arrival rate λ = 250 req/s (Poisson). Each instance (single CPU) can serve μ₀ = 350 req/s with service‑time SCV $C_s = 0.8$. The 99th‑percentile latency SLO is 80 ms. Using the Kingman approximation for G/G/1 queues, determine the minimum number of identical instances *n* required to meet the SLO. Show the derivation and any numerical solving method you use (e.g., Newton‑Raphson iteration).  
 
 ---
 
 ## Linux Connection
+### Kernel Subsystems & System Calls Relevant to Reliability
+| Subsystem | Purpose | Key Interfaces / Files |
+|-----------|---------|------------------------|
+| **`printk` / `klogctl`** | Kernel logging; feeds `/dev/kmsg` and `syslog` | `int syslog(int type, char *bufp, int len);` |
+| **`journald` (systemd)** | Structured, indexed journal; forward‑compatible with syslog | `/var/log/journal/`, `journalctl -u <unit>` |
+| **`inotify` / `fanotify`** | File‑system event notification for monitoring config changes | `int fd = inotify_init1(IN_NONBLOCK|IN_CLOEXEC);` |
+| **`cgroups v2`** | Resource isolation (CPU, memory, I/O) to bound faulty workloads | `/sys/fs/cgroup/`, `cgcreate`, `cgset` |
+| **`namespaces` (pid, net, mnt, ipc, uts, user)** | Process isolation; limits blast radius of compromised containers | `unshare(CLONE_NEWNET)`, `setns(fd, CLONE_NEWPID)` |
+| **`watchdog`** | Hardware‑timer that triggers reset if userspace fails to ping | `/dev/watchdog`, `ioctl(fd, WDIOC_SETTIMEOUT, &timeout)` |
+| **`kexec` / `kdump`** | Fast reboot and crash‑dump capture for post‑mortem analysis | `systemctl kexec`, `/proc/sys/kernel/kexec_load`, `/proc/sys/kernel/kexec_crash_load` |
+| **`perf` & `eBPF`** | Low‑overhead profiling, tracing syscalls, scheduler events | `perf record -g -a sleep 30`, `bpftrace -e 'tracepoint:syscalls:sys_enter_* { @[comm] = count(); }'` |
+| **`futex`** | Fast userspace locking; contention leads to priority inversion → latency spikes | `int futex(int *uaddr, int op, int val, const struct timespec *timeout, int *uaddr2, int val3);` |
 
-### Measuring Latency SLIs from Application Logs
-
-For HTTP services, extract latency percentiles directly from access logs without external tooling. Nginx adds request duration to access logs with `$request_time` (seconds, milliseconds resolution). Confirm your log format includes it:
-
+### Representative Commands & Code Snippets
 ```bash
-# Check the log_format in nginx config — $request_time is seconds as float
-grep log_format /etc/nginx/nginx.conf /etc/nginx/conf.d/*.conf
+# 1. Detect high error rate via journalctl
+journalctl -u nginx.service --since "5 min ago" \
+  | grep -c " 500 "   # count 5xx responses in last 5 min
+
+# 2. Contain offending IP with nftables (modern replacement for iptables)
+nft add rule inet filter input ip saddr 203.0.113.45 drop
+
+# 3. Eradicate by rolling back a faulty deployment (kubectl)
+kubectl rollout undo deployment/frontend --namespace=prod
+
+# 4. Verify service health with curl loop
+while ! curl -s -o /dev/null -w "%{http_error}\n" http://svc.local/health; do
+    sleep 2
+done
+
+# 5. Collect kernel trace of syscalls during an incident (eBPF)
+bpftrace -e '
+tracepoint:syscalls:sys_enter_openat
+{
+    @[args->filename] = count();
+}
+interval:s:5
+{
+    print(@);
+    clear(@);
+}'
 ```
 
-Compute percentiles from a log file where the last field is latency in milliseconds:
+### C Example: Using `timerfd` to Implement a Watchdog Ping
+```c
+#include <sys/timerfd.h>
+#include <unistd.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdint.h>
 
-```bash
-# Extracts last field (latency), sorts numerically, computes P50/P99/P999
-awk '{print $NF}' /var/log/nginx/access.log \
-  | sort -n \
-  | awk 'BEGIN{c=0} {a[c++]=$1} END{
-      p50  = a[int(c*0
+int main(void) {
+    int tfd = timerfd_create(CLOCK_MONOTONIC, TFD_NONBLOCK | TFD_CLOEXEC);
+    if (tfd < 0) { perror("timerfd_create"); exit(1); }
+
+    struct itimerspec its = {
+        .it_interval = { .tv_sec = 10, .tv_nsec = 0 }, // ping every 10s
+        .it_value    = { .tv_sec = 10, .tv_nsec = 0 }
+    };
+    if (timerfd_settime(tfd, 0, &its, NULL) == -1) {
+        perror("timerfd_settime"); exit(1);
+    }
+
+    while (1) {
+        uint64_t expirations;
+        ssize_t s = read(tfd, &expirations, sizeof(expirations));
+        if (s != sizeof(expirations)) { perror("read"); exit(1); }
+        // Ping the hardware watchdog here, e.g., ioctl(fd, WDIOC_KEEPALIVE, 0);
+        printf("Watchdog ping %llu\n", (unsigned long long)expirations);
+    }
+}
+```
+This snippet shows how a userspace process can reliably feed the kernel watchdog, preventing automatic reboot while the service is healthy.
+
+---
+
+## Why This Matters
+Reliability engineering turns vague notions of “uptime” into quantitative, actionable controls. By expressing expectations as **SLOs** and translating them into **error budgets**, teams gain a clear, measurable trade‑off between feature velocity and stability. Incident response becomes a disciplined loop—detect, contain, eradicate, recover, learn—where each stage is grounded in observable system properties (MTTD, MTTC, MTTR) and can be automated with Linux primitives like `systemd`, `eBPF`, and `cgroups`. Capacity planning, informed by queueing theory and real‑time metrics, prevents over‑provisioning while guaranteeing tail‑latency targets. The Linux kernel supplies the exact mechanisms—system calls, tracing facilities, and resource isolators—to implement these principles in practice. Mastering these concepts enables engineers to build systems that do not merely *hope* to stay available, but *prove* it through observable, repeatable, and continuously improving processes. This foundation allows deeper exploration of distributed consensus, chaotic testing, and advanced observability, ultimately delivering software that meets the stringent demands of modern users and stakeholders.

@@ -10,168 +10,245 @@ resources:
     title: "The Linux Command Line (Shotts)"
 ---
 
-## Why This Matters
-
-Every process on Linux runs as a specific user and belongs to specific groups. Every file has an owner and a set of permission bits. When a process tries to open a file, the kernel checks these identities against those bits before allowing the operation. Understanding this from first principles means you can reason about *why* a permission denied error occurs, trace it to a specific mismatch between an effective UID and an inode's `st_uid`, and fix it precisely — rather than reaching for `chmod 777`.
-
----
-
 ## Core Concepts
+### Users, Groups, and Identities
+Every process in Linux carries three integer identifiers that the kernel uses for permission checks: the real UID (`ruid`), the effective UID (`euid`), and the saved set‑UID (`suid`). Likewise there are real, effective, and saved GIDs. When a program executes, the kernel sets `euid` and `egid` to the values found in the password entry for the user that invoked the program (unless the binary has the set‑UID bit set, in which case `euid` becomes the file’s owner UID). Supplementary group IDs are obtained from `/etc/group` and stored in the task’s credential struct.  
+**Why:** The kernel’s access‑check algorithm compares the requester’s `euid`/`egid` (and supplementary GIDs) against the file’s owner UID, owning GID, and ACL entries. Using effective IDs allows a privileged program to temporarily drop privileges (via `seteuid`) while still being able to regain them later.
 
-### User and Group Identity
-
-Every process carries multiple numeric IDs in its kernel-maintained task struct (`task_struct` in `include/linux/sched.h`):
-
-- **Real UID / Real GID** — the identity of the user who launched the process; inherited across `fork()`, used for accounting and `access(2)`
-- **Effective UID / Effective GID** — what the kernel actually checks for most permission decisions (file open, signal delivery, binding privileged ports)
-- **Saved set-user-ID** — a snapshot of the effective UID taken when a privilege transition occurs, enabling later restoration via `seteuid(2)` without requiring root
-- **Supplementary groups** — up to `NGROUPS_MAX` (typically 65536) additional GIDs, loaded from `/etc/group` at login; the kernel checks these during group permission tests
-
-These IDs are separate because privilege must be both *delegatable* and *revocable*. A daemon that starts as root can drop to an unprivileged UID by calling `setuid(2)`, then cannot regain root — because the saved set-UID was also overwritten. A set-UID program, by contrast, keeps the original real UID so it can be audited.
-
-Inspect a live process's credentials directly:
-
-```bash
-cat /proc/$$/status | grep -E '^(Uid|Gid|Groups)'
-```
-
-The four columns under `Uid` and `Gid` are: real, effective, saved, filesystem.
-
-### The Inode and Ownership
-
-Every file has an inode. The inode stores:
-
-- `st_uid` — the owning user ID
-- `st_gid` — the owning group ID
-- `st_mode` — a bitmask encoding the file type and the nine permission bits plus three special bits
-
-Ownership is a property of the inode, not the filename. A hard link is just a directory entry pointing to the same inode. Creating a hard link does not create a new permission set — there is only one, shared by all names that resolve to that inode.
-
-### Mode Bits: The Permission Bitmask
-
-The lower 12 bits of `st_mode` encode permissions:
-
-$$\underbrace{b_{11}\ b_{10}\ b_9}_{\text{special}} \quad \underbrace{b_8\ b_7\ b_6}_{\text{owner}} \quad \underbrace{b_5\ b_4\ b_3}_{\text{group}} \quad \underbrace{b_2\ b_1\ b_0}_{\text{other}}$$
-
-Each of the three permission triples encodes read/write/execute as:
-
-$$\text{value} = 4r + 2w + x$$
-
-So mode `0644` decomposes as:
-
-| Bits | Octal | Who | Permissions |
-|------|-------|-----|-------------|
-| `110` | 6 | owner | read + write |
-| `100` | 4 | group | read only |
-| `100` | 4 | other | read only |
-
-The three special bits are:
-
-- **Set-UID (SUID, bit 11)** — on an executable, the kernel sets the process's effective UID to `st_uid` at `execve(2)` time. This is how `passwd(1)` can write to `/etc/shadow` (owned by root) when run by an unprivileged user.
-- **Set-GID (SGID, bit 10)** — analogous for GID. On a *directory*, new files created inside inherit the directory's GID rather than the creator's primary GID — critical for shared project directories.
-- **Sticky bit (bit 9)** — on a directory, prevents users from deleting or renaming files they do not own, even with write permission on the directory. This is why `/tmp` (mode `1777`) is world-writable but users cannot delete each other's files.
-
-To inspect the raw numeric mode of a file:
-
-```bash
-stat -c '%a %U %G %n' /tmp /usr/bin/passwd /etc/shadow
-```
-
-### The Permission Check Algorithm
-
-When a process accesses a file, the kernel applies exactly **one** of the three permission triples — in order, stopping at the first match:
-
-1. If `euid == st_uid`: apply the **owner** bits
-2. Else if `egid` or any supplementary GID matches `st_gid`: apply the **group** bits
-3. Else: apply the **other** bits
-
-This has a non-obvious consequence: if the owner triple denies access but the group triple would grant it, and the process is the owner, the access is still **denied**. The kernel does not OR the triples together. A file with mode `0064` is readable by the group but not by the owner.
-
-Root (`euid == 0`) bypasses read and write checks entirely. It still needs at least one execute bit set *anywhere* on the file to execute it — this prevents accidentally running non-executable data files as root.
-
-### The umask
-
-When a file is created, the kernel applies the process's umask to strip bits from the mode requested by the caller:
-
-$$\text{actual\_mode} = \text{requested\_mode}\ \&\ (\sim\text{umask})$$
-
-A umask of `0022` (octal) strips write permission from group and other. If `open(2)` requests mode `0666`:
-
-$$0666_8\ \&\ \sim 0022_8 = 0666_8\ \&\ 0755_8 = 0644_8$$
-
-In binary:
-
-$$\underbrace{110\ 110\ 110}_{0666}\ \&\ \underbrace{111\ 101\ 101}_{0755} = \underbrace{110\ 100\ 100}_{0644}$$
-
-The umask is *subtractive only* — it can remove bits, never add them. It is per-process, inherited across `fork()`, and invisible to other processes. There is no syscall that reads the umask without also setting it (see the C example below).
-
-### ACLs: Access Control Lists
-
-The nine mode bits cannot express "grant write access to exactly one additional user." POSIX ACLs solve this by attaching a named permission table to the inode, stored in an extended attribute (`security.posix_acl_access` or `system.posix_acl_access` depending on implementation). An ACL entry looks like:
+### Mode Bits (the traditional UNIX permission model)
+Each inode stores a 16‑bit `i_mode` field. The low 9 bits encode the classic *read/write/execute* for *owner/group/others*:
 
 ```
-user::rwx
-user:alice:rw-
-group::r--
-mask::rw-
-other::---
+bits 8‑6 → owner   (rwx)
+bits 5‑3 → group   (rwx)
+bits 2‑0 → others  (rwx)
 ```
 
-The `mask` entry is critical: it caps effective permissions for all *named* users and named groups (but not the owning user or `other`). If `alice` has `rwx` but `mask` is `rw-`, alice's effective permission is `rw-`. This lets you reduce the ceiling without editing every named entry.
+A permission bit is **1** if the corresponding access is granted. The numeric value of each triad is computed as:
 
-ACLs require filesystem support (ext4, xfs, btrfs all provide it). When an ACL is present, the `ls -l` output shows a trailing `+` on the mode string.
-
-```bash
-# Set an ACL
-setfacl -m u:alice:rw /path/to/file
-
-# Inspect the ACL
-getfacl /path/to/file
-
-# Remove a specific ACL entry
-setfacl -x u:alice /path/to/file
+```
+owner_bits   = 4*r_owner + 2*w_owner + 1*x_owner
+group_bits   = 4*r_group  + 2*w_group  + 1*x_group
+other_bits   = 4*r_other  + 2*w_other  + 1*x_other
+mode         = (owner_bits << 6) | (group_bits << 3) | other_bits
 ```
 
-### sudo
+*Example:* `rwxr-x---` → owner = 7 (111), group = 5 (101), others = 0 (000) → mode = (7<<6)|(5<<3)|0 = 0o750.
 
-`sudo` is a set-UID-root executable (`ls -l /usr/bin/sudo` shows mode `4755`, with the SUID bit set). When a normal user runs it, `execve` sets the effective UID to 0 because `st_uid` is 0 and SUID is set. `sudo` then:
+**Why this layout?** The VFS permission check (`inode_permission`) extracts these three fields with shifts and masks, then compares them against the caller’s credentials. The simplicity makes the check O(1) and storable in the inode without extra allocation.
 
-1. Reads `/etc/sudoers` (which must be owned by root and not writable by others — `sudo` refuses to run if this is violated)
-2. Checks whether the real UID is authorized for the requested command
-3. Calls `execve(2)` on the target command with root's effective UID
-
-The entire security of `sudo` collapses if `/etc/sudoers` or the `sudo` binary itself can be written by an unprivileged user. Always edit `/etc/sudoers` via `visudo`, which validates syntax before writing.
-
----
-
-## How It Works
-
-### Stat and the Mode Field
-
-The `stat(2)` syscall fills a `struct stat`. Masking `st_mode` with `07777` isolates the 12 permission bits; masking with `S_IFMT` (`0xF000`) isolates the file type.
+### Access Control Lists (ACLs) – POSIX.1e Extensions
+When the filesystem is mounted with the `acl` option, each inode can have an extended attribute named `system.posix_acl_access` (and optionally a default ACL for directories). An ACL is a variable‑length array of `struct posix_ace` entries:
 
 ```c
-#include <sys/stat.h>
-#include <stdio.h>
-
-int main(void) {
-    struct stat sb;
-    if (stat("/etc/shadow", &sb) == -1) {
-        perror("stat");   /* likely EACCES or ENOENT */
-        return 1;
-    }
-    printf("uid=%u  gid=%u  mode=%04o  type=%s\n",
-           (unsigned)sb.st_uid,
-           (unsigned)sb.st_gid,
-           (unsigned)(sb.st_mode & 07777),
-           S_ISREG(sb.st_mode) ? "regular" :
-           S_ISDIR(sb.st_mode) ? "directory" : "other");
-    return 0;
-}
+struct posix_ace {
+    __le16 e_tag;   // ACL_USER_OBJ, ACL_USER, ACL_GROUP_OBJ, ACL_GROUP, ACL_MASK, ACL_OTHER
+    __le32 e_id;    // UID or GID for USER/GROUP entries, ignored otherwise
+    __le16 e_perm;  // permission bits (same layout as mode bits)
+};
 ```
 
-On a typical system, `/etc/shadow` is owned by `root:shadow`, mode `0640` — readable only by root and members of the `shadow` group. `passwd(1)` accesses it through its set-UID-root effective UID, not through group membership.
+Evaluation order (performed by the VFS after checking traditional mode bits):
 
-### Checking Permissions: access(2) vs. Attempting the Operation
+1. If the requester’s `euid` equals the file owner UID → check `ACL_USER_OBJ`.
+2. Else if there is an entry with `e_tag == ACL_USER` and `e_id == euid` → use that entry.
+3. Else check all `ACL_GROUP` entries whose `e_id` matches any of the requester’s supplementary GIDs; compute the union of their permissions.
+4. If an `ACL_MASK` entry exists, the union from step 3 is masked (bitwise AND) with its permissions.
+5. Finally, if none of the above matched, check `ACL_OTHER`.
 
-`access(2)` checks permissions using the **real** UID/GID, not the effective UID. This exists specifically so set-UID programs can ask: "would the *actual user who invoked me* be allowed to read this file?" But it has a
+The effective permission is the union of the applicable user entry (if any) and the masked group union.  
+**Why:** ACLs let you grant permissions to specific users or groups without changing the file’s owning UID/GID, which is essential for shared directories (e.g., a project folder where several developers need read/write but no single Unix group maps exactly to that set).
+
+### Privilege Escalation with sudo
+`sudo` is a set‑uid root executable (`/usr/bin/sudo`). When invoked, it:
+
+1. Changes its `euid` to 0 (root) via the set‑uid bit.
+2. Reads `/etc/sudoers` (or included files) to determine whether the invoking user is allowed to run the requested command, optionally with a password prompt.
+3. If authorized, it creates a new process via `fork()` and `execve()` that runs the target command with `euid` = 0 (and usually `egid` = 0). The environment is sanitized unless `env_keep` or `env_reset` options are set.
+4. After successful authentication, sudo writes a timestamp file (`/var/run/sudo/ts/<user>`) to allow password‑free sudo for a configurable timeout (default 5 min).
+
+**Why this design?** The set‑uid root bit gives sudo the necessary privilege to consult the sudoers policy and spawn a root‑owned child. The policy file enforces *least privilege* by specifying exactly which commands (and arguments) a user may run as root, reducing the attack surface compared to logging in as root directly.
+
+## How It Works
+### Permission Check Flow in the VFS
+When a syscall such as `openat(dirfd, pathname, flags)` reaches the VFS:
+
+1. The dentry’s inode is looked up.
+2. `inode_permission(inode, mask, unsigned int flags)` is called, where `mask` encodes the requested operation (`MAY_READ`, `MAY_WRITE`, `MAY_EXEC`).
+3. The function extracts the caller’s credentials: `uid = current_cred()->euid`, `gid = current_cred()->egid`, and the supplementary group list.
+4. It compares `uid` against `inode->i_uid` and `gid` (plus supplementary groups) against `inode->i_gid`.
+5. **If the caller is the owner**, the permission bits shifted for the owner (`(mode >> 6) & 0x7`) are tested against `mask`.
+6. **Else if the caller’s groups match the owning group**, the group bits (`(mode >> 3) & 0x7`) are tested.
+7. **Else**, the other bits (`mode & 0x7`) are tested.
+8. If any of the above succeeds, the check returns 0 (permission granted).  
+   If all fail, the VFS then looks for a POSIX ACL:
+   - Retrieve `system.posix_acl_access` via `getxattr`.
+   - Parse the ACE list and apply the algorithm described in the Core Concepts section.
+   - If the ACL grants the requested bit, return 0; otherwise return `-EACCES`.
+
+Thus ACLs are consulted *only* after the traditional mode bits have been denied, providing a fallback that preserves backward compatibility.
+
+### UMask and Default Mode Creation
+When a process creates a new file via `creat()` or `open(..., O_CREAT)`, the kernel takes the mode argument supplied by the caller and clears the bits set in the process’s file mode creation mask (`umask`). Mathematically:
+
+```
+granted_mode = requested_mode & ~umask
+```
+
+If the caller does not specify a mode (e.g., `open(..., O_WRONLY|O_CREAT)`), the default is `0666` for files and `0777` for directories before umask application.  
+**Why:** This allows users to enforce a baseline privacy policy (e.g., `umask 0027` → new files get `640`, directories `750`) without having to remember to `chmod` each new object.
+
+### Sudo Authentication and Timestamp Mechanics
+The sudo PAM module (`pam_sudo`) performs the following steps:
+
+1. **Conversation:** Prompts the user for a password (unless `targetpw` is set or the user is listed with `NOPASSWD`).
+2. **Verification:** Calls `crypt()` or the system’s password hashing scheme (usually SHA‑512) against the entry in `/etc/shadow`.
+3. **Success:** Updates the timestamp file:
+   ```
+   touch /var/run/sudo/ts/$USER
+   ```
+   The file’s modification time is compared against `timeout` (default 300 s). If `now - mtime < timeout`, subsequent sudo invocations skip the password prompt.
+4. **Failure:** Logs the attempt via syslog and returns authentication error.
+
+The timestamp file is owned by root and mode `0700` to prevent other users from tampering with it.
+
+## Worked Examples
+### Example 1: Computing Mode from Symbolic Permission
+**Goal:** Set a file’s mode to `rw-r--r--` (owner read/write, group read, others read).  
+**Step‑by‑step:**
+1. Owner: `rwx` → `rw-` → `4+2+0 = 6`.
+2. Group: `rwx` → `r--` → `4+0+0 = 4`.
+3. Others: `rwx` → `r--` → `4+0+0 = 4`.
+4. Combine: `mode = (6<<6) | (4<<3) | 4 = 0b110_100_100 = 0o644`.
+5. Apply with `chmod`:
+   ```bash
+   $ touch example.txt
+   $ chmod 644 example.txt
+   $ stat -c "%a %n" example.txt
+   644 example.txt
+   ```
+
+### Example 2: Creating an Effective ACL with Mask
+**Scenario:** Give user `alice` read/write, group `staff` read-only, and mask to limit group to read.  
+**Commands:**
+```bash
+$ touch shared.txt
+$ setfacl -m u:alice:rw shared.txt          # user ACL entry
+$ setfacl -m g:staff:r  shared.txt          # group ACL entry
+$ setfacl -m m:r        shared.txt          # mask = read only
+$ getfacl shared.txt
+# file: shared.txt
+# owner: alice
+# group: alice
+user::rw-
+user:alice:rw-                     #effective:rw-
+group::r-
+group:staff:r-                     #effective:r-
+mask::r-
+other::r-
+```
+**Explanation:** The mask (`m:r`) forces the union of all group entries (`group::r-` and `group:staff:r-`) to be AND‑ed with `r-`, resulting in effective `r-` for both the owning group and the `staff` group. Without the mask, `staff` would have inherited the owning group’s `rw-` (if the file were group‑writable).
+
+### Example 3: sudoers Policy and Timestamp
+**Goal:** Allow user `deploy` to restart `nginx` without a password, but require a password for any other command.  
+**Edit `/etc/sudoers.d/deploy_nginx` (using `visudo`):**
+```nginx
+deploy ALL=(root) NOPASSWD: /usr/sbin/systemctl restart nginx
+deploy ALL=(root) PASSWD: ALL
+```
+**Test:**
+```bash
+$ sudo -u deploy -v   # refresh timestamp, will prompt for password
+[sudo] password for deploy: ******
+$ sudo -u deploy systemctl restart nginx   # no password prompt
+$ sudo -u deploy ls /root                  # password required again
+```
+**Why:** The first line matches the exact command path with `NOPASSWD`; the second line is a catch‑all that requires authentication. The timestamp file is updated after the `-v` validation, so the `restart` command runs without prompting if executed within the timeout window.
+
+## Common Mistakes
+| Mistake | What’s Wrong | Why It Matters |
+|---------|--------------|----------------|
+| **Assuming `chmod` affects ACLs** | Running `chmod` only modifies the low‑9‑bit mode; existing ACL entries remain unchanged. | A file may appear to have permissive mode bits (`755`) while an ACL still restricts a specific user, leading to confusing “access denied” errors. |
+| **Ignoring the ACL mask** | Adding a user ACE with `rwx` but leaving the mask at `r--` results in that user getting only read access. | The mask limits the effective permissions of all named user and group entries; forgetting to adjust it yields over‑privileged or under‑privileged outcomes. |
+| **Using `sudo -i` to run a single command** | `sudo -i` launches a login shell as root, inheriting root’s environment; subsequent commands run in that shell without re‑checking sudoers. | If the shell is left open, any user with access to the terminal gains unrestricted root until the shell exits, violating least‑privilege. |
+| **Believing that `chgrp` changes the file’s owning group for ACL evaluation** | `chgrp` updates `i_gid`, but ACL entries that explicitly name a group (`ACL_GROUP`) still require the entry’s `e_id` to match the requester’s GID, not the file’s owning group. | In shared directories where a specific group (e.g., `devops`) needs access, merely changing the owning group won’t help unless an ACL entry for that group exists or the mask permits it. |
+| **Setting a overly permissive umask (e.g., `000`) and relying on `chmod` later** | Files are created with `666` (or `777` for dirs) then `chmod` reduces permissions; there is a race window where other users can read/write the file before `chmod` runs. | On multi‑user systems, this race can expose sensitive data (e.g., temporary keys) to unintended readers. The correct approach is to set an appropriate umask upfront. |
+
+## Exercises
+### Easy
+1. **Mode bits:** Create a file `test.txt`. Use `chmod` to set its mode to `020` (write‑only for owner). Verify with `stat -c "%a %n" test.txt`. Then try to read it as your user and note the error.  
+2. **Basic ACL:** Create a directory `acldir`. Give user `guest` read and execute access via `setfacl -m u:guest:rx acldir`. Use `getfacl` to confirm, then `su - guest -c "ls -ld acldir"` to verify access.
+
+### Medium
+3. **Umask effect:** Set `umask 0027`. Create a file `f1` and a directory `d1`. Check their default modes with `stat`. Explain why the file got `640` and the directory `750`.  
+4. **sudoers NOPASSWD:** Add a line to `/etc/sudoers.d/` allowing your user to run `/bin/df` without a password. Test with `sudo df -h`. Then attempt `sudo ls /root` and confirm you are prompted for a password.
+
+### Hard
+5. **C program – raw syscalls:** Write a C program that:
+   - Opens or creates a file `perm_test.bin` with mode `0640` using the `openat` syscall (`O_CREAT|O_WRONLY`).
+   - Calls `fchmod` to change the mode to `0660`.
+   - Retrieves the file’s ACL via `getxattr` (`system.posix_acl_access`) and prints each ACE in human‑readable form.
+   - Modifies the ACL to add an entry for UID `1000` (your user) with `rw` using `setxattr`.
+   - Compile and run as a regular user, then verify with `getfacl` and `strace`.
+6. **ACL mask calculation:** Given a file with mode `0640` and ACL entries:  
+   - `user::rw-`  
+   - `user:alice:rwx`  
+   - `group::r--`  
+   - `group:staff:rwx`  
+   - `mask::rwx`  
+   - `other::---`  
+   Compute the effective permissions for alice and for a process whose supplementary GIDs include the staff GID. Show your work using bitwise operations.  
+7. **sudo timestamp timeout:** Reduce sudo’s timestamp timeout to 30 seconds by editing `/etc/sudoers.d/` (`Defaults timestamp_timeout=0.5`). Verify that after authenticating, you have exactly 30 seconds to run another sudo command without a password, and that after 31 seconds you are prompted again.
+
+## Linux Connection
+### VFS Permission Checking
+- **Source:** `fs/namei.c` – function `inode_permission(const struct inode *inode, int mask, unsigned int flags)`.  
+- **Key data:** `inode->i_mode` (mode_t), `inode->i_uid`, `inode->i_gid`.  
+- **ACL retrieval:** `generic_get_acl(struct inode *inode, int type)` → `get_xattr(&init_user_ns, inode, POSIX_ACL_XATTR_ACCESS, …)`.
+
+### Syscall Wrappers
+```c
+/* change mode bits */
+int chmod(const char *pathname, mode_t mode);
+/* change mode bits of an open file descriptor */
+int fchmod(int fd, mode_t mode);
+
+/* POSIX ACL via extended attributes */
+ssize_t getxattr(const char *path, const char *name,
+                 void *value, size_t size);
+ssize_t setxattr(const char *path, const char *name,
+                 const void *value, size_t size, int flags);
+```
+The VFS forwards these to the filesystem’s `setattr`/`getxattr` implementations (e.g., ext4’s `ext4_setattr`).
+
+### Sudo Internals
+- **Binary:** `/usr/bin/sudo` (set‑uid root, mode `4755`).  
+- **Policy file:** `/etc/sudoers` (parsed by `sudoers.so` plugin).  
+- **PAM module:** `/usr/lib/x86_64-linux-gnu/security/pam_sudo.so`.  
+- **Timestamp directory:** `/var/run/sudo/ts/` (owned by root, mode `0755`). Each user gets a file named after their username; its mtime is checked against `timestamp_timeout`.
+
+### Relevant Kernel Structures
+```c
+struct inode {
+    umode_t    i_mode;   // permission bits + file type
+    kuid_t     i_uid;    // owner user ID (mapped to global uid)
+    kgid_t     i_gid;    // owner group ID
+    /* … */
+};
+struct posix_ace {
+    __le16 e_tag;
+    __le32 e_id;
+    __le16 e_perm;
+};
+```
+**Why this matters:** Understanding these structures lets you interpret `stat` output, debug permission denials via `dmesg` (look for `audit:` messages), and develop security tools that manipulate ACLs at the syscall level rather than relying solely on wrapper commands.
+
+## Why This Matters
+Mastering the interplay of mode bits, ACLs, and sudo equips you to enforce the principle of least privilege on a multi‑user Linux system. Mode bits give you a fast, immutable baseline; ACLs let you carve out precise exceptions without proliferating Unix groups; sudo provides a controlled, auditable gateway to root privileges. Together they form the foundation for:
+
+* **Container security:** Namespaces inherit the caller’s credentials; incorrect mode bits or overly permissive ACLs become immediate escape vectors.  
+* **Service hardening:** Daemons that drop privileges (via `setuid`) rely on correct file ownership and mode to read configuration or bind to privileged ports.  
+* **Shared workloads:** Projects like build farms or scientific clusters use ACLs to give specific users or groups access to intermediate data while keeping the broader system locked down.  
+* **Compliance:** Audits often require evidence that privileged commands are restricted via sudoers and that file permissions follow a documented policy (e.g., PCI‑DSS requirement 7).  
+
+By internalizing the mechanisms—how the VFS evaluates mode bits first, then falls back to POSIX ACLs, and how sudo brokers root access through a set‑uid binary and policy file—you gain the ability to diagnose permission failures accurately, harden systems against privilege escalation, and automate administrative tasks safely. This knowledge is not just theoretical; it translates directly into reliable, secure Linux administration.

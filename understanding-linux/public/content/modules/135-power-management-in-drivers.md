@@ -10,170 +10,450 @@ resources:
     title: "The Linux Programming Interface (Kerrisk)"
 ---
 
-## Why This Matters
-
-Every peripheral on a system has a power budget. A clock line toggling at $f$ Hz dissipates $$P_{dynamic} = \alpha C V^2 f$$ where $\alpha$ is the switching activity factor, $C$ is the total switched capacitance, and $V$ is the supply voltage. Even at idle, that clock is running unless the driver explicitly gates it. Multiply this across a SoC with dozens of peripherals and you get the difference between 8 hours of battery life and 4. When the system suspends, every driver must save whatever register state the hardware loses in power-off and quiesce any in-flight DMA — if a single driver skips the quiesce step, a DMA engine can write to memory after the CPU has already snapshotted it for hibernation, producing silent corruption that only manifests on the next boot.
-
-Runtime PM adds a finer dimension: a device can power down between uses within a single session, without user intervention, and power back up transparently before the next operation. The correctness constraint is the same — you cannot access hardware registers with the clock gated or the supply rail down — but now the window where that matters is milliseconds rather than hours.
-
----
-
 ## Core Concepts
+### Introduction to Power Management in Drivers
+Power management reduces energy consumption by aligning a device’s power draw with its actual workload. Energy E = ∫P(t) dt, where instantaneous power P(t) = P_dyn + P_stat. Dynamic power follows the well‑known formula  
 
-### The System Sleep Lifecycle
+$$P_{\text{dyn}} = \alpha C V^{2} f$$  
 
-`systemctl suspend` invokes the kernel's `PM_SUSPEND_MEM` path. Userspace tasks are frozen first (via `SIGSTOP` delivered by the freezer), then drivers are suspended in reverse-probe order — children before parents — because a child cannot save state through a bus that is already powered down. The call chain ends in a platform-specific low-power entry: on x86 this calls `acpi_suspend_enter()`, which executes the `\_S3` method from the ACPI DSDT table and cuts power to DRAM's self-refresh support circuitry while keeping DRAM itself alive.
+with switching activity α, load capacitance C, supply voltage V, and clock frequency f. Static (leakage) power grows exponentially with temperature and roughly linearly with V. Lowering V or f therefore yields quadratic (V) or linear (f) savings, while turning off clocks eliminates P_dyn entirely. The Linux kernel exposes these levers through three interlocking subsystems: the **power management (PM) core**, the **clock framework**, and the **regulator framework**. Drivers hook into them via standard callbacks so that the kernel can coordinate transitions without needing to know device‑specific details.
 
-On resume, the order reverses. The kernel calls each driver's `.resume` callback in forward-probe order. A driver that fails to restore its hardware state — by writing back saved registers, re-enabling DMA — will appear to work until the first operation hits a register that reset to its power-on default.
+### Power Management Core
+The PM core lives in `drivers/base/power/` and tracks each device’s power state via `struct dev_pm_info` embedded in `struct device`. Key fields:
 
-The four callbacks a driver registers for system sleep are:
+- `power.state` – current PM state (`PM_ON`, `PM_SUSPEND`, etc.).
+- `power.runtime_status` – `RPM_ACTIVE`, `RPM_SUSPENDED`, `RPM_IDLE`.
+- `power.autosuspend_delay_ms` – threshold after which the core may auto‑suspend an idle device.
+- `power.use_autosuspend` – enables autosuspend logic.
+- `power.skip_sysfs` – if set, the device will not appear under `/sys/devices/.../power`.
 
-```c
-static const struct dev_pm_ops my_pm_ops = {
-    .suspend  = my_suspend,   /* system going to sleep              */
-    .resume   = my_resume,    /* system waking from sleep           */
-    .freeze   = my_freeze,    /* hibernation: snapshot state to RAM */
-    .restore  = my_restore,   /* hibernation: reload from snapshot  */
-};
-```
+The core defines a set of **PM callbacks** that drivers implement in `struct dev_pm_ops`:
 
-`.freeze` and `.restore` are the hibernation (S4) variants. The hardware loses power during S4, so `.restore` must bring the device to a fully operational state as if it were just probed. The distinction from `.resume` matters: after S3, the hardware retains state you didn't explicitly destroy; after S4, it does not.
+| Callback            | When invoked                                   | Typical driver work                              |
+|---------------------|-----------------------------------------------|--------------------------------------------------|
+| `prepare`           | Before any PM transition (suspend, runtime)   | Quiesce I/O, stop submitting new requests        |
+| `suspend`           | System‑wide suspend (e.g., `echo mem > /sys/power/state`) | Save hardware context, put clocks/regulators low |
+| `suspend_noirq`     | After interrupts are disabled                 | Disable IRQs, final power‑gate if safe          |
+| `resume_noirq`      | Before IRQs are re‑enabled                    | Restore minimal hardware state                  |
+| `resume`            | After IRQs are re‑enabled                     | Full re‑initialization, resume normal operation |
+| `runtime_suspend`   | Device idle, autosuspend triggered            | Put device into low‑power state, gate clocks    |
+| `runtime_resume`    | Device needed again                           | Restore clocks, bring out of low‑power state    |
+| `runtime_idle`      | No pending runtime PM requests, autosuspend delay elapsed | Decide whether to suspend (`return -EAGAIN` to let core autosuspend) |
+| `complete`          | After any PM operation finishes               | Cleanup, re‑enable wake‑up sources              |
 
-### Runtime PM
+Each callback receives a `struct device *dev` pointer; drivers retrieve private data via `dev_get_drvdata(dev)`. Returning a non‑zero value aborts the transition and leaves the device in its previous state.
 
-System suspend is all-or-nothing. Runtime PM is per-device. The kernel maintains a usage count per device. When `pm_runtime_get_sync()` increments it from zero, the runtime resume callback fires synchronously before the call returns — the caller gets a powered device. When `pm_runtime_put_autosuspend()` decrements it to zero, the kernel sets a timer for the autosuspend delay; if the count is still zero when the timer fires, the runtime suspend callback runs. If `pm_runtime_get_sync()` is called during that window, the timer is cancelled.
+### Runtime Power Management (RPM)
+RPM lets the kernel manage power **while the system is fully awake**. The core maintains a **reference count** for each device:
 
-The reference count is what makes this race-free: a DMA transfer that calls `pm_runtime_get_sync()` before starting and `pm_runtime_put()` after completion holds the device awake for exactly as long as needed. There is no separate timer polling device activity.
+- `pm_runtime_get(dev)` increments the count; if the count transitions from 0→1, the core calls `runtime_resume`.
+- `pm_runtime_put(dev)` decrements; if the count transitions from 1→0, the core may call `runtime_suspend` after `autosuspend_delay_ms` of idle time.
+- Variants `_sync` block until the operation completes; `_get_noresume` increments without forcing a resume (used in interrupt context).
 
-The autosuspend delay $t_{auto}$ must be long enough that the cost of powering down and back up — regulator ramp time $t_{ramp}$, PLL lock time $t_{pll}$, and firmware re-initialization time $t_{fw}$ — does not exceed the power saved:
+The **autosuspend delay** is a tunable trade‑off: too short → frequent wake‑up overhead; too long → wasted energy. The optimal delay can be derived from an energy‑balance model:
 
-$$P_{saved} \cdot t_{idle} > E_{transition} = P_{peak} \cdot (t_{ramp} + t_{pll} + t_{fw})$$
+Let  
+- $P_{a}$ = active power (device executing workload)  
+- $P_{s}$ = suspended power (deep‑sleep)  
+- $E_{w}$ = fixed energy cost of a wake‑up/suspend cycle (save/restore overhead)  
 
-If $t_{idle} < E_{transition} / P_{saved}$, runtime PM wastes energy on transitions. This is why USB input devices use 5-second autosuspend delays rather than 100 ms.
+If the device remains idle for a time $t$, the energy if we **stay active** is $E_{a}=P_{a}t$.  
+If we **suspend after a delay d**, the energy is  
 
-### Clock Control
+$$E_{s}=P_{a}d + P_{s}(t-d) + E_{w}$$
 
-The Common Clock Framework (CCF) abstracts clock hardware behind a uniform API. A clock has two operations that must happen in order: `clk_prepare()`, which performs slow work such as waiting for a PLL to lock (may sleep, never call from atomic context), and `clk_enable()`, which gates the clock on atomically (cannot sleep). The split exists because PLL lock times are $O(100\,\mu s)$ to $O(1\,ms)$ — holding a spinlock for that duration would be illegal. The paired teardown calls are `clk_disable()` and `clk_unprepare()`, in that order. The convenience wrappers `clk_prepare_enable()` and `clk_disable_unprepare()` call both in sequence and cover the common non-atomic case.
+Suspending is worthwhile when $E_{s} < E_{a}$, i.e.
 
-The device tree names the clocks a device consumes:
+$$t > d + \frac{E_{w}}{P_{a}-P_{s}}$$  
 
-```dts
-my_device: device@40010000 {
-    clocks = <&ccu CLK_BUS_UART0>, <&ccu CLK_UART0>;
-    clock-names = "bus", "mod";
-};
-```
+The kernel uses this inequality implicitly: after the autosuspend delay elapses, the core checks whether the device has any pending I/O; if not, it proceeds to suspend.
 
-The driver requests them by the names declared in `clock-names`.
+### Clock Framework
+Clocks are hierarchical; each `struct clk` represents a signal source with operations:
 
-### Voltage Regulators
+- `clk_prepare_enable(clk)` – ensures the clock’s parents are prepared, then enables the gate.
+- `clk_disable_unprepare(clk)` – reverses the sequence.
+- `clk_set_rate(clk, rate)` – attempts to reprogram the hardware to the requested frequency (returns `-EINVAL` if unsupported).
+- `clk_get_rate(clk)` – reads the current programmed rate.
 
-A clock gate eliminates $P_{dynamic}$ but not $P_{static}$ (leakage). To eliminate leakage, you must power off the supply rail. The regulator framework manages this. Like clocks, regulators are reference-counted: `regulator_enable()` increments the count and `regulator_disable()` decrements it; the rail only drops when the count reaches zero, so shared rails are safe.
+Power scales with $f$ (see $P_{\text{dyn}}$ formula). Drivers typically:
 
-After `regulator_enable()` returns, the voltage is not necessarily stable. The regulator has a ramp rate $r$ (V/µs) and a target voltage $V_{target}$, giving a settling time:
+1. Obtain a clock via `devm_clk_get(dev, "core")`.
+2. In `probe`, call `clk_prepare_enable(clk)`.
+3. In `runtime_suspend`, call `clk_disable_unprepare(clk)`.
+4. Optionally adjust rate based on load (DVFS) using `clk_set_rate`.
 
-$$t_{ramp} = \frac{V_{target}}{r}$$
+Regulators often gate clocks; changing a clock’s rate may require voltage scaling via the regulator framework.
 
-For a 1.8 V rail ramping at 0.1 V/µs, $t_{ramp} = 18\,\mu s$. Hardware clocks propagating signals before $t_{ramp}$ elapses can sample undefined voltages, corrupting the device's internal state machine. You must delay by $t_{ramp}$ between enabling the regulator and enabling the clock.
+### Regulator Framework
+Regulators supply controllable voltages (and sometimes currents) to devices. The core API (`drivers/regulator/`) provides:
 
----
+- `regulator_get(dev, "vdd")` – obtain a regulator reference.
+- `regulator_enable(r)` / `regulator_disable(r)` – toggle output.
+- `regulator_set_voltage(r, min_uV, max_uV)` – request a voltage window; the regulator chooses the lowest feasible voltage ≥ `min_uV`.
+- `regulator_get_voltage(r)` – read actual output.
+- `regulator_set_mode(r, mode)` – e.g., `REGULATOR_MODE_FAST` vs `REGULATOR_MODE_IDLE` for efficiency.
+
+Power saved by lowering voltage follows the quadratic term in $P_{\text{dyn}}$. A typical sequence for a device that supports DVFS:
+
+1. Enable regulator (`regulator_enable`).
+2. Set initial voltage (`regulator_set_voltage`).
+3. Enable and set clock rate.
+4. On load increase: request higher voltage → set higher clock rate.
+5. On load decrease: lower clock rate → lower voltage → disable if idle.
 
 ## How It Works
+### Power Management Core Internals
+When the kernel initiates a system suspend (e.g., via `/sys/power/state`), it walks the device tree depth‑first, invoking each device’s `prepare` → `suspend` → `suspend_noirq`. The **noirq** phase runs after `local_irq_disable()`, guaranteeing that no interrupt handlers will run while the device is being powered down. Conversely, resume walks upward, invoking `resume_noirq` → `resume`. This ordering ensures that parent buses (e.g., PCI, I²C) are still functional when child devices need to save/restore state that depends on bus traffic.
 
-### Suspend/Resume in Practice
+Runtime PM uses a **workqueue** (`pm_runtime_work_t`) to defer autosuspend decisions. When `pm_runtime_put_autosuspend` drops the refcount to zero, the core schedules a delayed work item that fires after `autosuspend_delay_ms`. If another `pm_runtime_get` occurs before the work runs, the work is cancelled, preventing unnecessary suspend/resume cycles.
 
-```c
-static int my_suspend(struct device *dev)
-{
-    struct my_priv *priv = dev_get_drvdata(dev);
+### Clock Control Details
+The clock framework isolates hardware-specific enabling/disabling in **clock drivers** (found in `drivers/clk/`). A clock node in device‑tree may look like:
 
-    /*
-     * Quiesce DMA before saving registers. An in-flight DMA burst
-     * may modify the same registers we are about to snapshot.
-     */
-    my_hw_stop_dma(priv);
-
-    /*
-     * Save registers while the clock is still running. Reading a
-     * register with the clock gated returns 0xdeadbeef or hangs the
-     * bus depending on the interconnect.
-     */
-    priv->saved_ctrl = readl(priv->base + CTRL_REG);
-    priv->saved_cfg  = readl(priv->base + CFG_REG);
-    priv->saved_irq  = readl(priv->base + IRQ_MASK_REG);
-
-    /* Gate clock after save, before power removal. */
-    clk_disable_unprepare(priv->clk);
-
-    /* Drop supply rail. Regulator framework handles shared rails. */
-    regulator_disable(priv->reg);
-
-    return 0;
-}
-
-static int my_resume(struct device *dev)
-{
-    struct my_priv *priv = dev_get_drvdata(dev);
-    int ret;
-
-    /* Rail first. */
-    ret = regulator_enable(priv->reg);
-    if (ret)
-        return ret;
-
-    /*
-     * Wait for voltage to stabilize. t_ramp is device-specific;
-     * read it from the regulator's "regulator-ramp-delay" property
-     * or from the datasheet. Here we use a fixed conservative value.
-     */
-    usleep_range(20, 30);   /* 20–30 µs for a typical 1.8 V rail */
-
-    /* Clock after rail. */
-    ret = clk_prepare_enable(priv->clk);
-    if (ret) {
-        regulator_disable(priv->reg);
-        return ret;
-    }
-
-    /* Restore state. Hardware is now clocked and supplied. */
-    writel(priv->saved_irq,  priv->base + IRQ_MASK_REG);
-    writel(priv->saved_cfg,  priv->base + CFG_REG);
-    writel(priv->saved_ctrl, priv->base + CTRL_REG);
-
-    return 0;
-}
-```
-
-The restore order within resume matters independently of the clock/rail ordering. If `CTRL_REG` initiates DMA when written, you must restore `CFG_REG` (which configures the DMA target address) before `CTRL_REG`. Read the hardware manual to determine which registers have side effects on write.
-
-Wire the ops into the driver:
-
-```c
-static const struct dev_pm_ops my_pm_ops = {
-    .suspend = my_suspend,
-    .resume  = my_resume,
-};
-
-static struct platform_driver my_driver = {
-    .driver = {
-        .name   = "my_device",
-        .pm     = &my_pm_ops,
-    },
-    .probe  = my_probe,
-    .remove = my_remove,
+```dts
+clocks {
+    osc: oscillator {
+        #address-cells = <0>;
+        #size-cells = <0>;
+        compatible = "fixed-clock";
+        clock-frequency = <24000000>;
+    };
+    pll: pll-clock {
+        compatible = "fixed-factor-clock";
+        clocks = <&osc>;
+        clock-div = <1>;
+        clock-mult = <20>;
+    };
 };
 ```
 
-### Runtime PM Lifecycle
+The core resolves `&osc` and `&pll` at probe time, constructing a graph where enabling the PLL automatically enables its parent oscillator. Power savings come from disabling unused branches; the core tracks **prepare counts** to avoid disabling a clock still needed by another consumer.
 
-Configure autosuspend in `probe`, after the device is operational:
+### Regulator Coordination
+Regulators expose **constraints** via regulator‑driver `struct regulator_constraints` (often supplied through device‑tree). These constraints tell the core the permissible voltage range, startup delay, and whether the regulator can be turned off. When a driver calls `regulator_set_voltage`, the core checks the constraints and may need to wait for the regulator’s internal settling time (exposed via `regulator_get_enable_time`/`regulator_get_disable_time`). Ignoring these times can cause the device to see an unstable supply, leading to brown‑outs or corrupted registers.
+
+### Interplay Example: DVFS Sequence
+Consider a CPU core that must scale from 800 MHz/0.9 V to 1.2 GHz/1.1 VF. The driver executes:
 
 ```c
-static int my_probe(struct platform_device *pdev)
+/* 1. Raise voltage first (to avoid frequency over‑voltage) */
+regulator_set_voltage(vdd_reg, 900000, 1100000); /* request 0.9‑1.1 V */
+regulator_enable(vdd_reg);
+
+/* 2. Wait for voltage to stabilize (optional, regulator driver may expose a callback) */
+usleep_range(10, 20);
+
+/* 3. Increase clock */
+clk_set_rate(cpu_clk, 1200000000);
+
+/* 4. Update governor statistics */
+```
+
+Reversing the order (clock then voltage) risks transient over‑frequency operation, which can cause timing violations or electromigration. The kernel’s **devfreq** subsystem encapsulates this pattern, but drivers that bypass it must respect the voltage‑first rule.
+
+## Worked Examples
+### Example 1: System Suspend/Resume Driver (Platform Bus)
+We implement a minimal platform driver for a hypothetical sensor that needs to save its register state during suspend.
+
+```c
+/* file: sensor_pm.c */
+#include <linux/module.h>
+#include <linux/platform_device.h>
+#include <linux/pm.h>
+#include <linux/io.h>
+
+struct sensor_dev {
+	void __iomem *base;
+	u32 saved_ctrl;   /* register to preserve */
+};
+
+static int sensor_prepare(struct device *dev)
 {
-    struct my_priv *priv;
-    int ret;
+	struct sensor_dev *sdev = dev_get_drvdata(dev);
+	/* Stop any ongoing conversions */
+	iowrite32(0, sdev->base + SENSOR_CTRL);
+	return 0;
+}
 
-    /* ... resource acquisition, clock and regulator setup ... */
+static int sensor_suspend(struct device *dev)
+{
+	struct sensor_dev *sdev = dev_get_drvdata(dev);
+	/* Save critical register */
+	sdev->saved_ctrl = ioread32(sdev->base + SENSOR_CTRL);
+	/* Put hardware in low‑power state */
+	iowrite32(SENSOR_CTRL_LOWPOWER, sdev->base + SENSOR_CTRL);
+	dev_dbg(dev, "sensor suspended, ctrl saved=%08x\n", sdev->saved_ctrl);
+	return 0;
+}
 
-    pm_runtime_set_active(&pdev->dev);   /* mark as active before enabling */
+static int sensor_resume(struct device *dev)
+{
+	struct sensor_dev *sdev = dev_get_drvdata(dev);
+	/* Restore saved state */
+	iowrite32(sdev->saved_ctrl, sdev->base + SENSOR_CTRL);
+	/* Re‑enable normal operation */
+	iowrite32(SENSOR_CTRL_NORMAL, sdev->base + SENSOR_CTRL);
+	dev_dbg(dev, "sensor resumed\n");
+	return 0;
+}
+
+static const struct dev_pm_ops sensor_pm_ops = {
+	.prepare = sensor_prepare,
+	.suspend = sensor_suspend,
+	.resume  = sensor_resume,
+};
+
+static int sensor_probe(struct platform_device *pdev)
+{
+	struct sensor_dev *sdev;
+	struct resource *res;
+
+	sdev = devm_kzalloc(&pdev->dev, sizeof(*sdev), GFP_KERNEL);
+	if (!sdev)
+		return -ENOMEM;
+
+	res = platform_get_resource(pdev, IORESOURCE_MEM, 0);
+	sdev->base = devm_ioremap_resource(&pdev->dev, res);
+	if (IS_ERR(sdev->base))
+		return PTR_ERR(sdev->base);
+
+	dev_set_drvdata(&pdev->dev, sdev);
+
+	/* Register PM ops */
+	pdev->dev.pm = &sensor_pm_ops;
+
+	return 0;
+}
+
+static int sensor_remove(struct platform_device *pdev)
+{
+	return 0;
+}
+
+static const struct of_device_id sensor_of_match[] = {
+	{ .compatible = "vendor,sensor-pm" },
+	{}
+};
+MODULE_DEVICE_TABLE(of, sensor_of_match);
+
+static struct platform_driver sensor_driver = {
+	.probe  = sensor_probe,
+	.remove = sensor_remove,
+	.driver = {
+		.name           = "sensor-pm",
+		.of_match_table = sensor_of_match,
+		.pm             = &sensor_pm_ops,
+	},
+};
+module_platform_driver(sensor_driver);
+MODULE_LICENSE("GPL");
+```
+
+**Explanation of steps**
+
+1. **prepare** halts new sensor conversions to avoid dangling DMA.
+2. **suspend** reads the control register (`SENSOR_CTRL`) and saves it in driver‑private memory, then writes a low‑power setting.
+3. **resume** restores the saved register and re‑enables normal mode.
+4. The driver registers its `dev_pm_ops` via the device’s `pm` pointer; the core will invoke these callbacks during system suspend/resume.
+
+### Example 2: Runtime Power Management with Autosuspend
+A USB‑like peripheral that processes packets intermittently.
+
+```c
+/* file: rpm_dev.c */
+#include <linux/module.h>
+#include <linux/usb.h>
+#include <linux/pm_runtime.h>
+#include <linux/delay.h>
+
+struct rpm_dev {
+	struct usb_device *udev;
+	u8 bulk_in_ep;
+	u8 bulk_out_ep;
+};
+
+static int rpm_runtime_suspend(struct device *dev)
+{
+	struct rpm_dev *rdev = dev_get_drvdata(dev);
+	/* Issue a vendor command to put the device into low power */
+	usb_control_msg(rdev->udev, usb_sndctrlpipe(rdev->udev, 0),
+	                0x01, /* vendor request: enter low power */
+	                USB_TYPE_VENDOR | USB_RECIP_DEVICE | USB_DIR_OUT,
+	                0, 0, NULL, 0, USB_CTRL_SET_TIMEOUT);
+	dev_dbg(dev, "runtime suspend issued\n");
+	return 0;
+}
+
+static int rpm_runtime_resume(struct device *dev)
+{
+	struct rpm_dev *rdev = dev_get_drvdata(dev);
+	/* Wake the device */
+	usb_control_msg(rdev->udev, usb_rcntrlpipes(rdev->udev, 0),
+	                0x02, /* vendor request: exit low power */
+	                USB_TYPE_VENDOR | USB_RECIP_DEVICE | USB_DIR_IN |
+	                USB_RECIP_DEVICE,
+	                0, 0, NULL, 0, USB_CTRL_SET_TIMEOUT);
+	dev_dbg(dev, "runtime resume issued\n");
+	return 0;
+}
+
+/* Called whenever we have a packet to process */
+static void rpm_process_packet(struct rpm_dev *rdev)
+{
+	/* Ensure runtime PM reference is held */
+	pm_runtime_get_sync(&rdev->udev->dev);
+	/* Submit URB, wait for completion … */
+	/* ... */
+	/* Release reference; autosuspend will trigger after delay */
+	pm_runtime_mark_last_busy(&rdev->udev->dev);
+	pm_runtime_put_autosuspend(&rdev->udev->dev);
+}
+
+static int rpm_probe(struct usb_interface *intf, const struct usb_device_id *id)
+{
+	struct rpm_dev *rdev;
+	struct usb_endpoint_descriptor *ep;
+
+	rdev = devm_kzalloc(&intf->dev, sizeof(*rdev), GFP_KERNEL);
+	if (!rdev)
+		return -ENOMEM;
+
+	rdev->udev = interface_to_usbdev(intf);
+	/* Find bulk-in/out endpoints */
+	usb_endpoint_foreach(ep, &intf->altsetting->endpoint) {
+		if (usb_endpoint_is_bulk_in(ep))
+			rdev->bulk_in_ep = ep->bEndpointAddress;
+		if (usb_endpoint_is_bulk_out(ep))
+			rdev->bulk_out_ep = ep->bEndpointAddress;
+	}
+
+	dev_set_drvdata(&intf->dev, rdev);
+
+	/* Enable runtime PM */
+	pm_runtime_use_autosuspend(&intf->dev);
+	pm_runtime_set_autosuspend_delay(&intf->dev, 100); /* 100 ms */
+	pm_runtime_get_noresume(&intf->dev);  /* start with refcount=1, no resume */
+	pm_runtime_put_autosuspend(&intf->dev); /* now let autosuspend logic work */
+
+	return 0;
+}
+
+static void rpm_disconnect(struct usb_interface *intf)
+{
+	pm_runtime_get_sync(&intf->dev);   /* ensure we are resumed before removal */
+	pm_runtime_put_noidle(&intf->dev);
+	pm_runtime_disable(&intf->dev);
+	usb_set_intfdata(intf, NULL);
+}
+
+static struct usb_driver rpm_driver = {
+	.name          = "rpm-dev",
+	.id_table      = rpm_ids,
+	.probe         = rpm_probe,
+	.disconnect    = rpm_disconnect,
+};
+module_usb_driver(rpm_driver);
+MODULE_LICENSE("GPL");
+```
+
+**Key points**
+
+- `pm_runtime_get_noresume` followed by `pm_runtime_put_autosuspend` seeds the reference count at 1 without forcing a resume; the core will resume on the first `get_sync`.
+- After processing a packet we call `pm_runtime_mark_last_busy` (updates the internal idle timer) then `pm_runtime_put_autosuspend`. If no further packets arrive within the autosuspend delay (here 100 ms), the core will invoke `runtime_suspend`.
+- The driver uses vendor‑specific control commands to actually put the hardware into a low‑power state; the PM core only manages the reference counting and timing.
+
+### Example 3: Clock Scaling and Regulator Coordination (DVFS)
+A simple driver that adjusts CPU‑like frequency based on a load metric.
+
+```c
+/* file: dvfs_demo.c */
+#include <linux/module.h>
+#include <linux/platform_device.h>
+#include <linux/clk.h>
+#include <linux/regulator/driver.h>
+#include <linux/delay.h>
+
+struct dvfs_dev {
+	struct clk *clk;
+	struct regulator *vdd;
+	unsigned long cur_rate;   /* current clock rate (Hz) */
+	int cur_uv;               /* current voltage (µV) */
+};
+
+static int dvfs_set_rate(struct dvfs_dev *d, unsigned long target_rate)
+{
+	int ret;
+	unsigned long min_uv, max_uv;
+	/* 1. Determine required voltage for target rate (simplified V/f curve) */
+	/* Assume Vmin = 600 mV + (rate/1GHz)*400 mV */
+	min_uv = 600000 + (target_rate / 2500000) * 40000; /* 40 mV per 250 MHz */
+	max_uv = min_uv + 50000; /* allow 50 mV tolerance */
+
+	/* 2. Scale voltage first */
+	ret = regulator_set_voltage(d->vdd, min_uv, max_uv);
+	if (ret)
+		return ret;
+	ret = regulator_enable(d->vdd);
+	if (ret)
+		return ret;
+
+	/* 3. Wait for regulator to settle (use regulator_get_enable_time if available) */
+	usleep_range(100, 200);
+
+	/* 4. Set clock */
+	ret = clk_set_rate(d->clk, target_rate);
+	if (ret) {
+		/* If clock fails, revert voltage to previous safe value */
+		regulator_set_voltage(d->vdd, d->cur_uv, d->cur_uv);
+		return ret;
+	}
+	d->cur_rate = target_rate;
+	d->cur_uv   = min_uv;
+	return 0;
+}
+
+static int dvfs_probe(struct platform_device *pdev)
+{
+	struct dvfs_dev *d;
+	struct device *dev = &pdev->dev;
+	int ret;
+
+	d = devm_kzalloc(dev, sizeof(*d), GFP_KERNEL);
+	if (!d)
+		return -ENOMEM;
+
+	d->clk = devm_clk_get(dev, "core");
+	if (IS_ERR(d->clk))
+		return PTR_ERR(d->clk);
+
+	d->vdd = devm_regulator_get(dev, "vdd");
+	if (IS_ERR(d->vdd))
+		return PTR_ERR(d->vdd);
+
+	dev_set_drvdata(dev, d);
+
+	/* Enable clock and regulator at a safe baseline */
+	ret = clk_prepare_enable(d->clk);
+	if (ret)
+		return ret;
+	ret = regulator_enable(d->vdd);
+	if (ret) {
+		clk_disable_unprepare(d->clk);
+		return ret;
+	}
+	/* Assume initial state: 800 MHz, 0.9 V */
+	d->cur_rate = 800000000;
+	d->cur_uv   = 900000;
+
+	return 0;
+}
+
+static void dvfs_remove(struct platform_device *pdev)
+{
+	struct dvfs_dev *d = dev_get_drvdata(&pdev->dev);
+	regulator_disable(d->vdd);
+	clk_disable_unprepare(d->clk);
+}
+
+/* Example sysfs attribute

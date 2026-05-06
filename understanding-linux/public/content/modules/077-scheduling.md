@@ -10,120 +10,259 @@ resources:
     title: "Modern Operating Systems (Tanenbaum)"
 ---
 
-## Why This Matters
-
-Every modern system runs more processes than it has CPU cores. Without a principled scheduling policy, a single CPU-bound process starves everything else — your shell freezes, your audio skips, your network stack stops responding. The scheduler decides which runnable process gets the CPU, for how long, and in what order. The consequences of getting it wrong are concrete: missed deadlines (a video frame drops because the decoder was preempted too late), wasted throughput (a server handles half the requests it could because context switches dominate), or starvation (a background job never finishes because higher-priority work never drains). In real-time systems, the scheduler makes explicit timing guarantees that human safety depends on.
-
----
-
 ## Core Concepts
+### Scheduling Fundamentals
+In an operating system the **scheduler** decides which runnable thread obtains the CPU next.  
+A thread is *runnable* when it is not blocked on I/O, a lock, or waiting for a timer.  
+The scheduler’s decision is guided by a **policy** that optimizes a combination of:
 
-### The Fundamental Tension: Latency vs. Throughput
+* **Throughput** – number of completed jobs per unit time.  
+* **Turnaround time** – $T_{turn} = T_{completion} - T_{arrival}$.  
+* **Waiting time** – $T_{wait} = T_{turn} - T_{burst}$.  
+* **Response time** – $T_{resp} = T_{first\_run} - T_{arrival}$ (important for interactive workloads).  
+* **Fairness** – often quantified by Jain’s fairness index  
+  $$
+  J = \frac{(\sum_{i=1}^n x_i)^2}{n \sum_{i=1}^n x_i^2},
+  $$  
+  where $x_i$ is the CPU time received by process $i$; $J=1$ denotes perfect fairness.
 
-**Turnaround time** measures end-to-end job duration:
+A policy must balance these metrics; improving one often degrades another (e.g., minimizing response time with a tiny quantum can increase context‑switch overhead and hurt throughput).
 
-$$T_{turnaround} = T_{completion} - T_{arrival}$$
+### Preemptive vs. Non‑preemptive
+* **Non‑preemptive** (FIFO, Shortest Job First) – a running thread keeps the CPU until it blocks or finishes.  
+* **Preemptive** (RR, MLFQ, CFS) – the scheduler can interrupt a thread after a time slice or when a higher‑priority thread becomes runnable. Preemption is essential for responsiveness but incurs **context‑switch overhead** $C_{cs}$ (typically 2–10 µs on x86‑64).
 
-**Response time** measures how long until a job first touches the CPU:
-
-$$T_{response} = T_{firstrun} - T_{arrival}$$
-
-These metrics are in direct conflict because of a structural asymmetry: minimizing turnaround time favors running jobs to completion without interruption (so no time is wasted on switching), while minimizing response time demands frequent switching (so no job waits long in the queue). You cannot simultaneously minimize both. Every scheduling policy picks a point in this tradeoff space, and any claim of "best scheduler" is meaningless without specifying which metric matters for the workload.
-
-### Preemption
-
-A **non-preemptive** scheduler lets a running process hold the CPU until it voluntarily yields — by blocking on I/O, calling `sleep()`, or exiting. This is simple to implement but gives CPU-bound processes infinite leverage: one tight loop can hold the CPU indefinitely.
-
-A **preemptive** scheduler uses a hardware timer interrupt — typically the local APIC timer on x86 — to forcibly reclaim the CPU after a fixed **time slice** (quantum). At each timer interrupt, the kernel saves the current process's register state, runs the scheduler, and may context-switch to a different process. The timer interrupt is what makes multiprogramming enforceable: no process can hold the CPU forever by accident or malice, because the hardware takes it back.
-
-The **context switch** itself is not free. Saving and restoring registers is the cheap part. The expensive parts are:
-- **TLB flush**: switching address spaces invalidates TLB entries on most architectures (PCID tagging reduces but does not eliminate this cost on x86-64).
-- **Cache pollution**: the incoming process has a different working set; its first accesses after a switch are likely L1/L2 cache misses.
-- **Pipeline and branch predictor state**: indirect branch predictors track per-process history; a switch effectively poisons them.
-
-This is why time slices cannot be made arbitrarily small. If a context switch costs $t_{cs}$ and the time slice is $q$, the fraction of CPU time wasted on switching is:
-
-$$f_{overhead} = \frac{t_{cs}}{t_{cs} + q}$$
-
-A 1ms time slice with a 10µs context switch wastes about 1% of CPU time on switches. Shrink $q$ to 10µs and you waste 50%.
-
-### Workload Assumptions and Why They Break
-
-Scheduling theory starts with simplifying assumptions: all jobs arrive simultaneously, runtimes are known, jobs are purely CPU-bound. Real workloads break all three. Jobs arrive at arbitrary times; runtimes are unknown and highly variable (a database query might run 1ms or 10 minutes); and processes alternate between CPU bursts and I/O waits. Any scheduler that performs well on textbook workloads but ignores these realities fails in production.
-
-### The Convoy Effect
-
-With a non-preemptive scheduler, a single long CPU-bound job forces every job behind it to wait, regardless of how short those jobs are. This is the **convoy effect**: short jobs pile up behind a long one the way cars pile up behind a truck on a single-lane road. Average turnaround time grows proportionally to the length of the blocking job, not to the average job length — which is why one badly behaved process can degrade a system's apparent responsiveness far beyond what its CPU share would suggest.
-
-### Fairness
-
-A scheduler is **fair** if every runnable process receives CPU time at a rate proportional to its assigned weight. With equal weights, each of $n$ processes should receive $\frac{1}{n}$ of the CPU. Fairness and optimal turnaround are in direct conflict: Shortest Job First, the provably optimal turnaround policy, is maximally unfair — it can starve long jobs indefinitely if short jobs keep arriving.
-
----
+### Core Policies
+| Policy | Decision Rule | Preemptive? | Typical Use |
+|--------|---------------|-------------|--------------|
+| FIFO (FCFS) | Earliest arrival → head of ready queue | No | Batch systems |
+| RR | Circular queue, fixed quantum $q$ | Yes | Time‑sharing |
+| MLFQ | Multiple queues with decreasing priority; threads move down after exhausting quantum, age‑based boost | Yes | General‑purpose OS |
+| CFS (Linux) | Virtual runtime $vruntime$; picks thread with smallest $vruntime$ | Yes (via timer tick) | Default Linux scheduler |
 
 ## How It Works
+### Scheduler Invocation Points
+The scheduler runs on three events:
+1. **Timer interrupt** – periodic tick (default $HZ=250$ → 4 ms) checks if current thread exceeded its slice.  
+2. **Blocking syscall** – e.g., `read()`, `mutex_lock()` when the resource is unavailable.  
+3. **Wakeup** – I/O completion, timer expiry, or `pthread_cond_signal()` puts a thread back on the runqueue.
 
-### FIFO / First-Come-First-Served
+At each point the scheduler executes `schedule()` (found in `kernel/sched/core.c`).
 
-Run jobs in arrival order, non-preemptively. Performance degrades severely when a long job arrives before short ones.
+### Data Structures
+* **runqueue (`struct rq`)** – per‑CPU structure containing:
+  * `curr` – pointer to currently running task.
+  * `cfs` – pointer to the CFS red‑black tree root.
+  * `nr_running` – count of runnable tasks.
+* **task struct (`struct task_struct`)** – holds:
+  * `pid`, `state`, `prio`, `static_prio`, `normal_prio`.
+  * `se` (`struct sched_entity`) – CFS fields: `vruntime`, `sum_exec_runtime`, `load_weight`.
+  * `rt` (`struct sched_rt_entity`) – real‑time fields for SCHED_FIFO/RR.
 
-**Example:** Three jobs arrive at $t = 0$. A runs for 100s, B for 10s, C for 10s.
+### Context Switch Mechanism
+When `schedule()` selects a new `next` task:
+1. **Save** registers of `curr` onto its kernel stack (`switch_to` assembly).  
+2. **Update** `curr->state` and `next->state` to `TASK_RUNNING`.  
+3. **Load** `next`’s registers and switch the page table if needed (`switch_mm`).  
+4. **Perform** any required lazy FPU state restore.  
 
-$$T_{A} = 100, \quad T_{B} = 110, \quad T_{C} = 120$$
+The total latency from timer interrupt to first instruction of `next$ is:
+$$
+L_{sched} = L_{tick} + L_{schedule} + C_{cs},
+$$
+where $L_{tick}$ is interrupt latency (~10 µs) and $L_{schedule}$ is the time to traverse the rbtree ($O(\log n)$).
 
-$$\bar{T} = \frac{100 + 110 + 120}{3} = 110 \text{ s}$$
+### CFS Core Idea (Derivation)
+CFS aims to allocate CPU proportionally to **weight** $w_i$ (derived from nice value).  
+Each task accumulates **virtual runtime**:
+$$
+vruntime_i(t) = \int_0^t \frac{w_{tot}}{w_i}\, dt,
+$$
+where $w_{tot} = \sum_j w_j$.  
+The scheduler picks the task with minimal $vruntime$, guaranteeing that over any interval $\Delta t$:
+$$
+\frac{\Delta t_i}{\Delta t} \approx \frac{w_i}{w_{tot}}.
+$$
+Thus, a nice‑+5 task ($w\approx 0.707$) receives roughly 70 % of the CPU of a nice‑0 task.
 
-Reorder so B arrives first:
+## Worked Examples
+### Example 1: FIFO with Overhead
+Three jobs arrive at $t=0$:  
+| P | $C_{burst}$ (ms) |
+|---|-----------------|
+| P1| 6 |
+| P2| 4 |
+| P3| 5 |
 
-$$\bar{T} = \frac{10 + 20 + 120}{3} = 50 \text{ s}$$
+Assume context‑switch cost $C_{cs}=0.2$ ms (negligible for FIFO).  
+Schedule:  
+* P1 runs $0\rightarrow6$ → ends at 6.  
+* Switch → P2 runs $6\rightarrow10$ → ends at 10.  
+* Switch → P3 runs $10\rightarrow15$ → ends at 15.
 
-Same jobs, same total work, 55% improvement in average turnaround — purely from ordering. This illustrates that FIFO's pathology is not about total work but about which jobs block which others.
+Metrics:  
+* Turnaround: $T_{turn}^{P1}=6$, $P2=10$, $P3=15$.  
+* Average waiting: $(0+6+10)/3 = 5.33$ ms.  
+* Throughput: $3/15 = 0.2$ jobs/ms.
 
-### Shortest Job First (SJF)
+### Example 2: Round‑Robin (q=2 ms) with Overhead
+Same jobs; $C_{cs}=0.2$ ms.  
+Gantt chart (including switch time):
+```
+0-2   P1
+2-2.2 cs
+2.2-4.2 P2
+4.2-4.4 cs
+4.4-6.4 P3
+6.4-6.6 cs
+6.6-8.6 P1 (rem 2)
+8.6-8.8 cs
+8.8-10.8 P2 (rem 0) → finishes
+10.8-11.0 cs
+11.0-13.0 P1 (rem 0) → finishes
+13.0-13.2 cs
+13.2-15.2 P3 (rem 1) → continues
+15.2-15.4 cs
+15.4-17.4 P3 (finishes)
+```
+Completion times: P1=13.0 ms, P2=10.8 ms, P3=17.4 ms.  
+Average waiting = $[(13-6)+(10.8-4)+(17.4-5)]/3 = 6.8$ ms.  
+Throughput = $3/17.4 ≈ 0.172$ jobs/ms – lower than FIFO due to quantum + switch overhead.
 
-Run the job with the shortest total runtime first, non-preemptively. Among all non-preemptive policies for jobs that arrive simultaneously, SJF is **provably optimal** for average turnaround time. The proof is by exchange argument: if any longer job $L$ precedes a shorter job $S$ in the schedule, swapping them reduces $T_{turnaround}$ for $S$ by the length of $L$, while increasing $T_{turnaround}$ for $L$ by the length of $S$. Since $len(S) < len(L)$, the net effect is a decrease in average turnaround.
+### Example 3: MLFQ with Aging (3 Queues)
+Quantums: Q0=5 ms, Q1=10 ms, Q2=∞ (FCFS).  
+Aging boost every 50 ms: any job waiting >50 ms moves to Q0.  
 
-The catch is fundamental: the OS does not know $len(S)$ in advance.
+Jobs:  
+* A: arrival 0, burst 30 ms  
+* B: arrival 10, burst 8 ms  
+* C: arrival 20, burst 4 ms  
 
-### Shortest Time-to-Completion First (STCF)
+Timeline (simplified):
+| Time | Running | Queue |
+|------|---------|-------|
+|0-5   | A       | Q0 (5/30 used) |
+|5-10  | A       | Q1 (now 15/30 left) |
+|10-15 | B arrives → Q0 (runs 5/8) |
+|15-20 | B → Q1 (remaining 3/8) |
+|20-25 | C arrives → Q0 (runs 4/4) → **C finishes at 24** |
+|25-30 | A (still Q1) runs 5/15 left |
+|30-35 | A → Q2 (FCFS) runs remaining 10/15 |
+|35-40 | B → Q2 runs remaining 3/8 |
+|40-45 | A finishes at 45 |
+|45-48 | B finishes at 48 |
 
-The preemptive extension of SJF. Whenever a new job arrives, compare its total runtime to the **remaining** runtime of the currently running job. If the newcomer is shorter, preempt immediately and run the newcomer. STCF is optimal for average turnaround time when jobs arrive at arbitrary times — by the same exchange argument as SJF, but applied to remaining work rather than total work.
+Aging never triggered because no job waited >50 ms.  
+Result shows how short jobs (C) preempt longer ones despite arriving later.
 
-**Example:** A arrives at $t=0$ with runtime 100s. B arrives at $t=10$ with runtime 10s. Under STCF:
-- A runs from $t=0$ to $t=10$ (10s elapsed, 90s remaining).
-- B arrives; $10 < 90$, so preempt A. B runs from $t=10$ to $t=20$.
-- A resumes at $t=20$, finishes at $t=110$.
+## Common Mistakes
+### Mistake 1: Assuming Burst Time Is Known
+*What’s wrong:* Many textbook algorithms (SJF, SRTF) require exact $C_{burst}$.  
+*Why it matters:* In real systems burst time is only estimable via past behavior (e.g., exponential averaging). Using a stale estimate can cause severe starvation or poor response.  
+*Correct approach:* Use the estimator  
+$$
+\tau_{n+1} = \alpha \cdot t_n + (1-\alpha)\tau_n,
+$$  
+with $0<\alpha\le1$, where $t_n$ is the measured burst of the $n$th CPU burst.
 
-$$T_{turnaround,B} = 20 - 10 = 10 \text{ s}, \quad T_{turnaround,A} = 110 - 0 = 110 \text{ s}$$
+### Mistake 2: Ignoring Priority Inversion in Real‑Time Policies
+*What’s wrong:* Assuming a high‑priority SCHED_FIFO task will never be blocked by a lower‑priority task holding a mutex.  
+*Why it matters:* Without priority‑inheritance or priority‑ceiling protocols, a medium‑priority task can preempt the holder, causing the high‑priority task to miss its deadline (classic Mars Pathfinder incident).  
+*Linux fix:* `pi_mutex` (or `pthread_mutexattr_setprotocol(&attr, PTHREAD_PRIO_INHERIT)`) temporarily raises the holder’s priority to the waiter’s.
 
-$$\bar{T} = \frac{110 + 10}{2} = 60 \text{ s}$$
+### Mistake 3: Treating Time Slice as the Only Knob for RR
+*What’s wrong:* Believing that decreasing $q$ always improves response.  
+*Why it matters:* Context‑switch overhead $C_{cs}$ scales with $1/q$. Effective CPU utilization becomes  
+$$
+U = \frac{q}{q + C_{cs}}.
+$$  
+If $q \ll C_{cs}$, utilization collapses.  
+*Correct rule:* Choose $q$ such that $q \ge 5\!-\!10 \times C_{cs}$ for a target utilization > 80 %.
 
-Compare to naive FIFO (A first): $\bar{T} = \frac{100 + 110}{2} = 105$ s.
+## Exercises
+### Easy – FIFO Simulator
+Write a C program that reads `n` lines `<pid> <arrival> <burst>` from stdin, simulates non‑preemptive FIFO, and prints each process’s start, finish, waiting, and turnaround times.  
+*Hint:* sort by arrival time before scheduling.
 
-### Round Robin (RR)
+### Medium – RR with Metrics
+Extend the FIFO simulator to implement preemptive RR. Accept a quantum $q$ as a command‑line argument. Compute average waiting, turnaround, and response times. Validate against the hand‑calculated Example 2.
 
-Cycle through all runnable jobs in order, giving each a fixed time slice $q$ before switching to the next. Every job gets CPU time regularly, regardless of how long it will ultimately run.
+### Hard – MLFQ with Aging
+Implement a three‑level MLFQ scheduler (quanta 8, 16, ∞) with aging boost every 100 ms. The simulator should accept a list of processes and output a Gantt chart (timestamp → pid).  
+*Bonus:* Calculate Jain’s fairness index for the CPU shares received.
 
-With $n$ equal-length jobs and time slice $q$, each job first runs within:
+### Challenge – Analyze CFS vruntime
+Given a set of nice values $-20 … +19$, derive the weight mapping used by Linux:  
+$$
+w = 1024 \times 1.25^{-\text{nice}}.
+$$  
+Write a program that, for a 1‑second interval, computes the expected CPU share of each nice level and verifies that the sum equals 100 %.
 
-$$T_{response} \leq (n-1) \cdot q$$
+## Linux Connection
+### Scheduling Subsystems
+Linux maintains **scheduling classes** (`struct sched_class`) registered in the kernel:
+* `stop_sched_class` (for stop/migration tasks) – highest priority.  
+* `dl_sched_class` (SCHED_DEADLINE, EDF).  
+* `rt_sched_class` (SCHED_FIFO, SCHED_RR).  
+* `fair_sched_class` (CFS, SCHED_OTHER, SCHED_BATCH, SCHED_IDLE).  
+* `idle_sched_class` (the idle task).
 
-RR's cost: it deliberately destroys turnaround time. If all $n$ jobs have length $L$, FIFO finishes the first job at time $L$. RR finishes the first job at time $n \cdot L - (n-1) \cdot q \approx n \cdot L$. RR stretches every job to near-completion time of the last job.
+The class with the highest priority that has a runnable task wins.
 
-The time slice $q$ is a continuous dial between two failure modes:
-- $q \to 0$: response time approaches zero but context-switch overhead $f_{overhead} \to 1$ — the CPU does nothing but switch.
-- $q \to \infty$: degenerates to FIFO — perfect turnaround for the first job, terrible response time for everyone else.
+### Inspecting the Scheduler
+* **Per‑CPU runqueue stats**:  
+  ```bash
+  cat /proc/sched_debug   # shows nr_running, load, latency stats per CPU
+  ```
+* **CFS vruntime of a task**:  
+  ```bash
+  cat /proc/<pid>/sched   # contains se.vruntime, sum_exec_runtime, etc.
+  ```
+* **Real‑time bandwidth**:  
+  ```bash
+  sysctl kernel.sched_rt_runtime_us   # runtime allocated to RT tasks per period
+  sysctl kernel.sched_rt_period_us
+  ```
 
-The Linux kernel's typical `sched_latency` target (the time within which every runnable process should run once) is 6–24ms, divided by the number of runnable processes to give the per-process slice.
+### Changing Priorities
+* **Nice value** (affects CFS weight):  
+  ```bash
+  nice -n 10 ./cpu_bound_program    # start with nice +10
+  renice 5 -p 1234                  # change existing pid 1234 to nice 5
+  ```
+* **Real‑time priority** (SCHED_FIFO/RR):  
+  ```bash
+  chrt -f 80 ./rt_program           # FIFO with priority 80 (1‑99)
+  chrt -r 50 ./rr_program           # RR with priority 50
+  ```
+* **CFS bandwidth control** (cgroups v2):  
+  ```bash
+  # Create a sub‑slice with half the CPU of the parent
+  echo 5000 > /sys/fs/cgroup/cpu.max   # 50 000 µs / 100 000 µs period
+  echo $$ > /sys/fs/cgroup/user.slice/user-1000.slice/myapp/cgroup.procs
+  ```
 
-### Incorporating I/O: Overlap
+### Observing Context‑Switch Overhead
+```bash
+perf stat -e context-switches,cpu-migrations -a sleep 10
+```
+The output gives the number of switches; dividing total runtime by switch count yields an empirical $C_{cs}$.
 
-A process blocked on I/O is not using the CPU — it's waiting for a disk seek, a network packet, or a pipe write. A scheduler that understands this runs another process during the wait, achieving **CPU/I/O overlap**: both the CPU and the I/O device are utilized simultaneously.
+### Deadline Scheduler (SCHED_DEADLINE)
+```bash
+# Allocate 20 ms runtime every 50 ms period to a task
+chrt -d 20000 50000 ./deadline_app
+```
+Useful for audio/video pipelines where latency bounds are strict.
 
-Concretely: if process A issues a `read()` that takes 10ms to complete, and process B is CPU-bound, a scheduler that gives the CPU to B during A's I/O wait can achieve near-100% CPU utilization. A scheduler that blocks waiting for A wastes 10ms of CPU time unconditionally.
+## Why This Matters
+Understanding scheduling is not an academic exercise; it directly determines how **latency‑sensitive** workloads (audio, trading, robotics) behave under load, how **throughput‑oriented** batch jobs share a cluster, and how **fairness** is enforced in multi‑tenant environments such as containers or virtual machines.  
 
-When A's I/O completes, the kernel receives an interrupt, marks A runnable, and reinserts it into the scheduler's queue. Where it gets placed matters: processes that do frequent short I/O bursts tend to use the CPU in short bursts too. Treating them as high-priority "short" jobs improves both their response time and overall CPU utilization — which is the intuition behind MLFQ's priority rules.
+When you can:
+* Derive the expected waiting time from a policy’s quantum and context‑switch cost,
+* Predict how a nice value translates into a CPU share via the CFS weight formula,
+* Observe real‑time bandwidth limits with `chrt` or cgroup `cpu.max`,
+* Diagnose priority inversion with `pi_mutex` diagnostics,
+* Choose the appropriate scheduling class (SCHED_FIFO for hard real‑time, SCHED_DEADLINE for guaranteed bandwidth, CFS for general purpose),
 
-### Multi-Level Feedback Queue (MLFQ)
-
-MLFQ solves the problem of unknown job runtimes by inferring them from observed behavior. It maintains $k$ priority queues (typically 3–8) with the rule that higher-priority queues get scheduled first, and processes within a queue are scheduled round-
+you gain the ability to **design systems that meet stringent service‑level objectives**, avoid surprises like missed deadlines or starvation, and optimize resource utilization across heterogeneous workloads. This knowledge forms the foundation for advanced topics such as **real‑time networking**, **container orchestration schedulers**, and **multiprocessor load balancers**, all of which rely on the same core principles explored here.

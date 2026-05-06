@@ -10,190 +10,313 @@ resources:
     title: "Understanding the Linux Kernel (Bovet)"
 ---
 
-## Why This Matters
-
-Every process on a Linux system shares a single view of the world: the same filesystem tree, the same network interfaces, the same process ID space, the same pool of CPU and memory. This breaks when you need isolation — when process A must not see process B's files, when a misconfigured service must not consume all available RAM, or when two programs both want to bind port 80. Namespaces and cgroups are the two kernel primitives that together make containers possible: namespaces control *what a process can see*, cgroups control *how much of the machine it can use*. Neither is sufficient alone.
-
----
-
 ## Core Concepts
+### Introduction to Namespaces and cgroups
+Namespaces are a kernel mechanism that partitions global system resources so that each partition sees its own isolated instance. A process belongs to a namespace for each resource type (PID, mount, network, IPC, UTS, user). The kernel maintains a `struct nsproxy` per task that points to the six namespace objects; when a namespace is cloned, the kernel allocates a new namespace struct, increments its reference count, and updates the task’s `nsproxy` entry. Because namespaces share the same kernel code and data structures, the overhead is minimal—only the namespace objects themselves are duplicated.
 
-### The Problem with Global Kernel State
+Control groups (cgroups) provide a hierarchical way to limit, account for, and isolate resource usage (CPU, memory, I/O, etc.) of a collection of processes. In the unified hierarchy (cgroup v2), controllers are mounted under a single filesystem (typically `/sys/fs/cgroup`). Each cgroup directory corresponds to a node in the hierarchy; writing to special files (e.g., `cpu.max`, `memory.limit_in_bytes`) sets limits that the kernel enforces via the scheduler, page reclaim, or block‑io throttling. A process becomes a member of a cgroup by writing its PID to `cgroup.procs` (or `cgroup.threads` for thread‑wise containment). The kernel tracks membership via `struct cgroup` and `struct cgroup_subsys_state` attached to each task.
 
-The kernel maintains global tables: a process ID table, a mount table, a network interface table, a hostname stored in `uts_ns`. Every process reads from the same tables. If you want a process to believe it is PID 1, or that the hostname is `container-A`, without affecting the rest of the system, the kernel must let you create a *separate instance* of that table and assign the process to it. That is a namespace.
+Why they exist: traditional Unix offered only process‑level isolation via credentials and filesystems. Modern workloads (containers, sandboxes, PaaS) need finer‑grained separation of IDs, network stacks, mount points, and resource guarantees without booting a separate kernel. Namespaces provide the view isolation; cgroups provide the metering and enforcement. Together they let multiple tenants share a kernel safely.
 
-The key distinction: namespaces virtualize identity and visibility; they do not limit resource consumption. A process inside a PID namespace is still a real process consuming real CPU and memory. For that you need cgroups.
+### Process Isolation (First‑Principles)
+Consider the PID namespace. The kernel’s PID allocator is a `struct pid_namespace` containing an integer `last_pid`. When `fork()` is called, `pid = alloc_pid()` reads `last_pid`, increments it, and returns the new value. If two processes reside in different `pid_namespace` objects, each has its own `last_pid`, so the same numerical PID can refer to unrelated tasks in different namespaces. The init process of a namespace is the first task created after `unshare(CLONE_NEWPID)` or `clone(CLONE_NEWPID)`; it receives PID 1 within that namespace, but its global PID (visible from the parent namespace) is whatever the allocator handed out. This decoupling enables containers to have their own `ps` output without leaking host PIDs.
 
-### Namespaces: Virtualized Views of Kernel Resources
+### Resource Control (First‑Principles)
+Take the CPU controller in cgroup v2. The scheduler’s CFS (Completely Fair Scheduler) allocates CPU time proportional to each group’s weight. The controller exposes two parameters:
+- `cpu.max`: `quota period` (e.g., `50000 100000` means 50 ms of runtime per 100 ms period).
+- `cpu.weight`: an integer weight (default 100).
 
-A namespace wraps a particular type of global resource and gives each member process the illusion of an isolated instance. The kernel provides seven namespace types:
+If a group has `quota = Q` and `period = P`, its maximum average CPU usage is `Q/P`. For multiple groups, the actual runtime granted to group *i* in each period is:
+$$
+\text{runtime}_i = \frac{weight_i}{\sum_j weight_j} \times P \times \min\left(1, \frac{Q_i}{P}\right)
+$$
+Thus, setting `cpu.max=50000 100000` yields a hard cap of 50 % CPU regardless of competing groups; adjusting `cpu.weight` changes the share *within* the allowed quota.
 
-| Namespace | Flag | Isolates |
-|-----------|------|----------|
-| Mount | `CLONE_NEWNS` | Filesystem mount points (`/proc/mounts`) |
-| UTS | `CLONE_NEWUTS` | Hostname and NIS domain (`uname -n`) |
-| IPC | `CLONE_NEWIPC` | SysV IPC, POSIX message queues |
-| PID | `CLONE_NEWPID` | Process ID number space |
-| Network | `CLONE_NEWNET` | Network devices, IP addresses, routing tables, port space |
-| User | `CLONE_NEWUSER` | UID and GID mappings |
-| Cgroup | `CLONE_NEWCGROUP` | Which cgroup appears as root |
-
-### PID Namespaces: Why PIDs Are Relative
-
-When a process is created inside a new PID namespace, it is assigned PID 1 *within that namespace* while simultaneously having a different PID in every ancestor namespace. The kernel maintains this mapping in `struct pid` (see below). This is why a container's init can be PID 1 from its own perspective while the host sees it as PID 4271 — both are true simultaneously.
-
-The hierarchy is strictly one-directional: a process in an ancestor namespace can see and signal processes in descendant namespaces, but not vice versa. A container process cannot signal the host's PID 1 because that PID does not exist in its namespace table; the lookup simply fails.
-
-Signals also respect namespace boundaries: `kill(1, SIGTERM)` from inside a container targets the container's PID 1, not the host's init.
-
-### Cgroups: Hierarchical Resource Accounting and Enforcement
-
-A control group is a collection of processes bound to shared resource constraints, organized as a tree. A child cgroup's limits are bounded by its parent's — there is no escape upward. Each resource type is managed by a *controller*: `cpu`, `memory`, `io`, `pids`, `cpuset`, and others.
-
-Cgroups do two separable things:
-
-- **Accounting**: track what processes actually consume, readable from pseudo-files under `/sys/fs/cgroup/`
-- **Enforcement**: prevent consumption from exceeding a threshold, implemented inside the relevant kernel subsystem (scheduler, memory allocator, block layer)
-
-You can use accounting without enforcement — useful for observability without risk of throttling production workloads.
-
-**cgroup v2** uses a unified hierarchy: all controllers share one tree rooted at `/sys/fs/cgroup/`. **cgroup v1** had a separate tree per controller under `/sys/fs/cgroup/<controller>/`, which caused correctness problems when a process belonged to different groups in different hierarchies — memory limits could apply to a different set of processes than CPU limits. Most modern distros (kernel ≥ 5.2 with systemd ≥ 244) default to v2. Verify with:
-
-```bash
-mount | grep cgroup
-# cgroup2 on /sys/fs/cgroup type cgroup2 ... → v2 unified
-# tmpfs on /sys/fs/cgroup type tmpfs ...     → v1 hybrid
-```
-
----
+Memory limits work similarly: the kernel tracks `memory.current`; if it exceeds `memory.limit_in_bytes`, the page reclamation routine is invoked, potentially triggering the OOM killer for tasks in that cgroup.
 
 ## How It Works
+### Namespace Creation
+The `clone()` and `unshare()` syscalls accept a flags mask. Each flag corresponds to a namespace type:
+| Flag | Namespace | Kernel struct |
+|------|-----------|---------------|
+| `CLONE_NEWPID` | PID | `struct pid_namespace` |
+| `CLONE_NEWNET` | Network | `struct net` |
+| `CLONE_NEWNS`  | Mount | `struct mount_namespace` |
+| `CLONE_NEWIPC` | IPC   | `struct ipc_namespace` |
+| `CLONE_NEWUTS` | UTS   | `struct uts_namespace` |
+| `CLONE_NEWUSER`| User  | `struct user_namespace` |
 
-### Creating Namespaces with `clone()`
+When `unshare(CLONE_NEWPID)` is invoked:
+1. Kernel checks `CAP_SYS_ADMIN` (unless user namespace allows it).
+2. Allocates a new `pid_namespace` via `create_pid_namespace()`.
+3. Sets `current->nsproxy->pid_ns_for_children = new_ns`.
+4. Increments the namespace’s reference count.
+All subsequently created children inherit this pointer; `fork()` does not copy the namespace, it shares the same pointer.
 
-The kernel creates namespaces at process creation time via flags passed to `clone()`:
-
+#### Example: Creating a PID namespace in C
 ```c
 #define _GNU_SOURCE
 #include <sched.h>
+#include <unistd.h>
+#include <stdio.h>
 #include <sys/wait.h>
 
-// Child process starts inside new UTS and PID namespaces.
-// It will see itself as PID 1; the parent sees its actual PID.
-pid_t pid = clone(child_fn,
-                  child_stack + STACK_SIZE,
-                  CLONE_NEWUTS | CLONE_NEWPID | SIGCHLD,
-                  NULL);
+int main(void) {
+    /* Create a new PID namespace; child will see its own PID numbering */
+    if (unshare(CLONE_NEWPID) == -1) {
+        perror("unshare");
+        return 1;
+    }
+    pid_t pid = fork();
+    if (pid == -1) {
+        perror("fork");
+        return 1;
+    }
+    if (pid == 0) {          /* child */
+        printf("Child PID (inside ns): %d\n", getpid());
+        /* Child's init process gets PID 1 */
+        execlp("sleep", "sleep", "5", (char *)NULL);
+        perror("execlp");
+        _exit(1);
+    } else {                 /* parent */
+        int status;
+        waitpid(pid, &status, 0);
+        printf("Parent PID (outside ns): %d\n", getpid());
+    }
+    return 0;
+}
 ```
+Compile with `gcc -Wall -o pidns pidns.c && ./pidns`. Output shows the child reporting PID 1 while the parent retains its original PID.
 
-An existing process can drop specific namespaces and create new ones with `unshare(2)` — it does not fork:
+### cgroup Creation (Unified Hierarchy)
+1. Mount the cgroup2 filesystem (usually done by systemd):
+   ```bash
+   mount -t cgroup2 none /sys/fs/cgroup
+   ```
+2. Create a directory for the new group:
+   ```bash
+   mkdir -p /sys/fs/cgroup/mygroup
+   ```
+3. Enable desired controllers by writing a space‑separated list to `cgroup.controllers`:
+   ```bash
+   echo "+cpu +memory" > /sys/fs/cgroup/mygroup/cgroup.controllers
+   ```
+   The leading `+` adds controllers; `-` removes them.
+4. (Optional) Disable threaded mode if you want process‑level containment:
+   ```bash
+   echo 0 > /sys/fs/cgroup/mygroup/cgroup.threaded
+   ```
+5. Set limits. For a 50 % CPU ceiling:
+   ```bash
+   # quota = 50000 µs, period = 100000 µs → 50 %
+   echo 50000 100000 > /sys/fs/cgroup/mygroup/cpu.max
+   ```
+   For a 200 MiB memory limit:
+   ```bash
+   echo $((200 * 1024 * 1024)) > /sys/fs/cgroup/mygroup/memory.limit_in_bytes
+   ```
+6. Move a process into the cgroup by writing its PID to `cgroup.procs`:
+   ```bash
+   echo $$ > /sys/fs/cgroup/mygroup/cgroup.procs   # current shell
+   ```
+   Or launch a process directly inside:
+   ```bash
+   cgexec -g cpu,memory:mygroup stress -c 1 -m 100M
+   ```
+   (`cgexec` is part of the libcgroup tools; on pure cgroup2 you can also use `systemd-run`.)
 
+#### Process Movement via `setns`
+To move an existing process into a namespace, open the namespace’s file descriptor under `/proc/[pid]/ns/` and invoke `setns`:
 ```c
-// After this call, any mounts created by this process are private to it.
-// Other processes mounting/unmounting do not affect this process's view.
-unshare(CLONE_NEWNS);
+#include <fcntl.h>
+#include <unistd.h>
+#include <sched.h>
+#include <stdio.h>
+
+int main(void) {
+    int fd = open("/proc/self/ns/pid", O_RDONLY);
+    if (fd < 0) { perror("open"); return 1; }
+    /* Suppose we want to join the PID namespace of PID 1234 */
+    int target_fd = open("/proc/1234/ns/pid", O_RDONLY);
+    if (target_fd < 0) { perror("open target"); return 1; }
+    if (setns(target_fd, 0) == -1) { perror("setns"); return 1; }
+    printf("Now in PID namespace of 1234\n");
+    close(fd);
+    close(target_fd);
+    return 0;
+}
 ```
+`setns` requires `CAP_SYS_ADMIN` in the caller’s user namespace unless the target namespace is a user namespace that grants the capability.
 
-A process can join an *existing* namespace owned by another process via `setns(2)`, using a file descriptor pointing into `/proc/[pid]/ns/`:
+### Process Movement in cgroups
+Writing a PID to `cgroup.procs` triggers the kernel to:
+1. Remove the task from its previous cgroup’s `cgroup.procs` (if any).
+2. Add it to the target cgroup’s list.
+3. Update the task’s `cgroup` pointer to the new `cgroup_subsys_state`.
+The operation is O(1) with respect to the number of tasks; only the cgroup’s internal list is adjusted.
 
+## Worked Examples
+### Example 1: Creating a New PID Namespace and Verifying Isolation
+**Goal**: Show that a child process sees PID 1 inside the namespace while the parent sees a different PID.
+
+**Steps**:
+1. Call `unshare(CLONE_NEWPID)` to create a fresh PID namespace.
+2. Fork a child.
+3. In the child, `exec` a program that prints its PID and then sleeps.
+4. Parent waits, then prints its own PID (still in the original namespace).
+
+**Code** (same as above, annotated):
 ```c
-int fd = open("/proc/4271/ns/net", O_RDONLY);
-// This process now shares PID 4271's network namespace:
-// same interfaces, same routing table, same port space.
-setns(fd, CLONE_NEWNET);
-close(fd);
+#define _GNU_SOURCE
+#include <sched.h>
+#include <unistd.h>
+#include <stdio.h>
+#include <sys/wait.h>
+
+int main(void) {
+    /* 1. New PID namespace */
+    if (unshare(CLONE_NEWPID) == -1) {
+        perror("unshare"); return 1;
+    }
+    pid_t child = fork();
+    if (child == -1) { perror("fork"); return 1; }
+    if (child == 0) {                /* child */
+        printf("Child PID (inside ns): %d\n", getpid()); /* should be 1 */
+        /* Keep alive long enough to observe */
+        sleep(10);
+        _exit(0);
+    } else {                         /* parent */
+        int status;
+        waitpid(&child, &status, 0);
+        printf("Parent PID (outside ns): %d\n", getpid()); /* original */
+    }
+    return 0;
+}
 ```
+**Expected output** (values will vary):
+```
+Child PID (inside ns): 1
+Parent PID (outside ns): 4237
+```
+The child’s PID is 1 because it is the first task created after the namespace clone. The parent’s PID remains whatever it was before the `unshare`.
 
-From the shell, `nsenter(1)` wraps this:
+### Example 2: Limiting CPU Resources with cgroup v2
+**Goal**: Constrain a CPU‑bound workload to 50 % of a single core and verify with `top`.
 
+**Commands**:
 ```bash
-# Enter the network namespace of PID 4271 and run ip link
-nsenter --target 4271 --net ip link show
+# 1. Ensure cgroup2 is mounted (usually already on modern distros)
+mount | grep -q '/sys/fs/cgroup type cgroup2' || sudo mount -t cgroup2 none /sys/fs/cgroup
+
+# 2. Create a group
+sudo mkdir -p /sys/fs/cgroup/cpulimit
+sudo echo "+cpu" > /sys/fs/cgroup/cpulimit/cgroup.controllers
+sudo echo 0 > /sys/fs/cgroup/cpulimit/cgroup.threaded   # process‑wise
+
+# 3. Set quota: 50 ms per 100 ms period → 50%
+sudo echo 50000 100000 > /sys/fs/cgroup/cpulimit/cpu.max
+
+# 4. Run a stress test inside the group (stress from package 'stress')
+sudo cgexec -g cpu:cpulimit stress -c 1 &
+STRESS_PID=$!
+
+# 5. Observe CPU usage (should hover ~50% of one CPU)
+top -b -d 1 -p $STRESS_PID | grep $STRESS_PID
+
+# 6. Cleanup
+kill $STRESS_PID
+sudo rmdir /sys/fs/cgroup/cpulimit
 ```
+**Explanation**:
+- `stress -c 1` creates one busy loop that would otherwise consume 100 % of a CPU.
+- The `cpu.max` tells the CFS scheduler to allow at most 50 ms of runtime every 100 ms.
+- Over a second, the task gets roughly 500 ms of CPU → 50 % utilization.
+- `top` shows the `%CPU` column fluctuating around 50.0.
 
-`unshare(1)` creates namespaces from the shell:
+### Example 3: Isolating Network Interfaces
+**Goal**: Create a network namespace, assign a loopback address, and verify that packets stay inside the namespace.
 
-```bash
-# Start a shell with a new UTS namespace; change hostname without
-# affecting the host
-unshare --uts bash
-hostname container-test
-hostname  # → container-test
-# In another terminal: hostname → unchanged on host
-```
-
-### Namespace Identity in `/proc`
-
-Every namespace has a unique inode number. Two processes are in the same namespace if and only if their corresponding `/proc/[pid]/ns/` symlink targets match:
-
-```bash
-ls -la /proc/1/ns/net /proc/4271/ns/net
-```
-
-```
-lrwxrwxrwx 1 root root 0 ... /proc/1/ns/net    -> net:[4026531992]
-lrwxrwxrwx 1 root root 0 ... /proc/4271/ns/net -> net:[4026532241]
-```
-
-The number in brackets is the inode number of the namespace object. Different numbers — different network namespaces. You can also hold a namespace alive without any processes in it by bind-mounting its pseudo-file:
-
-```bash
-# Keep the network namespace of PID 4271 alive after it exits
-mount --bind /proc/4271/ns/net /run/netns/preserved
-```
-
-This is how `ip netns` persists named network namespaces in `/run/netns/`.
-
-### PID Namespace Translation in the Kernel
-
-A process has one PID per namespace in its ancestry chain. The kernel stores these in `struct pid`, which contains a variable-length array of `struct upid` — one entry per namespace level:
-
+**C code**:
 ```c
-// Simplified from include/linux/pid.h
-struct upid {
-    int nr;                   // The PID number visible in this namespace
-    struct pid_namespace *ns; // Which namespace this number belongs to
-};
+#define _GNU_SOURCE
+#include <sched.h>
+#include <unistd.h>
+#include <stdio.h>
+#include <stdlib.h>
 
-struct pid {
-    refcount_t count;
-    unsigned int level;       // Depth in namespace hierarchy (0 = root)
-    struct upid numbers[];    // Flexible array: numbers[0] = root namespace,
-                              // numbers[level] = innermost namespace
-};
+int main(void) {
+    /* 1. New network namespace */
+    if (unshare(CLONE_NEWNET) == -1) {
+        perror("unshare"); return 1;
+    }
+    /* 2. Add a loopback device (requires ip tool) */
+    if (system("ip link add lo0 type loopback") != 0) {
+        perror("ip link add"); return 1;
+    }
+    if (system("ip link set lo0 up") != 0) {
+        perror("ip link set up"); return 1;
+    }
+    if (system("ip addr add 127.0.0.2/8 dev lo0") != 0) {
+        perror("ip addr add"); return 1;
+    }
+    /* 3. Verify */
+    printf("=== lo0 address ===\n");
+    system("ip -4 addr show lo0");
+    printf("=== ping self ===\n");
+    system("ping -c 2 127.0.0.2");
+    return 0;
+}
 ```
-
-When the kernel crosses a namespace boundary — e.g., to send a signal from a parent namespace process to a child namespace process — it walks `numbers[]` to find the correct `nr` for the target namespace. If the target namespace is not in the ancestry chain of the sender's namespace, no `upid` entry exists and the operation returns `ESRCH`.
-
-### The CFS Scheduler and Cgroup CPU Control
-
-The CPU controller integrates with the Completely Fair Scheduler (CFS). Each cgroup has its own CFS run queue and is assigned bandwidth via two parameters in `/sys/fs/cgroup/<group>/`:
-
-- `cpu.max` (v2) or `cpu.cfs_quota_us` / `cpu.cfs_period_us` (v1): quota $Q$ and period $T$ in microseconds
-
-The effective CPU limit is:
-
-$$\text{CPU fraction} = \frac{Q}{T}$$
-
-To limit a cgroup to 25% of one CPU with a 100 ms period:
-
-$$Q = 25000\,\mu s,\quad T = 100000\,\mu s,\quad \frac{25000}{100000} = 0.25$$
-
-To allow 1.5 CPUs on a multi-core machine:
-
-$$Q = 150000\,\mu s,\quad T = 100000\,\mu s,\quad \frac{150000}{100000} = 1.5$$
-
+Compile and run (needs root or `CAP_SYS_ADMIN`):
 ```bash
-# cgroup v2: create a group, limit it to 0.5 CPU
-mkdir /sys/fs/cgroup/demo
-echo "50000 100000" > /sys/fs/cgroup/demo/cpu.max
-
-# Move current shell into it
-echo $$ > /sys/fs/cgroup/demo/cgroup.procs
-
-# Confirm
-cat /sys/fs/cgroup/demo/cpu.max
-# 50000 100000
+sudo gcc -o netns netns.c && sudo ./netns
 ```
+**Expected output** (excerpt):
+```
+=== lo0 address ===
+3: lo0: <LOOPBACK,UP,LOWER_UP> mtu 65536 qdisc noop state UNKNOWN group default qlen 1000
+    inet 127.0.0.2/8 scope host lo0
+       valid_lft forever preferred_lft forever
+=== ping self ===
+PING 127.0.0.2 (127.0.0.2) 56(84) bytes of data.
+64 bytes from 127.0.0.2: icmp_seq=1 ttl=64 time=0.045 ms
+64 bytes from 127.0.0.2: icmp_seq=2 ttl=64 time=0.039 ms
 
-When a cgroup exhausts its quota within a period, all its processes are **throttled**: they are dequeued from the CFS run queue and placed in a throttled list. They cannot run again until the period timer fires and
+--- 127.0.0.2 ping statistics ---
+2 packets transmitted, 2 received, 0% packet loss, time 1015ms
+```
+Notice that the loopback device `lo0` exists only in this namespace; the host’s original `lo` (127.0.0.1) is untouched. A ping to `127.0.0.2` does not appear on the host’s network stack.
+
+## Common Mistakes
+| Mistake | What’s Wrong | Why It Happens | How to Fix |
+|---------|--------------|----------------|------------|
+| **Assuming `unshare(CLONE_NEWUSER)` gives full privileges** | After creating a user namespace, the process still lacks capabilities in the original user namespace. | The user namespace only maps IDs; capabilities are governed by the mapping. Without a proper `uid_map`/`gid_map` set, `CAP_SYS_ADMIN` inside the namespace does not translate to host capabilities. | Write appropriate `uid_map` and `gid_map` files in `/proc/<pid>/` before calling `unshare`. Example: `echo "0 $(id -u) 1" > /proc/self/uid_map`. |
+| **Using cgroups v1 tools (`cgcreate`, `cgset`) on a system with only cgroup v2 mounted** | Commands fail with “invalid argument” or silently create v1 hierarchies that are ignored. | Many distros now mount only the unified hierarchy; v1 tools expect a separate `cgroup` filesystem for each controller. | Use the cgroup v2 interface directly (`mkdir /sys/fs/cgroup/mygrp`, write to `cgroup.controllers`, `cpu.max`, etc.) or install `cgroup-tools` that support v2 (`cgcreate -t cpu:mygrp` with `-a` flags). |
+| **Forgot to enable controllers before setting limits** | Writing to `cpu.max` returns “No such file or directory”. | In cgroup v2, a controller’s files appear only after the controller is enabled via `cgroup.controllers`. | First echo `+cpu` (or `+memory`) into `cgroup.controllers`, then write limits. |
+| **Calling `setns` without `CAP_SYS_ADMIN` in the caller’s user namespace** | `setns` returns `EPERM`. | The kernel checks the caller’s capability in the user namespace that owns the target namespace. If the caller lacks it, the operation is denied. | Either run as root, or create a user namespace that maps the caller’s uid to 0 inside that namespace, then invoke `setns`. |
+| **Moving a process into a cgroup by writing its PID to `cgroup.threads` when the group is not threaded** | The write succeeds but the task remains in the parent cgroup; later attempts to manage it fail. | `cgroup.threads` exists only when `cgroup.threaded` is set to 1. Writing there adds the task as a thread group member, not as a process. | Check `cat cgroup.threaded`; if 0, use `cgroup.procs`. If you truly want thread‑wise containment, set `cgroup.threaded=1` **before** adding tasks. |
+| **Assuming network namespace isolation hides all host devices** | After `unshare(CLONE_NEWNET)`, physical NICs still appear in `ip link`. | The namespace inherits a *copy* of the host’s device list at creation; however, devices are not moved unless explicitly placed with `ip link set dev eth0 netns <pid>`. | To truly isolate, either create the namespace before any devices are added (e.g., in early boot) or move desired devices into the namespace with `ip link set`. |
+| **Not cleaning up namespaces leading to “zombie” ns** | Long‑running shells accumulate unused namespaces, consuming kernel memory. | Each `unshare` increments the namespace’s reference count; it is only freed when the last task exits and the last `put_ns` occurs. | Track the PID of the namespace‑owning process and ensure it exits, or use `nsenter --target <pid> --mount --uts --ipc --net --pid` to join and then exit. |
+
+## Exercises
+### Easy
+1. **UTS Namespace Hostname Change**  
+   ```bash
+   unshare -u --fork --pid bash -c 'echo "container" > /proc/sys/kernel/hostname; hostname; exec bash'
+   ```
+   Verify that the hostname inside the shell differs from the host’s, while `hostname` outside remains unchanged.
+
+2. **Mount Namespace Private Bind**  
+   ```bash
+   unshare -m --fork --pid bash -c 'mount --bind /tmp /tmp; touch /tmp/foo; ls /tmp'
+   ```
+   Confirm that the bind mount is visible only in the child shell.
+
+### Medium
+1. **Memory‑Limited cgroup**  
+   ```bash
+   sudo mount -t cgroup2 none /sys/fs/cgroup
+   sudo mkdir -p /sys/fs/cgroup/memlimit
+   sudo echo "+memory" > /sys/fs/cgroup/memlimit/cgroup.controllers
+   sudo echo $((100 * 1024 * 1024)) > /sys/fs/cgroup/memlimit/memory.limit_in_bytes   # 100 MiB
+   sudo cgexec -g memory:memlimit stress --vm-bytes 150M --vm

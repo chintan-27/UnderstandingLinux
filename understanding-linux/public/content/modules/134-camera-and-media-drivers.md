@@ -10,145 +10,391 @@ resources:
     title: "The Linux Programming Interface (Kerrisk)"
 ---
 
-## Why This Matters
-
-A webcam, a TV tuner, and an embedded ISP all produce continuous streams of data under a hard constraint: every frame must land in RAM within one frame period or it is lost forever. Without a principled framework, every driver would invent its own ioctl interface, its own buffer scheme, and its own synchronization model. V4L2 exists to prevent that fragmentation. It defines a single contract between hardware, kernel drivers, and userspace: how buffers are negotiated, how formats are declared, and how data flows through multi-stage pipelines. The consequence of getting any part of this wrong is not a clean error — it is corrupted frames, silent data loss, or a kernel crash from a DMA into unmapped memory.
-
----
-
 ## Core Concepts
+### V4L2 as a Character‑Device API
+V4L2 (Video for Linux 2) exposes each video endpoint as a **character device** (`/dev/video*`). Unlike block devices, a character device is accessed as a byte stream; the kernel does not impose a fixed block size, which matches the nature of video frames that arrive as variable‑length, time‑ordered buffers. The V4L2 core (`drivers/media/v4l2-core/videodev2.c`) registers these devices with the VFS using the `file_operations` struct that implements `open`, `release`, `ioctl`, `read`, `write`, and `mmap`.  
+**Why a char device?** Video data is consumed sequentially (capture → process → display) and often needs low‑latency delivery; random‑access semantics of a block device would add unnecessary overhead and complexity.
 
-### V4L2 as a Kernel Subsystem
+### Buffers, Memory Types, and the Streaming Model
+A V4L2 buffer (`struct v4l2_buffer`) describes a memory region that holds one video frame. The driver does **not** allocate the memory itself; the application chooses a memory type and tells the driver where to place the data:
 
-V4L2 lives under `drivers/media/v4l2-core/` and exposes devices as `/dev/videoN`, `/dev/vbiN`, and `/dev/radioN`. The framework separates two concerns that must never be conflated:
+| Memory type | Kernel macro          | Typical use                                            |
+|-------------|-----------------------|--------------------------------------------------------|
+| `V4L2_MEMORY_MMAP`   | `VIDIOC_REQBUFS` + `mmap` | Driver allocates contiguous kernel pages; user space maps them via `mmap`. Zero‑copy, low latency. |
+| `V4L2_MEMORY_USERPTR`| `VIDIOC_REQBUFS` + user pointer | Application provides pre‑allocated pages (must be page‑aligned and locked with `mlock`). Useful when the app already owns buffers (e.g., GPU‑mapped memory). |
+| `V4L2_MEMORY_DMABUF` | `VIDIOC_REQBUFS` + DMA‑buf fd | Enables sharing buffers with other subsystems (GPU, VPU, codec) without copying. Required for zero‑copy pipelines (e.g., V4L2 → DRM/KMS). |
 
-- **Capability negotiation** — what pixel formats, frame sizes, and frame rates the hardware supports (`VIDIOC_ENUM_FMT`, `VIDIOC_S_FMT`, `VIDIOC_S_PARM`)
-- **Buffer management** — how pixel data physically moves from hardware into RAM and then into userspace
+The driver negotiates the **format** (`struct v4l2_pix_format`) first: width, height, pixel format (`V4L2_PIX_FMT_YUYV`, `V4L2_PIX_FMT_RGB24`, etc.), and bytes per line. Only after the format is fixed may the application request buffers (`VIDIOC_REQBUFS`).  
+**Why negotiate format first?** The driver needs to know the exact frame size to allocate or validate buffers; requesting buffers before format negotiation would lead to `EINVAL` or silently incorrect sizes.
 
-This separation is deliberate. A driver author implements format negotiation once; the buffer machinery is handled by the `videobuf2` (vb2) layer in `drivers/media/common/videobuf2/`. A driver that registers with vb2 gets queue management, buffer state tracking, and mmap support essentially for free.
+### Pipelines and the Media Controller
+V4L2 does not work in isolation; it is a node in the **media controller graph** (`media-ctl`). Each video node (sensor, ISP, encoder, output) is represented as an *entity* with *pads* linked via *links*. The application configures the graph (format, frame rate, crop/compose) using `VIDIOC_SUBDEV_*` ioctls on subdevice nodes (`/dev/v4l-subdev*`).  
+**Why a graph?** Modern SoCs split video processing across multiple hardware blocks; the media controller lets the kernel enforce compatibility (e.g., a sensor outputting 12‑bit raw must be linked to an ISP that accepts that format) and provides a single point of control for the whole pipeline.
 
-The ioctl dispatch path is: userspace `ioctl()` → `v4l2_ioctl()` in `v4l2-ioctl.c` → per-driver `v4l2_ioctl_ops` function pointer. Every driver fills in a `struct v4l2_ioctl_ops`; the framework validates arguments before calling through.
+### Essential Ioctl Commands (What They Do and Why)
+| Ioctl                     | Purpose                                                                                          | Typical sequence                                                               |
+|---------------------------|--------------------------------------------------------------------------------------------------|--------------------------------------------------------------------------------|
+| `VIDIOC_QUERYCAP`         | Ask driver for version, capabilities, and supported I/O modes.                                   | First call after `open` to verify the device is a V4L2 video capture device.   |
+| `VIDIOC_ENUM_FMT`         | Enumerate pixel formats the driver can negotiate for a given buffer type.                        | Used to pick a format supported by both hardware and application.              |
+| `VIDIOC_G_FMT` / `VIDIOC_S_FMT` | Get / set the current format (`struct v4l2_pix_format`).                                      | Must be set before requesting buffers; changing format may require buffer re‑negotiation. |
+| `VIDIOC_REQBUFS`          | Request *n* buffers of a given type and memory type; returns the actual number allocated.       | After format is set; driver may allocate fewer buffers if resources are limited. |
+| `VIDIOC_QUERYBUF`         | Retrieve details (physical address, size, offset) for each allocated buffer.                     | Needed to `mmap` each buffer or to fill `struct v4l2_buffer` for `USERPTR`.    |
+| `VIDIOC_QBUF`             | Queue an empty buffer to the driver’s incoming queue (for capture) or outgoing queue (for output). | Application fills buffer (for output) or leaves empty (for capture) then queues it. |
+| `VIDIOC_DQBUF`            | Dequeue a filled buffer (capture) or an empty buffer (output).                                   | Blocking or non‑blocking; returns when a frame is ready or driver needs a buffer. |
+| `VIDIOC_STREAMON` / `VIDIOC_STREAMOFF` | Start or stop streaming on the selected buffer type.                                           | Buffers must be queued before `STREAMON`; otherwise driver returns `EBUSY`.   |
+| `VIDIOC_SUBDEV_*`         | Configure sub‑devices (sensor, ISP, etc.) via the media controller.                              | Used to set exposure, gain, cropping, etc., on the sensor before capture.    |
 
-### Buffers and the Streaming I/O Model
+### Data Flow Equation
+For a negotiated format with width *W*, height *H*, and bytes per pixel *B* (derived from the pixel format), the **minimum buffer size** required for one frame is:
 
-`read()` on a video device is legal but useless at scale. Copying a 1080p YUYV frame through the kernel on every call costs:
+$$
+\text{frame\_size} = W \times H \times B
+$$
 
-$$\text{copy cost} = \frac{1920 \times 1080 \times 2 \text{ bytes}}{64 \text{ bytes/cacheline}} = 64{,}800 \text{ cache line writes per frame}$$
+If the application requests *N* buffers, the **total memory commitment** is:
 
-At 60 fps that is $\approx 3.9 \times 10^6$ cache line operations per second — on the critical path of every frame. Streaming I/O eliminates this by keeping buffers in place and transferring ownership rather than data.
+$$
+\text{mem\_total} = N \times \text{frame\_size}
+$$
 
-The three streaming modes differ in who allocates the buffer memory:
+The **sustained data rate** (bytes per second) at a frame rate *F* (frames/sec) is:
 
-| Mode | Allocator | Use case |
-|---|---|---|
-| `MMAP` | Kernel driver | General capture; application mmaps kernel buffers |
-| `USERPTR` | Userspace | Application controls buffer placement, e.g., for GPU-visible memory |
-| `DMABUF` | Third party (GPU, DSP) | Zero-copy sharing across subsystems via `dma_buf` fd |
+$$
+R = \text{frame\_size} \times F
+$$
 
-`DMABUF` is the modern choice for any pipeline where a camera feeds a GPU or encoder. The buffer never moves; only the file descriptor is passed between drivers.
-
-### Physical Contiguity and Why It Is Required
-
-A simple bus-mastering DMA controller holds a single base address register and a transfer length. It cannot scatter-gather across non-contiguous physical pages. If your driver programs address $A$ into the DMA base register and the next physical page is not at $A + 4096$, the DMA engine reads garbage or faults the bus.
-
-For a frame buffer of size $S$ bytes spanning $n$ pages:
-
-$$n = \left\lceil \frac{S}{4096} \right\rceil$$
-
-All $n$ pages must be physically adjacent. `kmalloc` guarantees contiguity only up to $2^{order}$ pages (order limited by `MAX_ORDER`, typically $\approx 10$, giving 4 MB on 4 KB pages). For larger buffers, drivers use `dma_alloc_coherent()`, which calls the CMA (Contiguous Memory Allocator) on platforms that configure it.
-
-### Buffer Ownership and Cache Coherence
-
-At any instant, a DMA buffer is owned by exactly one agent — CPU or device. This is not convention; it reflects the behavior of real cache controllers. If the CPU speculatively prefetches a cache line while the DMA engine has not finished writing that line, the CPU reads stale data. The kernel's DMA API makes ownership transfers explicit:
-
-```c
-/* Before CPU reads a filled frame: */
-dma_sync_single_for_cpu(dev, dma_handle, size, DMA_FROM_DEVICE);
-
-/* Before re-queuing an empty buffer to the device: */
-dma_sync_single_for_device(dev, dma_handle, size, DMA_FROM_DEVICE);
-```
-
-On x86 with hardware-coherent caches, these are compiled away to nothing. On ARM Cortex-A without hardware coherency (common in SoCs), `dma_sync_single_for_cpu` issues `DC CIVAC` (clean-invalidate by VA to PoC) instructions across the buffer range. The cost is proportional to buffer size:
-
-$$\text{sync cost} \approx \frac{S}{64} \text{ cache maintenance operations}$$
-
-For a 4K frame ($3840 \times 2160 \times 2 = 16{,}588{,}800$ bytes) that is $\approx 259{,}200$ operations — non-trivial on a mobile CPU at 120 fps.
-
-Drivers using `dma_alloc_coherent()` bypass this: coherent memory is marked non-cacheable (or write-combining) in the page tables, so the CPU never caches it and no sync is needed. The tradeoff is slower CPU reads of that memory.
-
-### Media Controller and Pipelines
-
-A raw V4L2 device models a single data source. A real embedded camera is a pipeline:
-
-```
-[Sensor] → [CSI-2 Receiver] → [ISP] → [Scaler] → [Memory Interface]
-```
-
-Each block has independent configuration: exposure on the sensor, lane count on the CSI-2 receiver, debayering algorithm on the ISP. The **Media Controller** API (`/dev/mediaN`) models this as a directed graph. Nodes are *entities* (each backed by a `struct media_entity`). Entities expose *pads* (input or output ports). *Links* connect pads across entities and can be individually enabled or disabled.
-
-Before streaming, userspace must:
-1. Open `/dev/mediaN` and enumerate the graph with `MEDIA_IOC_ENUM_ENTITIES` / `MEDIA_IOC_ENUM_LINKS`
-2. Enable the required links with `MEDIA_IOC_SETUP_LINK`
-3. Set formats on each subdevice pad via `/dev/v4l-subdevN` using `VIDIOC_SUBDEV_S_FMT`
-4. Only then open `/dev/videoN` and begin the V4L2 buffer dance
-
-Skipping step 3 is a common source of `EPIPE` errors when calling `VIDIOC_STREAMON` — the pipeline is topologically incomplete.
+These formulas let you size `mlock` limits, check DMA‑buf feasibility, and estimate USB bandwidth (`R` must be < ~480 Mbps for USB 2.0 isochronous, accounting for overhead).
 
 ---
 
 ## How It Works
+### Step‑by‑Step Interaction Model
+1. **Device discovery** – Applications scan `/dev/video*` or use `v4l2-ctl --list-devices`.  
+2. **Open** – `fd = open("/dev/video0", O_RDWR);` invokes the V4L2 `open` method, which increments the device’s reference count and allocates per‑file private data.  
+3. **Capability check** – `ioctl(fd, VIDIOC_QUERYCAP, &cap)` verifies `cap.capabilities & V4L2_CAP_VIDEO_CAPTURE`.  
+4. **Format negotiation** –  
+   ```c
+   struct v4l2_fmtdesc fmt = { .index = 0, .type = V4L2_BUF_TYPE_VIDEO_CAPTURE };
+   while (ioctl(fd, VIDIOC_ENUM_FMT, &fmt) == 0) { /* ... */ }
+   struct v4l2_format fmt = {
+       .type = V4L2_BUF_TYPE_VIDEO_CAPTURE,
+       .fmt.pix.width       = 640,
+       .fmt.pix.height      = 480,
+       .fmt.pix.pixelformat = V4L2_PIX_FMT_YUYV,
+       .fmt.pix.field       = V4L2_FIELD_NONE
+   };
+   ioctl(fd, VIDIOC_S_FMT, &fmt);
+   ```
+   The driver may adjust values (e.g., rounding width to a multiple of 32) and returns the actual configuration.  
+5. **Buffer request** –  
+   ```c
+   struct v4l2_requestbuffers req = {
+       .count  = 4,
+       .type   = V4L2_BUF_TYPE_VIDEO_CAPTURE,
+       .memory = V4L2_MEMORY_MMAP
+   };
+   ioctl(fd, VIDIOC_REQBUFS, &req);
+   ```
+   The driver allocates *req.count* kernel pages (or returns fewer if memory is tight).  
+6. **Query each buffer** – For i = 0 … req.count‑1:  
+   ```c
+   struct v4l2_buffer buf = { .type = V4L2_BUF_TYPE_VIDEO_CAPTURE,
+                              .memory = V4L2_MEMORY_MMAP,
+                              .index = i };
+   ioctl(fd, VIDIOC_QUERYBUF, &buf);
+   buffers[i].start = mmap(NULL, buf.length, PROT_READ|PROT_WRITE,
+                           MAP_SHARED, fd, buf.m.offset);
+   buffers[i].length = buf.length;
+   ```
+7. **Queue buffers** – Each mmap’d buffer is put into the driver’s incoming queue:  
+   ```c
+   for (i = 0; i < req.count; ++i) {
+       struct v4l2_buffer buf = { .type = V4L2_BUF_TYPE_VIDEO_CAPTURE,
+                                  .memory = V4L2_MEMORY_MMAP,
+                                  .index = i };
+       ioctl(fd, VIDIOC_QBUF, &buf);
+   }
+   ```
+8. **Start streaming** – `ioctl(fd, VIDIOC_STREAMON, &type);` tells the hardware to begin filling buffers and generating interrupts.  
+9. **Capture loop** –  
+   ```c
+   while (running) {
+       struct v4l2_buffer buf = { .type = V4L2_BUF_TYPE_VIDEO_CAPTURE,
+                                  .memory = V4L2_MEMORY_MMAP };
+       if (ioctl(fd, VIDIOC_DQBUF, &buf) == -1) {
+           if (errno == EAGAIN) continue; /* non‑blocking */
+           break;
+       }
+       /* buffers[buf.index].start now holds a filled frame */
+       process_frame(buffers[buf.index].start, buf.bytesused);
+       ioctl(fd, VIDIOC_QBUF, &buf); /* re‑queue */
+   }
+   ```
+10. **Stop and cleanup** – `VIDIOC_STREAMOFF`, `munmap`, `close(fd)`.
 
-### Buffer Lifecycle: The MMAP Path
+**Why each step matters**  
+- Skipping format negotiation leads to undefined buffer sizes.  
+- Requesting buffers before format set returns `EINVAL` because the driver cannot compute size.  
+- Not queuing buffers before `STREAMON` results in no frames being captured; the driver has nowhere to place incoming data.  
+- Using the wrong memory type (e.g., passing a user pointer with `V4L2_MEMORY_MMAP`) causes the driver to ignore the pointer or return `EINVAL`.  
 
-The state machine every capture application follows:
+### Error Propagation and Non‑Blocking I/O
+V4L2 ioctls return `-1` on error, setting `errno`. Common codes:
+- `EINVAL` – invalid argument (often format/memory mismatch).  
+- `EBUSY` – device already streaming or buffers not queued.  
+- `EAGAIN` – non‑blocking `DQBUF` called when no buffer is ready; useful for polling with `select()`/`epoll()` on the file descriptor (the driver signals `POLLIN` when a dequeued buffer is available).  
 
-```
-VIDIOC_REQBUFS      → allocate N kernel buffers; driver calls vb2_queue_init
-VIDIOC_QUERYBUF     → retrieve each buffer's mmap offset and length
-mmap()              → install userspace mapping; driver calls remap_pfn_range()
-VIDIOC_QBUF         → transfer buffer ownership to device
-VIDIOC_STREAMON     → arm DMA; driver programs base address registers
-[hardware fills buffers, raises interrupt]
-VIDIOC_DQBUF        → transfer ownership to CPU; blocks until a buffer is ready
-  [application reads frame data]
-VIDIOC_QBUF         → return buffer to device
-VIDIOC_STREAMOFF    → halt DMA; driver waits for in-flight transfers to complete
-munmap() + close()  → driver calls dma_free_coherent on each buffer
-```
+**Why use non‑blocking?** In a multimedia pipeline (e.g., GStreamer) you may want to service multiple sources or handle UI events without blocking a thread; `select()` lets you wait for either a frame or a shutdown signal.
 
-The offset returned by `VIDIOC_QUERYBUF` is **not** a file offset. It is an opaque token — typically `buffer_index * PAGE_ALIGN(buffer_size)` — that the driver's `.mmap` file operation decodes to locate the physical buffer. The driver then calls `remap_pfn_range()` to wire the process's virtual pages to the buffer's physical pages:
+---
+
+## Worked Examples
+### Example 1: Simple Capture → Raw File (MMAP)
+**Goal:** Grab a single frame from `/dev/video0` in YUYV format and write it to `frame.yuv`.  
+**Explanation:** We negotiate format, request 2 MMAP buffers, queue them, start streaming, dequeue one buffer, and dump its raw bytes.
 
 ```c
-/* Inside driver .mmap handler, simplified: */
-unsigned long pfn = virt_to_phys(buf->cpu_addr) >> PAGE_SHIFT;
-return remap_pfn_range(vma, vma->vm_start, pfn,
-                       vma->vm_end - vma->vm_start,
-                       vma->vm_page_prot);
-```
+/* capture_one.c */
+#define _GNU_SOURCE
+#include <fcntl.h>
+#include <unistd.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <errno.h>
+#include <sys/mman.h>
+#include <linux/videodev2.h>
 
-After `remap_pfn_range`, any write by the DMA engine to the physical buffer is immediately visible at the userspace virtual address — no copy, no syscall.
-
-### Kernel-Side Buffer Allocation
-
-```c
-#include <linux/dma-mapping.h>
-
-struct my_buffer {
-    void        *cpu_addr;   /* kernel virtual address */
-    dma_addr_t   dma_handle; /* bus address for device registers */
-    size_t       size;
-};
-
-static int alloc_frame_buffers(struct device *dev,
-                                struct my_buffer *bufs, int n)
+static int xioctl(int fd, int request, void *arg)
 {
-    for (int i = 0; i < n; i++) {
-        bufs[i].size = PAGE_ALIGN(FRAME_SIZE);
-        bufs[i].cpu_addr = dma_alloc_coherent(dev,
-                                               bufs[i].size,
-                                               &bufs[i].dma_handle,
-                                               GFP_KERNEL);
-        if (!bufs[i].cpu_addr)
-            return -ENOMEM;
-        /* Program bufs[i].dma_handle into hardware descriptor
+    int r;
+    do r = ioctl(fd, request, arg);
+    while (-1 == r && EINTR == errno);
+    return r;
+}
+
+int main(void)
+{
+    const char *dev = "/dev/video0";
+    int fd = open(dev, O_RDWR | O_NONBLOCK, 0);
+    if (fd < 0) { perror("open"); return 1; }
+
+    /* Query capabilities */
+    struct v4l2_capability cap;
+    if (xioctl(fd, VIDIOC_QUERYCAP, &cap) < 0) {
+        perror("VIDIOC_QUERYCAP"); goto err;
+    }
+    if (!(cap.capabilities & V4L2_CAP_VIDEO_CAPTURE)) {
+        fprintf(stderr, "%s is no video capture device\n", dev);
+        goto err;
+    }
+
+    /* Set format */
+    struct v4l2_format fmt = {0};
+    fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    fmt.fmt.pix.width       = 640;
+    fmt.fmt.pix.height      = 480;
+    fmt.fmt.pix.pixelformat = V4L2_PIX_FMT_YUYV;   /* 2 bytes per pixel */
+    fmt.fmt.pix.field       = V4L2_FIELD_NONE;
+    if (xioctl(fd, VIDIOC_S_FMT, &fmt) < 0) {
+        perror("VIDIOC_S_FMT"); goto err;
+    }
+    /* Verify driver didn't change it unexpectedly */
+    if (fmt.fmt.pix.pixelformat != V4L2_PIX_FMT_YUYV) {
+        fprintf(stderr, "Driver changed pixelformat.\n");
+        goto err;
+    }
+
+    /* Request buffers */
+    struct v4l2_requestbuffers req = {0};
+    req.count  = 2;
+    req.type   = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    req.memory = V4L2_MEMORY_MMAP;
+    if (xioctl(fd, VIDIOC_REQBUFS, &req) < 0) {
+        perror("VIDIOC_REQBUFS"); goto err;
+    }
+    if (req.count < 2) {
+        fprintf(stderr, "Insufficient buffer memory\n");
+        goto err;
+    }
+
+    /* Map buffers */
+    struct {
+        void *start;
+        size_t length;
+    } buffers[req.count];
+
+    for (unsigned i = 0; i < req.count; ++i) {
+        struct v4l2_buffer buf = {0};
+        buf.type        = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+        buf.memory      = V4L2_MEMORY_MMAP;
+        buf.index       = i;
+        if (xioctl(fd, VIDIOC_QUERYBUF, &buf) < 0) {
+            perror("VIDIOC_QUERYBUF"); goto err;
+        }
+        buffers[i].length = buf.length;
+        buffers[i].start = mmap(NULL, buf.length,
+                                PROT_READ | PROT_WRITE,
+                                MAP_SHARED, fd, buf.m.offset);
+        if (buffers[i].start == MAP_FAILED) {
+            perror("mmap"); goto err;
+        }
+    }
+
+    /* Queue buffers */
+    for (unsigned i = 0; i < req.count; ++i) {
+        struct v4l2_buffer buf = {0};
+        buf.type        = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+        buf.memory      = V4L2_MEMORY_MMAP;
+        buf.index       = i;
+        if (xioctl(fd, VIDIOC_QBUF, &buf) < 0) {
+            perror("VIDIOC_QBUF"); goto err;
+        }
+    }
+
+    /* Start streaming */
+    enum v4l2_buf_type type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    if (xioctl(fd, VIDIOC_STREAMON, &type) < 0) {
+        perror("VIDIOC_STREAMON"); goto err;
+    }
+
+    /* Dequeue a single frame */
+    struct v4l2_buffer buf = {0};
+    buf.type        = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    buf.memory      = V4L2_MEMORY_MMAP;
+    if (xioctl(fd, VIDIOC_DQBUF, &buf) < 0) {
+        perror("VIDIOC_DQBUF"); goto err;
+    }
+
+    /* Write raw data */
+    FILE *out = fopen("frame.yuv", "wb");
+    if (!out) { perror("fopen"); goto err_streamoff; }
+    fwrite(buffers[buf.index].start, 1, buf.bytesused, out);
+    fclose(out);
+    printf("Wrote %u bytes to frame.yuv\n", buf.bytesused);
+
+    /* Requeue buffer (good practice) */
+    xioctl(fd, VIDIOC_QBUF, &buf);
+
+    /* Stop streaming */
+    xioctl(fd, VIDIOC_STREAMOFF, &type);
+    /* Cleanup mmap */
+    for (unsigned i = 0; i < req.count; ++i)
+        munmap(buffers[i].start, buffers[i].length);
+    close(fd);
+    return 0;
+
+err_streamoff:
+    xioctl(fd, VIDIOC_STREAMOFF, &type);
+err:
+    for (unsigned i = 0; i < req.count; ++i)
+        if (buffers[i].start) munmap(buffers[i].start, buffers[i].length);
+    close(fd);
+    return 1;
+}
+```
+
+**Why this works:**  
+- `O_NONBLOCK` lets us break out of the loop if `DQBUF` ever returns `EAGAIN` (not used here but safe).  
+- After `VIDIOC_STREAMON`, the hardware begins filling buffers; the first `DQBUF` returns when the first frame is ready.  
+- The frame size is `640 * 480 * 2 = 614 400` bytes (YUYV). The program checks `buf.bytesused` which should equal that value.  
+- All resources are unmapped and released even on error paths.
+
+### Example 2: Capture → RGB Conversion → PPM File
+**Goal:** Capture a frame, convert YUYV → RGB24, and store as a portable PPM (`frame.ppm`).  
+**Explanation:** Adds a conversion step to illustrate processing in the pipeline. The conversion uses the standard YUYV layout: each 4‑byte block holds Y0 Cb Y1 Cr; conversion formulas are:
+
+$$
+\begin{aligned}
+R &= Y + 1.402 \times (Cr - 128)\\
+G &= Y - 0.344 \times (Cb - 128) - 0.714 \times (Cr - 128)\\
+B &= Y + 1.772 \times (Cb - 128)
+\end{aligned}
+$$
+
+Clamp each component to `[0,255]`.
+
+```c
+/* capture_rgb.c */
+#define _GNU_SOURCE
+#include <fcntl.h>
+#include <unistd.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <stdint.h>
+#include <errno.h>
+#include <sys/mman.h>
+#include <linux/videodev2.h>
+
+static int xioctl(int fd, int request, void *arg)
+{
+    int r;
+    do r = ioctl(fd, request, arg);
+    while (-1 == r && EINTR == errno);
+    return r;
+}
+
+/* Clamp helper */
+static inline uint8_t clamp(int v)
+{
+    return (v < 0) ? 0 : (v > 255) ? 255 : (uint8_t)v;
+}
+
+/* Convert one YUYV block (4 bytes) to two RGB24 pixels (6 bytes) */
+static void yuyv_to_rgb24(const uint8_t *src, uint8_t *dst)
+{
+    int Y0 = src[0];
+    int Cb = src[1];
+    int Y1 = src[2];
+    int Cr = src[3];
+
+    int R = Y0 + 1.402 * (Cr - 128);
+    int G = Y0 - 0.344 * (Cb - 128) - 0.714 * (Cr - 128);
+    int B = Y0 + 1.772 * (Cb - 128);
+    dst[0] = clamp(R); dst[1] = clamp(G); dst[2] = clamp(B);
+
+    R = Y1 + 1.402 * (Cr - 128);
+    G = Y1 - 0.344 * (Cb - 128) - 0.714 * (Cr - 128);
+    B = Y1 + 1.772 * (Cb - 128);
+    dst[3] = clamp(R); dst[4] = clamp(G); dst[5] = clamp(B);
+}
+
+int main(void)
+{
+    const char *dev = "/dev/video0";
+    int fd = open(dev, O_RDWR, 0);
+    if (fd < 0) { perror("open"); return 1; }
+
+    struct v4l2_capability cap;
+    if (xioctl(fd, VIDIOC_QUERYCAP, &cap) < 0) { perror("VIDIOC_QUERYCAP"); goto err; }
+    if (!(cap.capabilities & V4L2_CAP_VIDEO_CAPTURE)) {
+        fprintf(stderr, "%s not a capture device\n", dev); goto err;
+    }
+
+    /* Set format */
+    struct v4l2_format fmt = {0};
+    fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    fmt.fmt.pix.width       = 640;
+    fmt.fmt.pix.height      = 480;
+    fmt.fmt.pix.pixelformat = V4L2_PIX_FMT_YUYV;
+    fmt.fmt.pix.field       = V4L2_FIELD_NONE;
+    if (xioctl(fd, VIDIOC_S_FMT, &fmt) < 0) { perror("VIDIOC_S_FMT"); goto err; }
+
+    /* Request buffers */
+    struct v4l2_requestbuffers req = {0};
+    req.count  = 2;
+    req.type   = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+    req.memory = V4L2_MEMORY_MMAP;
+    if (xioctl(fd, VIDIOC_REQBUFS, &req) < 0) { perror("VIDIOC_REQBUFS"); goto err; }
+
+    /* Map buffers */
+    struct {
+        void *start;
+        size_t length;
+    } buffers[req.count];
+    for (unsigned i = 0; i < req.count; ++i) {
+        struct v4l2_buffer buf = {0};
+        buf.type        = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+        buf.memory      = V4L2_MEMORY_MMAP;
+        buf.index       = i;
+        if (

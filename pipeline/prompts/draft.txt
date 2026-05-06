@@ -4,27 +4,38 @@ Module: {module_id}. {module_title}
 Topics: {topics}
 Primary source: {primary_book}
 
-SOURCE EXCERPTS:
+SOURCE EXCERPTS (primary):
 ---
 {chunks}
 ---
 
-Write a draft lesson in markdown. Use this structure exactly:
+SOURCE EXCERPTS (secondary):
+---
+{secondary_chunks}
+---
 
-## Why This Matters
-One paragraph. Explain why this topic exists and what breaks without it. Be concrete.
+Write a detailed, comprehensive draft lesson in markdown. Use this structure exactly:
 
 ## Core Concepts
-For each major topic: a short heading and a clear explanation. No padding. Explain causally — why does this work this way, not just what it is.
+For each major topic: a clear heading (###) and a thorough explanation. Explain causally — why does this work this way, not just what it is. Define every term precisely before using it. Build concepts in dependency order so nothing references something unexplained.
 
 ## How It Works
-Go deeper on the mechanism. Use examples. Include code blocks and math equations where they genuinely clarify the concept.
+Go deeper on the mechanism. Walk through the internal workings step by step. Use examples. Include code blocks and math equations where they genuinely clarify the concept. Show derivations, not just results.
+
+## Worked Examples
+2–3 detailed worked examples that show the concepts in action. Walk through each step explicitly. Use real numbers and concrete scenarios. Show both the math and the code where applicable.
+
+## Common Mistakes
+3–4 genuine misconceptions or errors that beginners make with this topic. For each: state the mistake, explain why it's wrong, and show the correct understanding.
+
+## Exercises
+3–4 hands-on tasks the student can do right now to test understanding. Vary difficulty: one straightforward, one moderate, one challenging. Include enough context that the student can attempt them without looking things up.
 
 ## Linux Connection
-How does this appear in Linux specifically? System calls, kernel subsystems, /proc entries, tools, source files. Be specific. Include real commands and code snippets the student can run.
+How does this topic appear in Linux specifically? System calls, kernel subsystems, /proc entries, tools, source files. Be specific. Include real commands and code snippets the student can run. Even for foundational topics (math, physics, circuits), show concretely where this knowledge is used inside the Linux kernel or userspace tools.
 
-## Key Takeaways
-3–5 bullet points. The things that must stick.
+## Why This Matters
+One strong paragraph at the end. Now that the student has learned the material, explain why it matters — what they can now understand that they couldn't before, and how this knowledge compounds as they go deeper into systems.
 
 Formatting rules:
 - Use fenced code blocks with the correct language tag: ```c, ```bash, ```python, ```asm, etc.
@@ -39,3 +50,5 @@ Content rules:
 - Prefer concrete examples over abstract descriptions
 - If you are uncertain about a detail, omit it rather than guess
 - Write for someone who is intelligent but new to this topic
+- Be thorough — this is the student's primary learning resource for this topic
+- Aim for depth: explain the why behind every mechanism, not just the what

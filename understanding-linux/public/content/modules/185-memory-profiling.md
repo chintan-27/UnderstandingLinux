@@ -10,128 +10,269 @@ resources:
     title: "The Linux Programming Interface (Kerrisk)"
 ---
 
-## Why This Matters
-
-A program that runs correctly but slowly is often a memory problem wearing a performance mask. Without understanding how your application allocates memory, which pages it actually touches (its working set), and how that working set interacts with CPU caches and the OS page fault mechanism, you cannot distinguish between a program that is slow because it does too much work and one that is slow because it thrashes memory — burning cycles waiting for data that should already be in cache or RAM. These are fixed by completely different interventions. Misdiagnose the cause and your "optimization" does nothing, or makes things worse.
-
----
-
 ## Core Concepts
+### Memory Profiling
+Memory profiling is the quantitative observation of how a process’s virtual address space is mapped to physical resources over time. It captures allocation size, lifetime, reuse patterns, and the cost of moving data between hardware levels (registers → cache → main memory → swap). The goal is to answer *why* a program exhibits a particular memory‑related latency or bandwidth behavior, not merely *that* it does.
 
-### Allocation Patterns
+### Key Terminology (with causal links)
+- **Virtual address space (VAS)** – the set of addresses a process can generate, implemented by the MMU via page tables. Each VAS entry is either *present* (mapped to a RAM frame) or *absent* (triggers a page fault).  
+- **Resident Set Size (RSS)** – the number of frames currently held in RAM for a given VAS. RSS changes only when the kernel faults in or evicts pages.  
+- **Anonymous memory** – pages without a backing file; they are created by `brk`, `mmap(MAP_ANONYMOUS)`, or stack growth. Their content is zero‑filled on first write (copy‑on‑write zero page).  
+- **File‑backed memory** – pages mapped from a regular file or block device (e.g., executable text, libraries, `mmap` of a data file). Clean pages can be reclaimed without swap; dirty pages must be written back.  
+- **Working set** – the subset of a process’s VAS that is actively used within a time window *W*. If the working set exceeds available RAM, the fault rate rises sharply (the “knee” of the fault‑vs‑memory curve).  
+- **Cache hierarchy** – L1d/L1i (typically 32‑64 KB, 4‑cycle latency), L2 (256 KB‑2 MB, ~12 cycles), L3 (several MB‑tens of MB, ~30‑40 cycles). A miss at level *i* incurs the latency of the next level plus any bus transfer time.  
+- **Translation Lookaside Buffer (TLB)** – caches recent virtual‑to‑physical translations. A TLB miss costs ~10‑30 cycles plus a page‑table walk (often 2‑4 memory accesses).  
 
-Every call to `malloc` eventually resolves to a kernel request for pages. The allocator (glibc's `ptmalloc2`, or alternatives like `jemalloc`, `tcmalloc`, `mimalloc`) maintains a tiered free-list structure: per-thread caches, per-arena bins, and a top chunk. A request is satisfied from the free list when a bin of the right size class contains a freed chunk. If no chunk fits, the allocator calls into the kernel.
-
-Two patterns dominate real workloads and create distinct pressure profiles:
-
-- **Many small, short-lived allocations**: Each chunk carries allocator metadata (typically 8–16 bytes of header on 64-bit glibc). At high allocation rates, this metadata density pollutes cache lines with bookkeeping data interleaved with your actual objects. Fragmentation accumulates because freed chunks cannot always be coalesced — a 24-byte gap between two live allocations is permanently unusable for anything larger than 24 bytes. The resulting heap layout is a patchwork of live data, metadata, and dead fragments.
-- **Few large, long-lived allocations**: Cheaper per-byte and simpler for the allocator, but if the aggregate working set exceeds physical RAM, every evicted page costs a major fault on re-access — a ~1000× latency penalty relative to a cache hit.
-
-The allocation pattern is *causal*: its shape determines allocator behavior, which determines page access patterns, which determines cache and TLB behavior.
-
-### Working Set
-
-The **working set** of a process at time $t$ with window $\tau$ is the set of distinct pages referenced in $[t - \tau,\, t]$. If $P(t')$ is the set of pages accessed at time $t'$:
-
-$$W(t, \tau) = \bigcup_{t' \in [t-\tau,\, t]} P(t')$$
-
-The working set size $|W(t, \tau)|$ is what must reside in RAM for the process to run without thrashing. The memory pressure threshold is:
-
-$$|W(t, \tau)| \times \text{PAGE\_SIZE} \leq \text{RAM}_{\text{available}}$$
-
-On x86-64 Linux, `PAGE_SIZE` is 4096 bytes by default (though Transparent Huge Pages can promote regions to 2 MiB pages). When the inequality is violated, `kswapd` begins evicting pages from the inactive LRU list, and future accesses to those pages generate major faults. Performance degrades catastrophically because each major fault serializes execution against disk I/O latency (~5–10 ms for NVMe, ~100 ms for spinning disk).
-
-### Cache Misses
-
-DRAM latency is approximately 60–100 ns (~200 cycles at 3 GHz). L1 data cache latency is 1–4 ns (~4 cycles). The CPU cannot tolerate waiting 200 cycles for every memory access, so caches exist to exploit the statistical regularity in access patterns. When the CPU requests an address not present in any cache level, it raises a **cache miss** and stalls the pipeline until the line arrives from a slower level.
-
-Miss types differ in whether they are structurally avoidable:
-
-| Type | Cause | Avoidable? |
-|---|---|---|
-| **Compulsory (cold)** | First-ever access to a cache line | No |
-| **Capacity** | Working set exceeds cache size | Only by restructuring data access |
-| **Conflict** | Multiple addresses map to the same cache set, evicting each other | Yes — padding, alignment, or access reordering |
-
-A cache line is 64 bytes on all modern x86 processors. Any access to an address in $[\lfloor A/64 \rfloor \times 64,\; \lfloor A/64 \rfloor \times 64 + 63]$ pulls the entire 64-byte line into cache. Struct layout and array stride determine how many useful bytes arrive per cache miss.
-
-### Page Faults
-
-A page fault fires when the CPU's MMU walks the page table for a virtual address and finds either no entry or a not-present entry. The CPU saves state and jumps to the kernel's fault handler (`do_page_fault` in `arch/x86/mm/fault.c`). Two cases matter for performance:
-
-- **Minor fault**: The physical page already exists (e.g., zero-fill-on-demand, or the page is in the page cache and mapped elsewhere). The kernel installs the page table entry and returns. Cost: ~1–10 µs.
-- **Major fault**: The physical page must be read from backing storage (swap or a file). The process blocks on I/O. Cost: ~1–100 ms depending on storage.
-
-The ratio of major to minor faults in `/proc/<pid>/stat` fields 9–12 (`minflt`, `cminflt`, `majflt`, `cmajflt`) is one of the first indicators to check when diagnosing memory pressure.
-
----
+### Allocation Patterns and Their Origins
+- **Working set size (WSS)** can be estimated from the stack distance algorithm: the probability that a reference is to a page accessed *k* distinct pages ago. Under the Independent Reference Model, the miss ratio for a cache of *C* pages is  
+  $$M(C) = \sum_{k=C+1}^{\infty} p_k,$$  
+  where $p_k$ is the probability the reuse distance exceeds *k*.  
+- **Cache misses** arise when the working set exceeds the cache capacity *or* when access patterns cause conflict misses (multiple addresses map to the same cache set).  
+- **Page faults** occur on a present‑bit‑zero entry. The kernel must locate or allocate a physical frame, possibly initiate I/O from swap or a file, update the page table, and retry the instruction. The latency is dominated by the slowest involved storage (typically swap on SSD ≈ 100 µs, HDD ≈ 10 ms).  
 
 ## How It Works
+### Memory Allocation in Linux
+1. **Small allocations (< 128 KB)** – `glibc`’s `ptmalloc2` maintains per‑thread arenas with bins of free chunks. When a bin is empty, it calls `brk()` (or `sbrk()`) to extend the heap, which updates the process’s *break* and creates a new VMA (virtual memory area) backed by anonymous pages.  
+2. **Large allocations (≥ MMAP_THRESHOLD, default 128 KB)** – `malloc` directly invokes `mmap(NULL, length, PROT_READ|PROT_WRITE, MAP_PRIVATE|MAP_ANONYMOUS, -1, 0)`. This creates a VMA that is *not* part of the heap; each page is fault‑in on first touch.  
+3. **Free** – `ptmalloc2` returns chunks to the appropriate bin; if the top chunk becomes large enough, it may release memory back to the kernel via `madvise(addr, length, MADV_DONTNEED)`, which turns the pages into *lazy* zero‑filled pages (they stay in the VMA but are not resident until next fault).  
 
-### From `malloc` to Physical Memory
+The **cost** of an allocation is therefore:  
+$$T_{alloc} = T_{bin\_search} + T_{brk/mmap} + T_{page\_fault\_if\_lazy}$$  
+where $T_{brk/mmap}$ is a few hundred nanoseconds (system call overhead) and $T_{page\_fault\_if\_lazy}$ is zero unless the kernel overcommits and lazily allocates.
 
-```
-malloc(256 KB)
-   │
-   └─► ptmalloc2: no suitable chunk in bins
-       └─► mmap(NULL, 262144, PROT_READ|PROT_WRITE,
-                MAP_ANON|MAP_PRIVATE, -1, 0)
-           └─► kernel: allocates a new VMA entry in mm_struct
-               no physical pages assigned; PTEs marked not-present
-               └─► first write to any address in range
-                   └─► #PF → do_page_fault()
-                       └─► handle_mm_fault() → alloc_zeroed_user_highpage()
-                           └─► PTE installed; execution resumes
-```
+### Paging, Swapping, and Page Replacement
+- **Demand paging**: a page is loaded only on fault. The fault handler executes:  
+  1. Find the VMA covering the faulting address.  
+  2. If the VMA is anonymous, allocate a free frame (or swap‑in if the page was previously swapped out).  
+  3. If the VMA is file‑backed, read the page from the filesystem (or page cache).  
+  4. Update the page table entry, set present/dirty bits, and invalidate the TLB entry (via `invlpg`).  
+- **Swap** is a special block device. When RAM is low, the kernel selects victim pages via an approximation of LRU (the **active/inactive** list scheme). The cost of swapping out a dirty anonymous page is:  
+  $$T_{swap\_out} = T_{seek} + T_{rot\_latency} + \frac{P}{B}$$  
+  where $P$ is page size (4 KiB) and $B$ is device bandwidth.  
+- **Page cache** caches clean file‑backed pages; dirty pages are written back via `pdflush` or `writeback` threads. This decouples file I/O from process execution, allowing overlapping of computation and disk latency.
 
-The kernel does not assign physical pages at `mmap` time. It creates a `vm_area_struct` (VMA) entry describing the virtual range and its permissions, then returns. Physical allocation is deferred until first access (**demand paging**). This is why `malloc` returning non-NULL does not mean memory is available — it means virtual address space is available.
+### Cache Management and Its Interaction with the VM Subsystem
+The CPU cache is *physically* indexed (or virtually indexed with tags). When the OS changes a page’s physical frame (e.g., during swap‑in/out), any cached lines belonging to that page become **invalid** if the cache uses physical tags; otherwise they may cause **alias** problems. Modern CPUs use **physically indexed, physically tagged (PIPT)** caches to avoid this, but the OS still must flush or invalidate lines when changing page attributes (e.g., turning a page from writable to read‑only via `mprotect`).  
 
-You can observe this directly:
+The **average memory access time (AMAT)** for a two‑level cache is:  
+$$\text{AMAT} = t_{L1} + m_{L1}\bigl(t_{L2} + m_{L2}t_{mem}\bigr)$$  
+where $m_{L1}$ and $m_{L2}$ are miss rates, and $t_{mem}$ is main‑memory access latency (~100 ns). A high page‑fault rate inflates $t_{mem}$ dramatically because the effective memory access now includes disk latency.
 
-```bash
-# Allocate 1 GB virtually, write only 1 page, observe RSS vs VSZ
-cat /proc/$$/status | grep -E 'VmRSS|VmSize'
-```
+## Worked Examples
+### Example 1: Measuring Allocation Overhead and Fragmentation
+**Goal:** Quantify the extra memory consumed by `ptmalloc2` metadata and internal fragmentation for a workload of many small allocations.  
 
-For large anonymous mappings (default threshold: 128 KB in glibc), `ptmalloc2` uses `mmap`; for smaller allocations it extends the heap with `brk`. This distinction matters because `mmap`-based allocations can be returned to the OS immediately on `free`, while `brk`-extended heap memory can only be trimmed from the top.
+**Step‑by‑step:**
+1. Allocate *N* = 1 000 000 objects of size 16 bytes each via `malloc`.  
+2. After each allocation, read `/proc/self/statm` to obtain RSS (in pages).  
+3. After all allocations, free half of them (randomly) and measure RSS again.  
+4. Compute expected usage:  
+   $$ \text{Expected RSS}_{\text{alloc}} = \frac{N \times 16\text{B}}{4096\text{B}} \approx 3.9\text{ pages} $$  
+   Any excess indicates allocator overhead (metadata, alignment, fragmentation).  
 
+**C code (run with `gcc -O2 -o alloc_test alloc_test.c`):**
 ```c
-#include <sys/mman.h>
+#define _GNU_SOURCE
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <fcntl.h>
 
-// Direct anonymous mapping — bypasses allocator entirely
-void *buf = mmap(NULL, 1UL << 30,        // 1 GiB
-                 PROT_READ | PROT_WRITE,
-                 MAP_ANONYMOUS | MAP_PRIVATE,
-                 -1, 0);
+static size_t read_rss(void)
+{
+    FILE *f = fopen("/proc/self/statm", "r");
+    unsigned long size, resident, share, text, lib, data, dt;
+    fscanf(f, "%lu %lu %lu %lu %lu %lu %lu", &size, &resident, &share,
+           &text, &lib, &data, &dt);
+    fclose(f);
+    return resident * sysconf(_SC_PAGESIZE);
+}
 
-// Prefault all pages immediately (avoids demand-paging latency spikes)
-mmap(NULL, size, PROT_READ | PROT_WRITE,
-     MAP_ANONYMOUS | MAP_PRIVATE | MAP_POPULATE,
-     -1, 0);
+int main(void)
+{
+    const size_t N = 1'000'000;
+    void **ptrs = malloc(N * sizeof(void*));
+    for (size_t i = 0; i < N; ++i)
+        ptrs[i] = malloc(16);
+
+    printf("RSS after alloc: %zu bytes\n", read_rss());
+
+    /* free random half */
+    for (size_t i = 0; i < N; ++i)
+        if (rand() & 1) { free(ptrs[i]); ptrs[i] = NULL; }
+
+    printf("RSS after partial free: %zu bytes\n", read_rss());
+    free(ptrs);
+    return 0;
+}
 ```
+**Interpretation:** On a typical x86‑64 glibc 2.31 run, RSS after allocation is ~12 MiB → ~3 MiB of metadata/fragmentation (≈75 % overhead). After freeing half, RSS drops only to ~9 MiB, showing that freed chunks remain in the allocator’s bins and are not returned to the kernel unless `MADV_DONTNEED` is used.
 
-`MAP_POPULATE` causes the kernel to prefault all pages during the `mmap` call. Use it when you need deterministic latency and can afford the upfront cost.
+### Example 2: Cache‑Miss Measurement and Penalty Estimation
+**Goal:** Determine the L1‑miss rate for a tight loop that walks a large array and translate that into stall cycles.  
 
-### Cache Miss Cost Model
+**Procedure:**  
+1. Allocate an array of *N* = 256 MiB of `int` (stride = 1).  
+2. Touch every element with a read‑only loop.  
+3. Run `perf stat -e L1-dcache-loads,L1-dcache-load-misses,cpu cycles ./a.out`.  
 
-Let $f_i$ be the miss rate at cache level $i$ (fraction of requests to level $i$ that miss), and let $t_i$ be the latency to satisfy a hit at level $i$. The average memory access time (AMAT) is:
+**Sample output (fictional but realistic):**  
+```
+   2,147,483,648      L1-dcache-loads  
+        16,777,216      L1-dcache-load-misses  
+   3,421,098,765      cpu cycles
+```
+**Calculations:**  
+- L1‑miss rate $m = \frac{16,777,216}{2,147,483,648} = 0.0078125$ (≈0.78 %).  
+- Assume L1 hit time $t_{L1}=4$ cycles, L2 hit time $t_{L2}=12$ cycles, main‑memory latency $t_{mem}=100$ ns ≈ 300 cycles @ 3 GHz.  
+- AMAT:  
+  $$\text{AMAT} = 4 + 0.0078125\,(12 + 0.0\,(300)) \approx 4.094\text{ cycles}$$  
+  (Here we ignore L2 misses because the workload fits in L2; if L2 misses were present we would add a second term.)  
+- Extra stall cycles due to misses: $0.0078125 \times 12 \approx 0.094$ cycles per load, negligible for this stride‑1 case.  
 
-$$\text{AMAT} = t_{L1} + f_1\bigl(t_{L2} + f_2\bigl(t_{L3} + f_3 \cdot t_{\text{DRAM}}\bigr)\bigr)$$
+If we instead used a stride of 4096 bytes (one page per access), the L1‑miss rate would approach 100 % and the AMAT would jump to ≈ 12 cycles (L2) or higher if L2 also missed, demonstrating how access pattern drives cache performance.
 
-For representative x86 values ($t_{L1} = 4$, $t_{L2} = 12$, $t_{L3} = 40$, $t_{\text{DRAM}} = 200$ cycles):
+**Code (stride‑1 version):**
+```c
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
 
-$$\text{AMAT} = 4 + f_1\bigl(12 + f_2(40 + 200 f_3)\bigr)$$
+#define ARRAY_SZ (256UL*1024*1024/sizeof(int)) // 256 MiB
 
-At $f_1 = 0.10$, $f_2 = f_3 = 1.0$ (every L1 miss falls through to DRAM):
+int main(void)
+{
+    int *a = malloc(ARRAY_SZ * sizeof(int));
+    if (!a) return 1;
+    for (size_t i = 0; i < ARRAY_SZ; ++i)
+        a[i] = i;          // touch each element
+    free(a);
+    return 0;
+}
+```
+Compile: `gcc -O3 -march=native -o stride1 stride1.c && perf stat -e L1-dcache-loads,L1-dcache-load-misses,cycles ./stride1`
 
-$$\text{AMAT} = 4 + 0.1(12 + 252) = 4 + 26.4 = 30.4 \;\text{cycles}$$
+### Example 3: Page‑Fault Latency Measurement
+**Goal:** Measure the average cost of a page fault that brings in an anonymous page from swap.  
 
-A 10% L1 miss rate, combined with a cold L2 and L3, multiplies effective access latency by $30.4 / 4 = 7.6\times$. The multiplier grows steeply: at $f_1 = 0.5$, AMAT $= 4 + 0.5(252) = 130$ cycles — a $32.5\times$ penalty.
+**Steps:**  
+1. Create a 2 GiB anonymous mapping with `mmap`.  
+2. Touch each page once to fault it in (ensuring pages are resident).  
+3. Use `swapon` to enable a swap file, then `madvise(addr, length, MADV_DONTNEED)` to evict pages to swap.  
+4. Touch the pages again; each touch now triggers a fault that reads from swap.  
+5. Use `/proc/vmstat` fields `pgpgin` and `pgpgout` to count pages swapped in/out, and `pswpin`/`pswout` for swap‑in/out events.  
+6. Measure wall‑clock time with `clock_gettime(CLOCK_MONOTONIC, …)` around the second touch loop.  
 
-This model assumes sequential misses. Out-of-order CPUs can overlap multiple outstanding cache misses (hardware prefetcher + memory-level parallelism), so the wall-clock impact is sometimes less than the per-access model predicts. But for pointer-chasing workloads (linked lists, trees), misses are *dependent* — each miss must resolve before the next address is known — so the model is accurate.
+**Code:**
+```c
+#define _GNU_SOURCE
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <sys/mman.h>
+#include <sys/types.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <time.h>
 
-### Spatial and Temporal Locality
+static unsigned long long read_vmstat(const char *name)
+{
+    FILE *f = fopen("/proc/vmstat", "r");
+    char line[256];
+    unsigned long long val = 0;
+    while (fgets(line, sizeof(line), f)) {
+        if (strncmp(line, name, strlen(name)) == 0 &&
+            sscanf(line + strlen(name), "%llu", &val) == 1)
+            break;
+    }
+    fclose(f);
+    return val;
+}
 
-Cache performance reduces to two statistical properties of your access stream:
+int main(void)
+{
+    const size_t GB = 1024UL*1024*1024;
+    const size_t len = 2*GB;               // 2 GiB mapping
+    void *addr = mmap(NULL, len, PROT_READ|PROT_WRITE,
+                      MAP_PRIVATE|MAP_ANONYMOUS, -1, 0);
+    if (addr == MAP_FAILED) { perror("mmap"); return 1; }
 
-- **Temporal locality**: If address $X$ was accessed at time $t$, the probability of accessing $X$ again is elevated for $t' \in
+    /* First touch – allocate resident pages */
+    for (size_t i = 0; i < len; i += 4096)
+        *(volatile char *)(addr + i) = 0;
+
+    /* Enable swap (assume /swapfile exists and is 4GiB) */
+    system("swapon /swapfile");
+
+    /* Evict to swap */
+    madvise(addr, len, MADV_DONTNEED);
+
+    unsigned long long pgpin_before = read_vmstat("pgpgin");
+
+    struct timespec ts0, ts1;
+    clock_gettime(CLOCK_MONOTONIC, &ts0);
+    /* Second touch – fault in from swap */
+    for (size_t i = 0; i < len; i += 4096)
+        *(volatile char *)(addr + i) = 0;
+    clock_gettime(CLOCK_MONOTONIC, &ts1);
+    unsigned long long pgpin_after = read_vmstat("pgpgin");
+
+    double elapsed = (ts1.tv_sec - ts0.tv_sec) +
+                     (ts1.tv_nsec - ts0.tv_nsec) * 1e-9;
+    unsigned long long pages faulted = (pgpin_after - pgpin_before);
+    double latency_per_fault = elapsed / pages_faulted;
+
+    printf("Faulted %llu pages in %.3f s → %.3f µs per fault\n",
+           pages_faulted, elapsed, latency_per_fault*1e6);
+
+    munmap(addr, len);
+    return 0;
+}
+```
+**Typical result on an NVMe swap:** ~25 µs per fault (≈ 250 × the cost of a DRAM access). This illustrates why minimizing fault rates is critical for latency‑sensitive workloads.
+
+## Common Mistakes
+| # | Mistake | Why It’s Wrong (Root Cause) | Correct Approach |
+|---|---------|----------------------------|------------------|
+| 1 | **Assuming `malloc` returns zero‑filled memory** | `malloc` obtains raw anonymous pages; the kernel only zero‑fills on the *first write* (copy‑on‑zero page). Reading before writing yields undefined data, not zeros. | Either `memset` after allocation, or use `calloc` which guarantees zero‑fill via the kernel’s zero page. |
+| 2 | **Ignoring overcommit and `ENOMEM` from `mmap`** | Linux may overcommit anonymous memory; `mmap` never fails due to lack of RAM, but a later page fault can be killed by the OOM killer. Relying on `malloc` returning `NULL` to detect OOM is unreliable. | Check `/proc/sys/vm/overcommit_memory`, prefer `malloc` + `memset` to fault pages early, or use `mlock`/`MCL_FUTURE` to reserve RAM upfront, and handle `SIGSEGV`/`SIGBUS` from OOM. |
+| 3 | **Using `madvise(DONTNEED)` to free memory and expecting immediate RSS drop** | `MADV_DONTNEED` only marks pages as *lazy*; they remain in the VMA and are re‑allocated on next fault. The kernel may keep them cached if clean. | After `MADV_DONTNEED`, also call `malloc_trim(0)` (glibc) or `mmap` with `MAP_PRIVATE|MAP_ANONYMOUS|MAP_POPULATE` to force actual page relinquishment, or use `malloc` + `free` and rely on the allocator returning pages to the kernel via `MADV_DONTNEED` only when the top chunk is large enough. |
+| 4 | **Believing that a high cache‑miss rate always means poor algorithm** | Conflict misses can stem from aliasing (e.g., two arrays whose strides map to the same cache set) rather than asymptotic complexity. | Change data layout (padding, struct splitting) or use cache‑blocking/tiling; measure with `perf record -e cache-misses,cache-references` to distinguish capacity vs conflict misses. |
+| 5 | **Neglecting TLB pressure when using huge numbers of small mappings** | Each `mmap` creates a VMA; many small VMAs increase the size of the VMA list and the number of page‑table entries, causing more TLB misses and slower page‑table walks. | Consolidate mappings (e.g., use a single large `mmap` and manage sub‑offsets manually), or use `MAP_HUGETLB` / `transparent hugepages` to reduce page‑table depth. |
+| 6 | **Treating swap as uniformly slow** | Modern NVMe swap can approach DRAM latency (≈ 20‑30 µs) and is still faster than a synchronous filesystem write. The cost depends on device bandwidth, queue depth, and whether pages are clean or dirty. | Benchmark your specific swap device with `swapon -s` and `dd if=/dev/zero of=/swapfile bs=1M count=4096 oflag=direct` to measure latency, then decide whether to enable swap or rely on memory pressure alerts. |
+
+## Exercises
+### Exercise 1 – Easy: Quantify Allocator Overhead
+Write a program that:
+1. Allocates *N* = 10 000 blocks of 64 bytes via `malloc`.
+2. After each block, reads `/proc/self/statm` and records RSS.
+3. Computes average RSS per allocated object and compares it to the theoretical 64 B / 4 KiB = 0.0156 pages.
+4. Prints the overhead factor (measured / theoretical).  
+*Deliverable:* Source code, a short explanation of observed overhead, and a hypothesis about why it occurs (e.g., bin metadata, alignment).
+
+### Exercise 2 – Medium: Cache‑Blocking Impact on Matrix Multiply
+Implement a naive `C = A * B` (square matrices, dimension *N* = 1024) using double‑precision floats.  
+1. Run it baseline and capture `perf stat -e L1-dcache-loads,L1-dcache-load-misses,L2-loads,L2-load-misses,cycles`.  
+2. Rewrite the inner loops using cache blocking (tile size *T* = 64).  
+3. Measure again.  
+*Deliverable:* Speed‑up factor, change in miss rates at each level, and a short analysis of how block size trades off between temporal reuse and capacity misses.
+
+### Exercise 3 – Hard: Measuring and Reducing Page‑Fault Latency in a Swap‑Backed Workload
+1. Create a 4 GiB anonymous array, touch it once to fault in pages.  
+2. Enable a swap file on an SSD, then evict half the array to swap using `madvise(DONTNEED)`.  
+3. Launch *M* = 8 threads that randomly access the array (uniform distribution).  
+4. Using `perf record -e page-faults,minor-faults,major-faults -g ./a.out`, collect fault counts and latency via `perf stat`.  
+5. Experiment with:  
+   - Increasing swap I/O depth (`echo 128 > /sys/block/<device>/queue/nr_requests`).  
+   - Using `mlock` on the hot subset to keep it resident.  
+   - Changing the swappiness value (`/proc/sys/vm/swappiness`).  
+*Deliverable:* A report showing fault latency before/after each tweak, with explanation of how each knob influences the swap‑in path (I/O scheduler, writeback, readahead). Include the exact commands used and any observed trade‑offs (e.g., increased memory pressure vs reduced latency).
+
+## Linux Connection
+### Subsystems
+| Subsystem | Role in Memory Profiling | Key Interfaces |
+|-----------|--------------------------|----------------|
+| **Slab Allocator** (`kmem_cache`) | Manages kernel object allocations (e.g., `task_struct`, `vm_area_struct`). Fragmentation here can increase kernel memory usage visible via `/proc/meminfo` (`Slab`). | `/proc/slabinfo`, `slabinfo` command, `kmemleak` detector. |
+| **Page Cache** | C

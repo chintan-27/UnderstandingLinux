@@ -10,104 +10,261 @@ resources:
     title: "Introduction to Linear Algebra (Strang)"
 ---
 
-## Why This Matters
-
-Every performance-critical subsystem in Linux eventually bottlenecks on a linear algebra primitive. The GPU command processor in `drivers/gpu/drm/` submits transformation matrices to hardware that rotates, scales, and projects geometry — a broken rotation matrix produces visual corruption that looks like a driver bug but is an algebraic one. The kernel's CFS scheduler maintains per-CPU load vectors and computes weighted sums to balance work; when NUMA topology is involved, that weighting is essentially a matrix-vector product. ALSA's resampling path in `sound/core/` applies FIR filters that are convolutions — which become pointwise multiplications after an FFT, a fact that falls directly out of eigenvalue theory. `scikit-learn`'s PCA, `numpy`'s `linalg.solve`, and OpenBLAS's `dgemm` are all calling into the same LAPACK routines ultimately traceable to Gaussian elimination.
-
-When these systems fail the root cause is almost always an invariant violation: rank dropped where it shouldn't, a matrix became ill-conditioned so small floating-point errors exploded, eigenvalues went negative in a covariance matrix that must be positive-semidefinite. You cannot diagnose those failures without knowing what the invariants are and why they must hold.
-
----
-
 ## Core Concepts
-
 ### Vectors
+A vector in $\mathbb{R}^n$ is an ordered $n$-tuple $v=(v_1,\dots,v_n)$.  
+Geometrically it represents a directed segment from the origin to the point $(v_1,\dots,v_n)$; its **magnitude** is $\|v\|_2=\sqrt{\sum_{i=1}^n v_i^2}$ and its **direction** is the unit vector $v/\|v\|_2$.  
 
-A vector is an ordered $n$-tuple of scalars. Two operations define it completely — addition and scalar multiplication:
+Two fundamental operations are defined:
 
-$$\mathbf{u} + \mathbf{v} = \begin{pmatrix} u_1 + v_1 \\ \vdots \\ u_n + v_n \end{pmatrix}, \qquad c\mathbf{v} = \begin{pmatrix} cv_1 \\ \vdots \\ cv_n \end{pmatrix}$$
+* **Addition**: $(u+v)_i = u_i+v_i$.  
+  *Why?* Adding vectors corresponds to placing the tail of $v$ at the head of $u$; the resulting displacement is the sum of the individual displacements.  
 
-A **vector space** is any set closed under these two operations with the expected associativity, commutativity, and distributivity axioms. The reason to care about the abstract definition is that the same theorems apply everywhere: $\mathbb{R}^n$, polynomials of degree $\leq k$, continuous functions on $[0,1]$, and finite fields $\mathbb{F}_2^n$ (used in error-correcting codes) are all vector spaces. Intuitions built in $\mathbb{R}^3$ transfer directly.
+* **Scalar multiplication**: $(\alpha v)_i = \alpha v_i$ for $\alpha\in\mathbb{R}$.  
+  *Why?* Scaling stretches or shrinks the vector while preserving its line through the origin; if $\alpha<0$ the direction reverses.
 
-### Matrices as Linear Transformations
+A set of vectors $\{v_1,\dots,v_k\}$ is **linearly independent** if the only solution to $\sum_{i=1}^k \alpha_i v_i =0$ is $\alpha_i=0\;\forall i$.  
+If a vector can be written as a linear combination of others, it is **dependent**; the maximal number of independent vectors in a set equals the dimension of their span.
 
-A matrix is not a grid of numbers — it is a compact encoding of a **linear transformation** $T: \mathbb{R}^m \to \mathbb{R}^n$ satisfying:
+### Matrices
+An $m\times n$ matrix $A$ is a rectangular array $a_{ij}$ with $1\le i\le m$, $1\le j\le n$.  
+When bases $\mathcal{B}_V=\{e_1,\dots,e_n\}$ of $V=\mathbb{R}^n$ and $\mathcal{B}_W=\{f_1,\dots,f_m\}$ of $W=\mathbb{R}^m$ are fixed, $A$ represents the linear map $T:V\to W$ defined by  
+$$
+T(e_j)=\sum_{i=1}^m a_{ij}f_i .
+$$  
+Thus the $j$‑th column of $A$ is the image of the $j$‑th basis vector of $V$.
 
-$$T(\mathbf{u} + \mathbf{v}) = T(\mathbf{u}) + T(\mathbf{v}), \qquad T(c\mathbf{v}) = cT(\mathbf{v})$$
+**Matrix multiplication**: If $A\in\mathbb{R}^{m\times p}$ and $B\in\mathbb{R}^{p\times n}$, then $C=AB\in\mathbb{R}^{m\times n}$ has entries  
+$$
+c_{ik}=\sum_{j=1}^p a_{ij}b_{jk}.
+$$  
+*Why this formula?* Applying $T_B$ followed by $T_A$ to a basis vector $e_k$ gives  
+$$
+T_A(T_B(e_k)) = T_A\!\Big(\sum_{j=1}^p b_{jk}f_j\Big)=\sum_{j=1}^p b_{jk}T_A(f_j)=\sum_{j=1}^p b_{jk}\sum_{i=1}^m a_{ij}g_i
+=\sum_{i=1}^m\Big(\sum_{j=1}^p a_{ij}b_{jk}\Big)g_i,
+$$  
+so the coefficient of $g_i$ is exactly $c_{ik}$. Consequently matrix multiplication is **associative** and **distributive**, but **not commutative** in general because the underlying linear maps need not commute.
 
-Linearity means $T$ is completely determined by its action on a basis. If you know where $T$ sends $n$ basis vectors, you know where it sends every vector. An $n \times m$ matrix encodes exactly this: **column $j$ is the image of the $j$-th basis vector**. This is why matrix-vector multiplication looks the way it does:
+**Special matrices**  
+* Identity $I_n$: $a_{ij}=\delta_{ij}$; it represents the identity map.  
+* Transpose $A^T$: $(A^T)_{ij}=a_{ji}$; corresponds to the adjoint with respect to the standard inner product.  
+* Orthogonal matrix $Q$: satisfies $Q^TQ=I$; its columns form an orthonormal basis.
 
-$$A\mathbf{x} = x_1 \mathbf{a}_1 + x_2 \mathbf{a}_2 + \cdots + x_m \mathbf{a}_m$$
+### Linear Transformations
+A map $T:V\to W$ between vector spaces is **linear** iff  
+$$
+T(u+v)=T(u)+T(v),\qquad T(\alpha u)=\alpha T(u)\quad\forall u,v\in V,\;\alpha\in\mathbb{R}.
+$$  
+*Why these two properties?* They encode precisely the preservation of vector addition and scalar multiplication, the only structure a vector space possesses.  
 
-The output is a linear combination of $A$'s columns weighted by the entries of $\mathbf{x}$.
+If $\dim V=n$ and $\dim W=m$, choosing bases yields a unique matrix $A$ such that $T(x)=Ax$ for all coordinate vectors $x\in\mathbb{R}^n$. Conversely, any matrix defines a linear transformation. Hence the study of linear transformations is equivalent to the study of matrices.
+
+Important consequences:
+* $T(0)=0$ (set $u=v=0$ in additivity).  
+* $T$ preserves linear combinations: $T\big(\sum_i\alpha_i v_i\big)=\sum_i\alpha_i T(v_i)$.  
+* The **kernel** (null space) $\ker T=\{v\mid T(v)=0\}$ and **image** $\operatorname{im} T=\{T(v)\mid v\in V\}$ are subspaces; their dimensions relate via the rank–nullity theorem (see below).
 
 ### Rank
+For a matrix $A\in\mathbb{R}^{m\times n}$ define  
+* **Column space** $\mathcal{C}(A)=\{Ax\mid x\in\mathbb{R}^n\}\subseteq\mathbb{R}^m$.  
+* **Row space** $\mathcal{R}(A)=\{y^TA\mid y\in\mathbb{R}^n\}\subseteq\mathbb{R}^m$.  
 
-The **rank** of $A$ is the dimension of its column space — the number of linearly independent directions the transformation actually produces. For an $m \times n$ matrix:
+The **rank** of $A$, denoted $\operatorname{rank}(A)$, is the dimension of either space (they are equal).  
 
-$$r = \operatorname{rank}(A) \leq \min(m, n)$$
+*Proof of equality*: Elementary row operations do not change the row space and preserve linear relations among columns; similarly, column operations preserve column relations. Reducing $A$ to row‑echelon form reveals pivot columns that form a basis for $\mathcal{C}(A)$; the number of pivots equals the number of nonzero rows, a basis for $\mathcal{R}(A)$.  
 
-The **rank-nullity theorem** states:
+**Rank–nullity theorem**: For $T:x\mapsto Ax$,  
+$$
+\operatorname{rank}(A)+\operatorname{nullity}(A)=n,
+$$  
+where $\operatorname{nullity}(A)=\dim\ker A$.  
+*Why?* Extend a basis of $\ker A$ to a basis of $\mathbb{R}^n$; the images of the added basis vectors are linearly independent and span $\operatorname{im}A$, giving exactly $n-\dim\ker A$ independent image vectors.
 
-$$\operatorname{rank}(A) + \operatorname{nullity}(A) = n$$
+### Eigenvalues and Diagonalization
+Let $A\in\mathbb{R}^{n\times n}$. A scalar $\lambda$ is an **eigenvalue** if there exists a non‑zero vector $v$ such that  
+$$
+Av=\lambda v .
+$$  
+$v$ is then an **eigenvector** associated with $\lambda$.  
 
-where $\operatorname{nullity}(A) = \dim(\ker A)$ is the dimension of the null space — the subspace of inputs that map to zero. Every direction in the null space is destroyed by $A$; information sent into those directions is unrecoverable. A rank-deficient $A\mathbf{x} = \mathbf{b}$ system either has no solution (if $\mathbf{b}$ lies outside the column space) or infinitely many (the solution is a particular solution plus any vector in the null space).
+*Characteristic polynomial*:  
+$$
+p_A(\lambda)=\det(A-\lambda I)=\lambda^n + c_{n-1}\lambda^{n-1}+\dots +c_0 .
+$$  
+The roots of $p_A$ are precisely the eigenvalues (Fundamental Theorem of Algebra).  
 
-Practically: if you build a system of equations whose coefficient matrix is rank-deficient because two sensors are measuring the same physical quantity, you will not get a unique solution no matter how good your solver is. The algebraic structure reflects the physical redundancy.
+**Algebraic multiplicity** $m_a(\lambda)$ = multiplicity of $\lambda$ as a root of $p_A$.  
+**Geometric multiplicity** $m_g(\lambda)=\dim\ker(A-\lambda I)$ = number of linearly independent eigenvectors for $\lambda$.  
+Always $m_g(\lambda)\le m_a(\lambda)$.  
 
-### Eigenvalues and Eigenvectors
+A matrix is **diagonalizable** iff there exists an invertible $P$ with $P^{-1}AP=D$ diagonal.  
+*Criterion*: $A$ is diagonalizable $\iff$ the sum of geometric multiplicities equals $n$, i.e. $A$ possesses $n$ linearly independent eigenvectors.  
 
-For a square $n \times n$ matrix $A$, a nonzero vector $\mathbf{v}$ is an **eigenvector** if the transformation only scales it:
+If $A$ is real symmetric ($A^T=A$), the **Spectral Theorem** guarantees orthogonal diagonalization: there exists an orthogonal $Q$ ($Q^TQ=I$) such that $Q^TAQ=\Lambda$ where $\Lambda$ is diagonal with real eigenvalues. Orthogonal matrices preserve lengths and angles, making symmetric matrices especially useful in physics and optimization.
 
-$$A\mathbf{v} = \lambda \mathbf{v}$$
+### Orthogonality
+With the standard inner product $\langle u,v\rangle = u^T v = \sum_{i=1}^n u_i v_i$, two vectors are **orthogonal** if $\langle u,v\rangle =0$.  
+A set $\{q_1,\dots,q_k\}$ is **orthonormal** if $\langle q_i,q_j\rangle =\delta_{ij}$.  
 
-The scalar $\lambda$ is the **eigenvalue**. Rearranging: $(A - \lambda I)\mathbf{v} = \mathbf{0}$ has a nontrivial solution iff $A - \lambda I$ is singular, i.e.:
+An **orthogonal matrix** $Q$ satisfies $Q^TQ=I$; equivalently its columns (and rows) form an orthonormal basis. Multiplication by $Q$ preserves the inner product:  
+$$
+\langle Qx,Qy\rangle = (Qx)^T(Qy)=x^TQ^TQy = x^Ty = \langle x,y\rangle .
+$$  
+Hence orthogonal transformations are **rigid motions** (rotations/reflections) that do not distort shapes.
 
-$$\det(A - \lambda I) = 0$$
-
-This **characteristic polynomial** has degree $n$, so there are $n$ eigenvalues (counting multiplicity, over $\mathbb{C}$). Eigenvectors are the natural axes of $A$ — directions the transformation acts on independently, with no coupling to other directions.
-
-Why they matter computationally: repeated application of $A$ amplifies directions with $|\lambda| > 1$ and suppresses directions with $|\lambda| < 1$. The largest eigenvalue dominates after enough iterations. This is exactly why the **power method** works for finding the dominant eigenvector, and why Google's original PageRank algorithm reduces to finding the principal eigenvector of a stochastic matrix.
-
-### Diagonalization
-
-$A$ is **diagonalizable** if it has $n$ linearly independent eigenvectors. Then:
-
-$$A = P D P^{-1}$$
-
-where $D = \operatorname{diag}(\lambda_1, \ldots, \lambda_n)$ and the columns of $P$ are the corresponding eigenvectors. The payoff is that powers and exponentials become trivial:
-
-$$A^k = P D^k P^{-1}, \qquad D^k = \operatorname{diag}(\lambda_1^k, \ldots, \lambda_n^k)$$
-
-$$e^{At} = P \operatorname{diag}(e^{\lambda_1 t}, \ldots, e^{\lambda_n t}) P^{-1}$$
-
-The matrix exponential $e^{At}$ is the exact solution to the ODE system $\dot{\mathbf{x}} = A\mathbf{x}$, which governs everything from circuit transients to linearized control systems in real-time kernels. Without diagonalization, computing $e^{At}$ for each timestep would require a full $O(n^3)$ matrix exponential algorithm; with it, the per-step cost is $O(n)$.
-
-### Singular Value Decomposition
-
-Eigendecomposition requires a square matrix and may not exist over $\mathbb{R}$. The **SVD** has no such restriction. Every $m \times n$ matrix $A$ decomposes as:
-
-$$A = U \Sigma V^T$$
-
-where $U$ ($m \times m$) and $V$ ($n \times n$) are orthogonal, and $\Sigma$ ($m \times n$) is diagonal with nonnegative entries $\sigma_1 \geq \sigma_2 \geq \cdots \geq \sigma_r > 0$ called **singular values**. The rank of $A$ is exactly the number of nonzero singular values.
-
-The geometric reading: $V^T$ rotates the input, $\Sigma$ stretches along the coordinate axes, $U$ rotates the output. The condition number $\kappa(A) = \sigma_1 / \sigma_r$ measures how much the transformation amplifies errors. A large condition number means small perturbations in $\mathbf{b}$ cause large changes in $\mathbf{x}$ when solving $A\mathbf{x} = \mathbf{b}$ — the matrix is **ill-conditioned**.
-
-The **rank-$k$ truncated SVD**:
-
-$$A_k = \sum_{i=1}^k \sigma_i \mathbf{u}_i \mathbf{v}_i^T$$
-
-is the best rank-$k$ approximation to $A$ in both spectral and Frobenius norms (Eckart-Young theorem). This is the mathematical foundation of PCA, latent semantic analysis, and low-rank matrix compression.
-
-### Orthogonality and QR
-
-Two vectors are **orthogonal** when $\mathbf{u} \cdot \mathbf{v} = \sum_i u_i v_i = 0$. An **orthonormal basis** ($Q$) has mutually orthogonal unit vectors. Its defining property: $Q^T Q = I$, so $Q^{-1} = Q^T$. Inversion costs nothing — just a transpose.
-
-**Gram-Schmidt** constructs an orthonormal basis from any linearly independent set by iteratively subtracting projections:
-
-$$\mathbf{u}_k = \mathbf{a}_k - \sum_{j=1}^{k-1} \frac{\mathbf{a}_k \cdot \mathbf{q}_j}{\mathbf{q}_j \cdot \mathbf{q}_j} \mathbf{q}_j, \qquad \mathbf{q}_k = \frac{\mathbf{u}_k}{\|\mathbf{u}_k\|}$$
-
-This is the constructive proof of **QR decomposition**: $A = QR$ where $Q$ is orthogonal and $R$ is upper triangular. QR is numerically stabler than LU for least-squares problems because orthogonal transformations have condition number 1 — they do not amplify errors.
-
----
+**Gram–Schmidt process**: Given a linearly independent set $\{v_1,\dots,v_k\}$, produce an orthonormal set $\{u_1,\dots,u_k\}$ by  
+$$
+u_1=\frac{v_1}{\|v_1\|},\qquad
+u_j=\frac{v_j-\sum_{i<j}\langle v_j,u_i\rangle u_i}{\big\|v_j-\sum_{i<j}\langle v_j,u_i\rangle u_i\big\|},\;j\ge2 .
+$$  
+This construction underlies QR factorization $A=QR$ with $Q$ orthogonal and $R$ upper‑triangular, a numerically stable way to solve least‑squares problems.
 
 ## How It Works
+### Solving Linear Systems
+Given $Ax=b$ with $A\in\mathbb{R}^{m\times n}$, perform Gaussian elimination to obtain an upper‑triangular matrix $U$ via elementary row operations (which correspond to left‑multiplication by invertible matrices).  
+*If* $\operatorname{rank}(A)=\operatorname{rank}([A\mid b])=n$ (full column rank) then the system has a **unique solution** $x=A^{-1}b$ (when $m=n$) or the **minimum‑norm solution** $x=A^{\dagger}b$ (Moore–Penrose pseudoinverse) when $m>n$.  
+*If* the ranks differ, the system is **inconsistent** (no solution).  
+*If* $\operatorname{rank}(A)<n$, there are infinitely many solutions; they form an affine subspace $x_0+\ker A$.
+
+The **LU decomposition** $A=LU$ (with $L$ lower‑triangular unit diagonal, $U$ upper‑triangular) stems directly from the elimination steps and enables solving multiple right‑hand sides in $O(n^2)$ after an $O(n^3)$ factorization.
+
+### Composition of Linear Transformations
+If $T_1:\mathbb{R}^p\to\mathbb{R}^q$ and $T_2:\mathbb{R}^q\to\mathbb{R}^r$ have matrices $B$ and $A$ respectively, then the composition $T_2\circ T_1$ is represented by $AB$.  
+Because matrix multiplication captures successive application, the order matters: $AB\neq BA$ generally, reflecting that applying a rotation then a shear differs from a shear then a rotation.
+
+### Eigenvalues in Dynamical Systems
+Consider the linear ODE $\dot{x}=Ax$, $x(0)=x_0$.  
+If $A=PDP^{-1}$ with $D=\operatorname{diag}(\lambda_1,\dots,\lambda_n)$, then  
+$$
+x(t)=e^{At}x_0=Pe^{Dt}P^{-1}x_0,
+$$  
+where $e^{Dt}=\operatorname{diag}(e^{\lambda_1 t},\dots,e^{\lambda_n t})$.  
+Thus each eigenvector direction evolves independently, scaling by $e^{\lambda_i t}$. Positive $\lambda_i$ yields growth, negative yields decay, complex pairs produce oscillations. Diagonalization therefore **decouples** the system.
+
+### Orthogonal Projections and Least Squares
+For inconsistent $Ax=b$, the **least‑squares** solution minimizes $\|Ax-b\|_2^2$. Setting the gradient to zero yields the **normal equations**  
+$$
+A^TAx=A^Tb .
+$$  
+If $A$ has full column rank, $A^TA$ is invertible and the unique solution is $x=(A^TA)^{-1}A^Tb$.  
+Geometrically, $Ax$ is the orthogonal projection of $b$ onto $\mathcal{C}(A)$; the residual $b-Ax$ is orthogonal to every column of $A$.  
+QR factorization provides a numerically stable method: $Ax=QRx$, so the normal equations become $R^Tx=Q^Tb$, solved by back substitution.
+
+## Worked Examples
+### Example 1: Inverse of a $2\times2$ Matrix
+Find $A^{-1}$ for  
+$$
+A=\begin{pmatrix}2&1\\[2pt]1&1\end{pmatrix}.
+$$
+
+**Step 1 – Determinant**  
+$$
+\det A = 2\cdot1-1\cdot1 = 1.
+$$  
+Since $\det A\neq0$, $A$ is invertible.
+
+**Step 2 – Adjugate**  
+The cofactor matrix $C$ is  
+$$
+C=\begin{pmatrix}
+\ \ \ 1 & -1\\
+-1 & \ \ \ 2
+\end{pmatrix},
+$$  
+where $C_{ij}=(-1)^{i+j}\det(A_{ji})$ (note the transpose).  
+The adjugate is $\operatorname{adj}(A)=C^T=\begin{pmatrix}1&-1\\-1&2\end{pmatrix}$.
+
+**Step 3 – Inverse**  
+$$
+A^{-1}= \frac{1}{\det A}\operatorname{adj}(A)=
+\begin{pmatrix}1&-1\\-1&2\end{pmatrix}.
+$$  
+*Verification*: $AA^{-1}=I_2$.
+
+### Example 2: Orthogonal Diagonalization of a Symmetric Matrix
+Diagonalize  
+$$
+A=\begin{pmatrix}4&2\\2&1\end{pmatrix}.
+$$
+
+**Step 1 – Characteristic polynomial**  
+$$
+\det(A-\lambda I)=\det\begin{pmatrix}4-\lambda&2\\2&1-\lambda\end{pmatrix}
+=(4-\lambda)(1-\lambda)-4=\lambda^2-5\lambda.
+$$  
+Thus $\lambda_1=0,\ \lambda_2=5$.
+
+**Step 2 – Eigenvectors**  
+*For $\lambda_1=0$*: Solve $Av=0$  
+$$
+\begin{pmatrix}4&2\\2&1\end{pmatrix}\!\begin{pmatrix}x\\y\end{pmatrix}=0
+\;\Rightarrow\;4x+2y=0\;\Rightarrow\;y=-2x.
+$$  
+Choose $v_1=\begin{pmatrix}1\\-2\end{pmatrix}$.
+
+*For $\lambda_2=5$*: Solve $(A-5I)v=0$  
+$$
+\begin{pmatrix}-1&2\\2&-4\end{pmatrix}\!\begin{pmatrix}x\\y\end{pmatrix}=0
+\;\Rightarrow\;-x+2y=0\;\Rightarrow\;x=2y.
+$$  
+Choose $v_2=\begin{pmatrix}2\\1\end{pmatrix}$.
+
+**Step 3 – Orthonormalize**  
+$\|v_1\|=\sqrt{1^2+(-2)^2}=\sqrt5$, $\|v_2\|=\sqrt{2^2+1^2}=\sqrt5$.  
+Set  
+$$
+q_1=\frac{v_1}{\sqrt5}=\begin{pmatrix}1/\sqrt5\\-2/\sqrt5\end{pmatrix},\qquad
+q_2=\frac{v_2}{\sqrt5}=\begin{pmatrix}2/\sqrt5\\\ 1/\sqrt5\end{pmatrix}.
+$$  
+Form $Q=[q_1\; q_2]$:  
+$$
+Q=\begin{pmatrix}
+\frac{1}{\sqrt5}&\frac{2}{\sqrt5}\\[4pt]
+-\frac{2}{\sqrt5}&\frac{1}{\sqrt5}
+\end{pmatrix},\qquad Q^TQ=I.
+$$
+
+**Step 4 – Diagonal form**  
+$$
+Q^TAQ=\begin{pmatrix}0&0\\0&5\end{pmatrix}= \Lambda .
+$$  
+Hence $A=Q\Lambda Q^T$ is the orthogonal diagonalization.
+
+## Common Mistakes
+| # | Mistake | Why it’s Wrong | Correct Reasoning |
+|---|---------|----------------|-------------------|
+| 1 | **Assuming $\det(A+B)=\det A+\det B$** | Determinant is multilinear in rows *or* columns, not additive over matrix addition. Counterexample: $A=I_2$, $B=-I_2$ gives $\det(A+B)=0\neq\det A+\det B=2$. | Use $\det(A+B)=\det A+\det B+\text{mixed terms}$; compute directly or use properties like $\det(A+B)=\det A\det(I+A^{-1}B)$ when $A$ invertible. |
+| 2 | **Thinking $AB=BA$ whenever $A$ and $B$ are both diagonal** | Only true if both are diagonal *in the same basis*. If $A$ is diagonal but $B$ is not, they generally don’t commute. Example: $A=\begin{pmatrix}1&0\\0&2\end{pmatrix}$, $B=\begin{pmatrix}0&1\\1&0\end{pmatrix}$ gives $AB\neq BA$. | Diagonal matrices commute with each other, but not with arbitrary matrices. Check $AB-BA$ explicitly or note that commutativity requires simultaneous diagonalizability. |
+| 3 | **Using $A^{-1}=\frac{1}{\det A}\operatorname{adj}(A)$ for non‑square matrices** | The adjugate is defined only for square matrices; non‑square matrices lack a two‑sided inverse. | For $m\neq n$, discuss one‑sided inverses or the Moore–Penrose pseudoinverse $A^{\dagger}=(A^TA)^{-1}A^T$ (if $A$ has full column rank). |
+| 4 | **Assuming orthogonal matrices have determinant $+1$ only** | Orthogonal matrices satisfy $Q^TQ=I$, which implies $\det Q=\pm1$. Determinant $-1$ corresponds to a reflection (orientation‑reversing). | Remember $\det(Q)^2=\det(Q^TQ)=\det I=1$, so $\det Q=\pm1$. Examples: rotation in 2D has $\det+1$, reflection across a line has $\det-1$. |
+
+## Exercises
+1. **(Easy) Inverse via Gaussian elimination**  
+   Compute the inverse of  
+   $$
+   B=\begin{pmatrix}
+   3 & 0 & 2\\
+   2 & 1 &-1\\
+   1 & 0 & 1
+   \end{pmatrix}
+   $$  
+   by augmenting with $I_3$ and performing row‑reduction. Show each elementary step and verify $BB^{-1}=I_3$.
+
+2. **(Intermediate) Diagonalization of a $3\times3$ symmetric matrix**  
+   Diagonalize  
+   $$
+   C=\begin{pmatrix}
+   5 & 2 & 0\\
+   2 & 5 & 0\\
+   0 & 0 & 3
+   \end{pmatrix}.
+   $$  
+   Find eigenvalues, orthogonal eigenvectors, construct $Q$, and confirm $Q^TCQ=\Lambda$.
+
+3. **(Hard) Rank, nullspace, and least‑squares**  
+   Let  
+   $$
+   D=\begin{pmatrix}
+   1 & 2 & 3 & 4\\
+   2 & 4 & 6 & 8\\
+   0 & 1

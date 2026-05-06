@@ -10,138 +10,266 @@ resources:
     title: "The Linux Programming Interface (Kerrisk)"
 ---
 
-## Why This Matters
-
-Every privileged instruction a guest kernel executes — writing CR3 to switch page tables, accessing an I/O port, modifying an MSR — must be intercepted by the hypervisor, validated, and handled. The cost of that interception is paid on every guest kernel entry, every device access, every memory mapping operation. Understanding KVM's architecture explains three things precisely: why compute-bound guest workloads run at near-native speed, why I/O-bound workloads pay a measurable tax, and why observability tools like `perf` and BPF can return incomplete or misleading data inside a guest (the guest's PMU is virtualized; the host's BPF programs don't see guest kernel symbols).
-
----
-
 ## Core Concepts
+### What KVM Is
+KVM (Kernel‑based Virtual Machine) is a **loadable kernel module** that turns the Linux kernel into a **type‑1 hypervisor** by leveraging CPU hardware virtualization extensions (Intel VT‑x or AMD‑V). Unlike hosted hypervisors, KVM runs VMs **directly on the host hardware**; the kernel itself handles privileged operations, while device emulation is delegated to a user‑space program (usually QEMU).
 
-### KVM Is a Linux Kernel Extension, Not a Separate Hypervisor
+### Why Hardware Assistance Matters
+Without VT‑x/AMD‑V, a VMM must use **binary translation** or **full software emulation** to trap and reinterpret privileged instructions. This adds interpretive overhead on every sensitive instruction (e.g., `LGDT`, `CLI`, `INVLPG`). Hardware virtualization introduces a **new processor mode**—*VMX root* (host) and *VMX non‑root* (guest)—so that the CPU can automatically:
 
-KVM is implemented as two kernel modules: `kvm.ko` (architecture-independent core) and either `kvm-intel.ko` or `kvm-amd.ko` (the hardware virtualization backend). There is no separate hypervisor layer. The host Linux kernel *becomes* the hypervisor. This matters because:
+1. **Intercept** privileged guest attempts via VM‑exits,
+2. **Restore** host state without software inspection,
+3. **Resume** guest execution via VM‑entry.
 
-- vCPUs are scheduled by CFS like any other thread — guest CPU starvation shows up in `schedstat`, not in a hypervisor-specific tool
-- Guest memory is managed by the host's page allocator and reclaim machinery — a memory-pressured host can balloon or swap guest RAM
-- KVM reuses the entire Linux driver stack instead of reimplementing it
+The cost of a VM‑exit is bounded (≈ 1–2 µs on modern CPUs) and is amortized over the many instructions executed between exits, yielding near‑native performance for most workloads.
 
-The type-1 vs. type-2 distinction matters less than the architectural consequence: KVM has no scheduler of its own, which means a noisy neighbor VM doesn't just slow down other VMs — it shows up as ordinary CPU contention on the host, diagnosable with standard Linux tools.
+### Guest‑Physical ↔ Host‑Physical Address Translation
+KVM uses **shadow page tables** (or, when available, **nested paging/EPT**) to translate a guest‑virtual address (GVA) → guest‑physical address (GPA) → host‑physical address (HPA).  
 
-### vCPUs Are POSIX Threads
+*Shadow paging*: The hypervisor maintains a copy of the guest’s page tables that map GVA → HPA directly. On every write to a guest page‑table entry (PTE), the kernel must **protect** the guest page‑table page (set it read‑only) and intercept the write to update the shadow copy.  
 
-Each vCPU is a thread in the QEMU process. When a vCPU thread is scheduled, it executes a `KVM_RUN` ioctl on its file descriptor (`/dev/kvm`), which causes the kernel to issue a `VMLAUNCH` or `VMRESUME` instruction. The guest then runs directly on hardware in **VMX non-root mode** (Intel) or **SVM guest mode** (AMD) — real CPU instructions, real registers, no interpretation.
+*Nested paging* (EPT/VPID): The CPU maintains two levels of translation: guest page tables (GVA→GPA) and an **EPT** table (GPA→HPA). The guest can modify its own page tables without causing a VM‑exit; only EPT misconfigurations trigger exits. This reduces exit frequency dramatically.
 
-The vCPU thread is in kernel space for the duration of guest execution. From the Linux scheduler's perspective, it looks like a thread blocked in a syscall. When a VM exit occurs, the CPU transitions back to VMX root mode, the kernel exit handler runs, and the thread either re-enters the guest or returns to QEMU userspace.
+#### Memory‑overhead Derivation (shadow paging)
+Assume a 4‑level x86‑64 page table, page size $P = 4\text{KB}$, PTE size $= 8\text{B}$. To map a guest memory region of size $S$:
 
-```c
-// The userspace side of the run loop (simplified from QEMU's kvm-all.c)
-// vcpu->fd is opened via ioctl(vm_fd, KVM_CREATE_VCPU, vcpu_id)
-// vcpu->run is a struct kvm_run mmap'd from the vcpu fd
+- Level 0 (leaf) entries needed: $S/P$  
+  Memory for leaf PTEs: $(S/P) \times 8\text{B} = \frac{S}{512}\text{B}$
+- Level 1 entries: $\frac{S}{P \times 512}$ → memory $= \frac{S}{512^2}\text{B}$
+- Level 2: $\frac{S}{512^3}\text{B}$
+- Level 3 (PML4): $\frac{S}{512^4}\text{B}$
 
-while (true) {
-    ret = ioctl(vcpu->fd, KVM_RUN, 0);
-    // On return, vcpu->run->exit_reason says why we exited
-    switch (vcpu->run->exit_reason) {
-    case KVM_EXIT_IO:
-        // guest did IN/OUT — handle port I/O in userspace
-        handle_io(vcpu->run);
-        break;
-    case KVM_EXIT_MMIO:
-        // guest accessed unmapped MMIO region
-        handle_mmio(vcpu->run);
-        break;
-    case KVM_EXIT_HLT:
-        // guest is idle
-        break;
-    case KVM_EXIT_SHUTDOWN:
-        return;
-    }
-}
-```
+Total shadow‑table memory:
+$$
+M_{\text{shadow}} = S\!\left(\frac{1}{512} + \frac{1}{512^2} + \frac{1}{512^3} + \frac{1}{512^4}\right) \approx S \times 0.0078
+$$
+Thus a 1 GB guest consumes ≈ 8 MB of shadow tables (~0.8 % overhead). With EPT, the guest’s own page tables remain in guest memory; the host only needs a single EPT table (~$S/512$ bytes), cutting overhead to < 0.1 %.
 
-The `struct kvm_run` layout is defined in `<linux/kvm.h>`. The `exit_reason` field tells QEMU what the guest was trying to do; the union members carry the operands.
-
-### VM Exits Are the Fundamental Cost Unit
-
-A VM exit forces the CPU to:
-1. Save the complete guest architectural state into the **VMCS** (Intel) or **VMCB** (AMD) — a per-vCPU hardware structure in memory
-2. Load host state from the same structure
-3. Jump to the hypervisor's exit handler at a fixed host virtual address
-
-The round-trip latency for a minimal exit (one that returns immediately) is roughly $500$–$2000$ ns on current hardware, depending on the exit reason and whether KPTI/Spectre mitigations are active. Mitigations add retpoline overhead and potentially an IBPB flush on each exit:
-
-$$t_{\text{exit}} = t_{\text{vmexit}} + t_{\text{handler}} + t_{\text{vmentry}} + t_{\text{mitigations}}$$
-
-For comparison, a native syscall (SYSCALL/SYSRET) costs roughly $100$–$200$ ns. A VM exit is $5$–$10\times$ more expensive before any emulation work. If a guest kernel issues $N$ privileged operations per second, the overhead floor is:
-
-$$\text{overhead} \geq N \cdot t_{\text{exit}}$$
-
-This is why paravirtualization exists: replacing a sequence of trapping instructions with a single hypercall collapses $N$ exits into $1$.
-
-### Two-Level Address Translation
-
-The guest OS maintains its own page tables mapping guest-virtual to guest-physical addresses. But guest-physical addresses are not real — they are an address space KVM manages, backed by host-virtual memory allocated via `mmap`. Reaching a real DRAM cell requires two translations:
-
-$$\text{GVA} \xrightarrow{\text{guest PT}} \text{GPA} \xrightarrow{\text{EPT/NPT}} \text{HPA}$$
-
-**Extended Page Tables** (Intel EPT) and **Nested Page Tables** (AMD NPT) extend the hardware MMU to walk both levels in a single TLB miss, producing a GVA→HPA entry cached directly in the TLB. Without EPT/NPT, the hypervisor must maintain **shadow page tables** that directly map GVA→HPA in software. Every guest write to its own page tables would trigger an EPT violation exit so the hypervisor could update the shadow tables — this was the dominant source of overhead in pre-EPT hypervisors.
-
-A TLB miss under EPT requires walking up to $5 \times 4 = 20$ memory accesses (4 levels of guest PT + 4 levels of EPT per guest PT level, plus the final EPT walk). This is why hugepages matter: each TLB entry covers more address space, reducing miss frequency.
-
-$$\text{TLB entries needed} = \left\lceil \frac{\text{Guest RAM}}{\text{Page Size}} \right\rceil$$
-
-For 8 GB of guest RAM:
-
-| Page size | TLB entries |
-|---|---|
-| 4 KB | $2{,}097{,}152$ |
-| 2 MB | $4{,}096$ |
-| 1 GB | $8$ |
-
-KVM exposes hugepage backing to the guest via transparent hugepages (THP) or explicit `hugetlbfs` allocation on the host. The guest doesn't need to know — the EPT mappings use large entries regardless of what the guest's own page tables do.
-
-### QEMU Handles Device I/O
-
-KVM only virtualizes CPU execution and memory translation. Everything with a device model — disks, NICs, USB controllers, firmware — lives in QEMU userspace. When a guest driver accesses an emulated device register (e.g., writes to the e1000's command register at a specific I/O port), the sequence is:
-
-1. Guest executes `OUT` instruction
-2. CPU triggers VM exit (`EXIT_REASON_IO_INSTRUCTION`)
-3. Kernel exit handler reads port/data from VMCS
-4. Handler determines this port belongs to QEMU, writes to an `ioeventfd`
-5. QEMU's event loop wakes, reads the I/O request from `struct kvm_run`
-6. QEMU emulates the device, performs real I/O (e.g., `pwrite` to a disk image)
-7. QEMU writes results back into guest memory and signals the guest via `irqfd`
-8. KVM injects a virtual interrupt; guest driver receives completion
-
-Steps 4–7 are the "QEMU round-trip." Each one is a context switch or syscall. For legacy device emulation, every register access in a device transaction may trigger a separate exit. A single guest disk read touching 10 device registers costs 10 exits plus the round-trip.
-
-### Virtio Reduces Exit Count, Not Latency
-
-Virtio replaces the register-per-operation protocol with a shared-memory ring buffer (**virtqueue**). The guest driver writes one or more descriptors into the ring, then writes to a single "doorbell" register to notify the host. That one write is the only exit per batch:
-
-```
-Guest memory (shared):
-┌──────────────────────────────────────────┐
-│  Descriptor Table  │  Available Ring  │  Used Ring  │
-└──────────────────────────────────────────┘
-         ↑ guest writes here          ↑ host writes completions here
-```
-
-The host reads the available ring, processes descriptors (doing real I/O), writes to the used ring, and raises an interrupt. The guest processes the used ring in its interrupt handler.
-
-The protocol is defined by the VirtIO specification. The in-kernel implementation lives in `drivers/virtio/` (guest side) and `drivers/vhost/` (host side, for in-kernel vhost backend that avoids the QEMU round-trip entirely for network and block I/O).
-
-For network I/O, `vhost-net` processes virtqueue descriptors in a kernel thread on the host, eliminating the QEMU userspace round-trip for the data path. Latency drops from ~$50\ \mu s$ (QEMU emulated) to ~$5\ \mu s$ (vhost-net) to ~$1\ \mu s$ (SR-IOV passthrough).
+### Core Components
+| Component | Role | Implementation |
+|-----------|------|----------------|
+| **kvm.ko** | Kernel module providing `/dev/kvm` and VM‑management ioctls | `kernel/kvm/` |
+| **kvm_intel.ko / kvm_amd.ko** | Architecture‑specific VMX/SVM support | `arch/x86/kvm/` |
+| **QEMU** | User‑space device emulator, I/O backend, and VMM launcher | `qemu-system-x86_64` (package `qemu-kvm`) |
+| **libvirt** | Daemon (`libvirtd`) offering stable XML API, storage, networking, and lifecycle tools | `/etc/libvirt/`, `/var/lib/libvirt/` |
 
 ---
 
 ## How It Works
+### KVM API Overview (ioctl‑based)
+All interactions with KVM happen through file descriptors opened on `/dev/kvm`. The primary ioctls are:
 
-### The Kernel-Side Exit Handler
+| ioctl | Purpose | Typical struct |
+|-------|---------|----------------|
+| `KVM_CREATE_VM` | Create a VM object, returns a VM fd | none |
+| `KVM_SET_USER_MEMORY_REGION` | Register a guest‑physical memory slot | `struct kvm_userspace_memory_region` |
+| `KVM_CREATE_IRQCHIP` | Create an emulated PIC/IOAPIC | none |
+| `KVM_CREATE_VCPU` | Allocate a VCPU fd | none |
+| `KVM_RUN` | Enter guest mode until a VM‑exit | `struct kvm_run` |
+| `KVM_GET_REGS / KVM_SET_REGS` | Access guest registers | `struct kvm_regs` |
+| `KVM_GET_SREGS / KVM_SET_SREGS` | Access special registers (CR0‑CR4, GDT, IDT) | `struct kvm_sregs` |
 
-Inside `arch/x86/kvm/vmx/vmx.c`, the exit dispatch table maps exit reasons to handlers:
-
+#### Example: Creating a 256 MiB VM
 ```c
-// Simplified from arch/x86/kvm/vmx/vmx.c
-// The actual table is vm
+int kvm_fd = open("/dev/kvm", O_RDWR);
+int vm_fd  = ioctl(kvm_fd, KVM_CREATE_VM, 0);
+
+/* Define a memory slot: guest physical 0x0–0x10000000 maps to host anonymous memory */
+struct kvm_userspace_memory_region mem = {
+    .slot   = 0,
+    .flags  = 0,
+    .guest_phys_addr = 0x0,
+    .memory_size     = 0x10000000,   /* 256 MiB */
+    .userspace_addr  = (unsigned long)mmap(NULL, 0x10000000,
+                                          PROT_READ|PROT_WRITE,
+                                          MAP_PRIVATE|MAP_ANONYMOUS, -1, 0)
+};
+ioctl(vm_fd, KVM_SET_USER_MEMORY_REGION, &mem);
+```
+After registering memory, VCPUs are created with `KVM_CREATE_VCPU` and run via `KVM_RUN`. Each `KVM_RUN` returns a `struct kvm_run` whose `exit_reason` field tells the host why the VM exited (e.g., `KVM_EXIT_IO` for port‑mapped I/O, `KVM_EXIT_HLT` for halt, `KVM_EXIT_MMIO` for memory‑mapped I/O).
+
+### QEMU’s Role
+QEMU is not a hypervisor; it is a **device emulator** that:
+
+1. **Allocates** guest RAM via `mmap` and registers it with KVM using the above ioctl.
+2. **Creates** VCPUs and runs the main loop invoking `KVM_RUN`.
+3. **Handles** VM‑exits: for each `KVM_EXIT_IO` it emulates in/out ports; for `KVM_EXIT_MMIO` it maps the address to a virtual device (virtio‑blk, virtio‑net, e1000, etc.).
+4. **Provides** a command‑line interface (`-enable-kvm`) that hides the ioctl complexity.
+
+When launched with `-enable-kvm`, QEMU essentially becomes a thin wrapper around the KVM API; without it, QEMU falls back to **TCG** (tiny code generator) and runs entirely in software.
+
+### Virtual Devices & VirtIO
+KVM delegates I/O to QEMU, which implements **virtio** para‑virtualized devices:
+
+- **virtio‑blk**: block device, uses virtqueues in shared host‑guest memory.
+- **virtio‑net**: network device, can be backed by a TAP, bridge, or vhost‑net (kernel‑accelerated).
+- **virtio‑console**: serial‑like console for logs.
+- **virtio‑rng**: entropy source.
+
+The virtio driver in the guest negotiates feature bits via the virtio configuration space; the host (QEMU or vhost‑net) processes packets directly, avoiding extra copies.
+
+### CPU Scheduling & NUMA Awareness
+Each VCPU is a regular Linux task (visible via `ps -L`). The CFS scheduler treats VCPUs like any other thread, but latency‑sensitive workloads benefit from:
+
+- **CPU pinning**: `virsh vcpupin <domain> <vcpu> <cpulist>`.
+- **NUMA placement**: `virsh numatune <domain> --mode strict --nodeset 0` ensures guest memory is allocated from a specific NUMA node, reducing remote‑node latency.
+- **Thread‑level isolation**: allocating a dedicated `vhost-worker` thread per virtio device via `vhost-net`.
+
+### Security Boundaries
+- The VM fd and VCPU fds are ordinary file descriptors; their permissions are governed by the process that opened `/dev/kvm`. Typically only root (or users in the `kvm` group) can open it.
+- Device assignment via **VFIO** (`vfio-pci`) passes a PCI device directly to the guest, bypassing QEMU emulation. The IOMMU must isolate the device’s DMA to the guest’s memory, preventing hostile DMA from affecting the host.
+
+---
+
+## Worked Examples
+### Example 1: Creating a VM with `virt-install` (step‑by‑step)
+Goal: provision an Ubuntu 22.04 VM with 2 GiB RAM, 2 vCPUs, 20 GiB qcow2 disk, virtio‑net bridged to `virbr0`, and cloud‑init user‑data.
+
+```bash
+# 1. Verify host supports KVM
+grep -E '(vmx|svm)' /proc/cpuinfo   # should show vmx or svm
+lsmod | grep kvm                    # kvm_intel or kvm_amd loaded
+
+# 2. Create a cloud‑init ISO (optional)
+cat > user-data <<'EOF'
+#cloud-config
+hostname: kvm-demo
+users:
+  - name: ubuntu
+    sudo: ALL=(ALL) NOPASSWD:ALL
+    groups: users, admin
+    shell: /bin/bash
+    lock_passwd: false
+    ssh_authorized_keys:
+      - ssh-rsa AAAAB3... user@example.com
+EOF
+cloud-localds seed.iso user-data meta-data   # meta-data can be empty
+
+# 3. Install the VM
+virt-install \
+  --name ubuntu-demo \
+  --ram 2048 \
+  --vcpus 2 \
+  --cpu host \
+  --disk size=20,format=qcow2 \
+  --cdrom /var/lib/libvirt/boot/ubuntu-22.04-live-server-amd64.iso \
+  --disk seed.iso,device=cdrom \
+  --network bridge=virbr0,model=virtio \
+  --os-variant ubuntu22.04 \
+  --graphics none \
+  --console pty,target_type=serial \
+  --noautoconsole
+```
+**Why each flag?**
+
+| Flag | Reason |
+|------|--------|
+| `--cpu host` | Exposes the host’s exact CPU feature set (including VT‑x/AMD‑V, AES‑NI, etc.) so the guest can use them. |
+| `--disk size=20,format=qcow2` | qcow2 supports snapshots and compression; the size is the *virtual* size, actual allocation grows on demand. |
+| `--network bridge=virbr0,model=virtio` | Uses the libvirt‑managed bridge; virtio gives near‑native throughput (~10 Gbps on a 10 GbE host). |
+| `--graphics none --console pty,target_type=serial` | Disables graphical console (saves GPU memory) and uses a serial console accessible via `virsh console`. |
+| `--os-variant ubuntu22.04` | Libvirt picks optimal machine type (`pc-q35-6.2`) and enables hypervisor features (e.g., `apic`, `hyperv`). |
+
+After installation, verify:
+```bash
+virsh list --all
+# Output shows ubuntu-demo in "shut off" state
+virsh start ubuntu-demo
+virsh console ubuntu-demo   # press Enter to get login prompt
+```
+
+### Example 2: Adjusting VM Memory at Runtime
+```bash
+# Current memory
+virsh domifstat ubuntu-demo | grep 'memory'   # or use dommemstat
+# Set to 4 GiB (must be ≤ max memory defined in XML)
+virsh setmem ubuntu-demo 4096 --config   # --config persists across reboots
+# If you need to change max memory, edit XML:
+virsh edit ubuntu-demo
+# <memory unit='MiB'>4096</memory>
+# <currentMemory unit='MiB'>4096</currentMemory>
+```
+**Why `--config`?** Without it, the change is transient and will be lost after a shutdown; `--config` updates the persistent XML so the next boot uses the new size.
+
+### Example 3: Pinning VCPUs to Specific Host CPUs
+```bash
+# Show current VCPU placement
+virsh vcpuinfo ubuntu-demo
+# Pin VCPU0 to host CPU2, VCPU1 to CPU3
+virsh vcpupin ubuntu-demo 0 2
+virsh vcpupin ubuntu-demo 1 3
+```
+**Why pinning?** Prevents the host scheduler from migrating VCPUs away from cores that share LLC (last‑level cache) with the guest’s working set, reducing cache‑miss latency especially for memory‑intensive workloads.
+
+### Example 4: Using VFIO to Assign a Physical NIC
+Assume the host has an Ethernet controller at `0000:03:00.0` (Intel X710).
+```bash
+# 1. Bind the device to vfio-pci (requires IOMMU enabled in kernel)
+echo 'vfio-pci' | sudo tee /sys/bus/pci/devices/0000:03:00.0/driver/override
+echo '0000:03:00.0' | sudo tee /sys/bus/pci/devices/0000:03:00.0/driver/unbind
+echo '0000:03:00.0' | sudo tee /sys/bus/pci/drivers/vfio-pci/bind
+
+# 2. Add to VM XML (via edit)
+virsh edit ubuntu-demo
+```
+Inside the `<devices>` section add:
+```xml
+<hostdev mode='subsystem' type='pci' managed='yes'>
+  <source>
+    <address domain='0x0' bus='0x03' slot='0x00' function='0x0'/>
+  </source>
+  <address type='pci' domain='0x0' bus='0x0' slot='0x05' function='0x0'/>
+</hostdev>
+```
+**Why managed='yes'?** Libvirt will detach the device from the host driver before assigning it to the guest and re‑attach it on VM shutdown, keeping the host usable.
+
+---
+
+## Common Mistakes
+### 1. Forgetting to Enable CPU Virtualization in BIOS/UEFI
+- **What’s wrong:** `kvm_intel` (or `kvm_amd`) loads but `dmesg` shows `VMX: disabled by BIOS`.
+- **Why it matters:** Without VT‑x/AMD‑V the kernel falls back to **software emulation** (TCG), which is **10‑100× slower**. The symptom is high CPU usage in `qemu-system-x86_64` processes and `VM exits` dominated by `KVM_EXIT_IO` for simple MMIO.
+- **How to avoid:** In BIOS, enable “Intel Virtualization Technology” (VT‑x) or “AMD Virtualization” (SVM). Verify after boot with `dmesg | grep -i vmx` or `grep -E 'vmx|svm' /proc/cpuinfo`.
+
+### 2. Launching QEMU Without `-enable-kvm`
+- **What’s wrong:** Running `qemu-system-x86_64 -hda disk.img` works but the VM crawls.
+- **Why it matters:** The absence of `-enable-kvm` tells QEMU to use its **TCG** interpreter. No KVM ioctls are used; all privileged instructions are translated in software, causing frequent `vm_exit` equivalents in TCG and massive overhead.
+- **How to avoid:** Always add `-enable-kvm` when you intend to use hardware acceleration, or rely on libvirt/virt-install which injects it automatically.
+
+### 3. Overcommitting Host Memory Without Swapping Considerations
+- **What’s wrong:** Creating several VMs whose *configured* RAM exceeds host RAM, assuming the hypervisor will reclaim unused memory via ballooning.
+- **Why it matters:** If guests actually use their allocated memory (e.g., in‑memory databases), the host will start swapping. Swapping introduces **millisecond‑scale latency** and can stall I/O, defeating the purpose of virtualization.
+- **How to avoid:** Use `virsh dommemstat` to monitor actual usage, enable **memory ballooning** (`<memballoon model='virtio'/>`) only when you have a balloon driver in the guest, and enforce a hard limit via `maxMemory` in the domain XML. Consider **transparent huge pages** (THP) only after testing, as they can cause uneven latency.
+
+### 4. Misconfiguring VirtIO Queue Size Leading to Dropped Packets
+- **What’s wrong:** Setting `<driver queues='4'/>` on a virtio‑net while the guest driver only allocates 1 queue.
+- **Why it matters:** Virtio uses *virtqueues*; a mismatch causes the host to place descriptors in queues the guest never consumes, leading to **tx/rx ring overflow** and packet loss.
+- **How to avoid:** Ensure the guest’s driver parameters match the host: e.g., in Linux guest, `ethtool -L eth0 combined 4` to set 4 queues, or use `multiqueue=on` in the XML and verify with `virsh dumpxml` and `ethtool`.
+
+### 5. Ignoring NUMA Placement When Assigning Large Memory
+- **What’s wrong:** A VM with 64 GiB RAM on a dual‑socket host gets all its memory allocated from node 0, leaving node 1 idle.
+- **Why it matters:** Remote‑node memory accesses incur ~ 60‑120 ns extra latency (vs ~ 80 ns local) and reduce memory bandwidth, hurting performance of NUMA‑aware workloads (e.g., in‑memory analytics).
+- **How to avoid:** Use `virsh numatune <domain> --mode strict --nodeset 0,1` or `virsh setmem <domain> --current --config` with `<numatune>` in XML to bind memory to specific nodes, and optionally bind VCPUs with `vcpupin`.
+
+---
+
+## Exercises
+### Easy
+1. **Check KVM readiness** – Run `kvm-ok` (from `cpu-checker` package) and verify it reports `KVM acceleration can be used`.
+2. **Create a minimal VM** – `virt-install --name test --ram 512 --vcpus 1 --disk size=5,format=qcow2 --cdrom /path/to/ubuntu.iso --noautoconsole --graphics none --console pty,target_type=serial`. Start it, log in via `virsh console test`, and run `uname -a`.
+3. **Inspect VCPU threads** – After starting the VM, run `ps -Lf -C qemu-system-x86_64` and note the LWP IDs; correlate with `virsh vcpuinfo test`.
+
+### Medium
+1. **Enable nested virtualization** – On an Intel host, add `options kvm_intel nested=1` to `/etc/modprobe.d/kvm.conf`, reload the module, then create a VM that itself runs KVM (`virt-install --cpu host --features nested=1`). Verify inside the guest with `kvm-ok`.
+2. **Configure a virtio‑scsi disk with write‑back cache** –  
+   ```bash
+   virt-install --name scsi-test \
+     --ram 1024 --vcpus 1 \
+     --disk size=10,format=qcow2,cache=writeback,io=native,bus=scsi \
+     --cdrom /path/to/ubuntu.iso \
+     --graphics none --console pty,target_type=serial
+   ```
+   Inside the guest, install `scsi-debug` and run `hdparm -tT /dev/sda` to measure throughput; compare with default `cache=none`.
+3. **Set up a vhost‑net accelerated virtual network** –  
+   ```bash
+   # Ensure vhost-net module is

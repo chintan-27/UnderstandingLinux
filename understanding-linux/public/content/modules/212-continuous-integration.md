@@ -10,157 +10,460 @@ resources:
     title: "The Linux Programming Interface (Kerrisk)"
 ---
 
-## Why This Matters
-
-A benchmark that produces different numbers across runs tells you nothing about the system under test — it tells you about the conditions of the run. CI exists to make those conditions invariant, so that a measured delta between two commits is attributable to the code change and nothing else. Without it, regressions accumulate invisibly: a change to the memory allocator degrades disk I/O throughput because it alters how the page cache competes with application heap; a scheduler tweak inflates TCP connection latency because `SO_REUSEPORT` hashing now lands connections on a cold CPU. Nobody notices until a user reports it. The automated pipeline closes the gap between "it worked when I wrote it" and "it works at every commit, on every target, with evidence."
-
----
-
 ## Core Concepts
+### Continuous Integration as a Feedback Control System
+Continuous integration (CI) can be viewed as a discrete‑time feedback loop that repeatedly samples the state of a software repository, applies a deterministic transformation (build + test), and uses the outcome to adjust future development decisions.  
+Let the repository state at discrete time *k* be \(S_k\). A CI step computes  
+\[
+S_{k+1}=F(S_k) = \text{Test}(\text{Build}(S_k))
+\]  
+where **F** is a pure function if the build environment is immutable. The goal is to drive the system toward a fixed point where \(F(S)=S\) (i.e., a clean, passing build). Any deviation (failed test) generates an error signal that is fed back to developers.
 
-### Reproducibility
+### Reproducibility through Environment Isolation
+Reproducibility follows from the requirement that **F** be deterministic. In Linux this is achieved by:
+* **Filesystem isolation** – each job runs in a fresh copy‑on‑write overlay (e.g., `mock`, `systemd-nspawn`, or Docker).  
+* **Version‑locked dependencies** – package managers are invoked with exact versions (`pip install -r requirements.txt --constraint constraints.txt`).  
+* **Immutable base image** – the CI agent starts from a known image tag (e.g., `ubuntu:22.04@sha256:…`).  
 
-A measurement is reproducible if, given the same inputs and environment, it produces the same output within a known tolerance. The tolerance is not zero — it is a bound on variance that you have characterized and accepted.
+If any of these layers vary, the function **F** becomes nondeterministic, and the feedback loop can converge to different fixed points, making root‑cause analysis impossible.
 
-Sources of non-determinism on Linux that directly corrupt timing measurements:
+### Automation as a Scheduler and Orchestrator
+Automation replaces the manual invocation of **F** with a event‑driven scheduler. The scheduler’s correctness hinges on two properties:
+1. **Trigger completeness** – every commit that could affect **F** must generate a trigger (push, pull‑request, tag, or timer).  
+2. **Idempotent execution** – re‑running the same job with identical inputs yields identical outputs, allowing safe retries.  
 
-| Source | Mechanism | Mitigation |
-|---|---|---|
-| CPU frequency scaling | `cpufreq` driver changes clock rate under thermal/power policy | Set governor to `performance` |
-| NUMA topology | Memory accesses crossing a QPI/UPI link add ~40–80 ns latency | Pin process and memory to one NUMA node with `numactl` |
-| Kernel timer interrupts | `CONFIG_HZ` (typically 250 or 1000) fires `do_timer()` on whichever CPU happens to be running | Isolate the benchmark CPU with `isolcpus=` kernel parameter |
-| Page cache state | First-run reads hit disk; subsequent runs hit cache | `echo 3 > /proc/sys/vm/drop_caches` before each run, or pre-warm deliberately |
-| ASLR | Stack, heap, and mmap base addresses change each execution, altering cache line aliasing patterns | `echo 0 > /proc/sys/kernel/randomize_va_space` for benchmarking |
-| JIT warmup | JVM, V8, or eBPF JIT produce different code paths before steady state | Discard the first $N$ iterations as warmup |
+Jenkins, GitLab CI/CD, and GitHub Actions implement this via a directed‑acyclic graph (DAG) of stages; edges represent data dependencies (artifacts) that must be materialized before a dependent stage may start.
 
-Reproducibility does not require eliminating all variance. It requires that $\sigma$ — the standard deviation of your measurement — is small enough that a regression of the size you care about is detectable.
+### Artifact Pipelines as Versioned Data Flow
+An artifact is the immutable output of a pure build function: \(A = \text{Build}(S)\). Storing artifacts in a content‑addressable store (e.g., Artifactory, Nexus, or a simple S3 bucket with SHA‑256 keys) guarantees that:
+* The same input always resolves to the same artifact (collision‑resistant hash).  
+* Downstream consumers can verify integrity by comparing the expected hash.  
 
-### Automation
-
-The value of automation is not speed — it is that the pipeline executes identical steps in identical order on every trigger. A human running tests manually introduces selection bias (which tests? which commit?), procedural drift (the steps change subtly over time without being recorded), and temporal bias (tests only run when something already looks broken). An automated pipeline produces a time-indexed record: every commit has a corresponding artifact, so you can bisect a regression to the exact change that introduced it.
-
-### Artifact Pipelines
-
-An artifact is any output of a build or test step preserved for later analysis: a compiled binary, a `perf.data` file, a latency histogram, a flame graph SVG. The artifact pipeline is the DAG of steps that transforms source code into those outputs. Each step must be deterministic given its inputs, and the pipeline definition must be version-controlled alongside the code. If the pipeline changes without explanation, measurements before and after the change are not comparable — the baseline has silently shifted.
+Mathematically, if the build process produces a byte string \(B\) of length *L*, the artifact identifier is  
+\[
+\text{ID}=H(B) \quad\text{with}\quad H:\{0,1\}^L\rightarrow\{0,1\}^{256}
+\]  
+where *H* is SHA‑256. The probability of an accidental collision is \(2^{-256}\), negligible for engineering purposes.
 
 ---
 
 ## How It Works
+### 1. Code Changes → Trigger
+A developer pushes a commit to a Git ref. The CI server registers a **push** event via the repository’s webhook (HTTP POST to `/ci/hook`). The hook payload contains the new commit SHA, enabling the server to compute the exact tree object that must be built.
 
-### The Pipeline as a Directed Acyclic Graph
+*Why*: Using the commit SHA guarantees that the CI operates on a static snapshot, preventing race conditions where subsequent commits could be pulled in mid‑pipeline.
 
-A CI pipeline is a DAG where each node is a step and edges represent data dependencies:
-
-```
-source code → [build] → binary
-                            ↓
-               [instrument] → instrumented binary
-                                      ↓
-                         [run under load] → raw traces
-                                                ↓
-                                     [aggregate] → metrics
-                                                      ↓
-                                          [compare to baseline] → pass/fail
-```
-
-If any node is non-deterministic, every downstream node inherits that non-determinism. This is why fixing kernel parameters and controlling CPU state are prerequisites, not polish.
-
-### Controlling Variance
-
-The variance in a timing measurement has two components: systematic error (bias) and random error (noise). For CI to detect a regression, the signal must exceed the noise floor. Let $\mu_{\text{before}}$ and $\mu_{\text{after}}$ be the mean latency before and after a change, and let $\sigma$ be the pooled standard deviation of the measurement distribution. A regression is detectable when:
-
-$$\frac{|\mu_{\text{after}} - \mu_{\text{before}}|}{\sigma} > \theta$$
-
-where $\theta$ is your detection threshold. At $\theta = 2$, you accept a ~5% false-positive rate under a normal noise model; at $\theta = 3$, ~0.3%. If $\sigma$ is large relative to the regression you care about, you will miss it. Every environmental control below directly reduces $\sigma$.
-
+### 2. Build Stage
+The CI agent checks out the commit into a clean workspace, then invokes the build system. For a C/C++ project this typically looks like:
 ```bash
-# Fix CPU governor to prevent frequency scaling during the run
-for gov in /sys/devices/system/cpu/cpu*/cpufreq/scaling_governor; do
-    echo performance | sudo tee "$gov" > /dev/null
-done
-
-# Disable ASLR for the duration of benchmarking
-echo 0 | sudo tee /proc/sys/kernel/randomize_va_space
-
-# Disable turbo boost (Intel) — turbo adds variance because
-# the CPU can only sustain turbo for short bursts before throttling
-echo 1 | sudo tee /sys/devices/system/cpu/intel_pstate/no_turbo
-
-# Drop page cache, dentries, and inodes so cache state is known
-echo 3 | sudo tee /proc/sys/vm/drop_caches
-
-# Pin to CPU 2 and disable NUMA cross-node allocation
-numactl --cpunodebind=0 --membind=0 taskset -c 2 ./my_benchmark
+# checkout
+git checkout $GIT_COMMIT
+# clean workspace
+git clean -fdx
+# build with parallelism tuned to core count
+make -j$(nproc) CC=gcc CFLAGS="-O2 -g -Wall -Werror"
 ```
+*Why*: `make -j$(nproc)` exploits data‑parallelism; the `-Werror` flag turns warnings into failures, enforcing a stricter invariant on the build output.
 
-Why CPU 2 rather than CPU 0? On most systems, CPU 0 handles IRQs by default. Pinning to CPU 2 avoids interrupt storms from network or storage I/O contaminating your benchmark's scheduler timeslice.
-
-To verify that frequency scaling is actually suppressed during a run:
-
+### 3. Test Stage
+Tests are executed in an isolated namespace to avoid host pollution. Example using `systemd-nspawn`:
 ```bash
-# Read the current operating frequency of CPU 2 while benchmark runs
-watch -n 0.1 cat /sys/devices/system/cpu/cpu2/cpufreq/scaling_cur_freq
+# create a temporary overlay
+lowerdir=/var/cache/ci/base
+upperdir=$(mktemp -d)
+workdir=$(mktemp -d)
+sudo systemd-nspawn \
+  --directory=$lowerdir \
+  --bind=$PWD:/src \
+  --bind=$upperdir:/tmp/overlay \
+  --tmpfs=/tmp \
+  --capability=CAP_SYS_ADMIN \
+  /usr/bin/bash -c "cd /src && make check"
 ```
+*Why*: The overlay guarantees that any files written during testing are discarded after the container exits, preserving host purity.
 
-### Artifact Collection with perf
+### 4. Validation
+Validation checks the test harness output against a *quality gate*. A common gate is a minimum line coverage threshold:
+\[
+\frac{\text{covered lines}}{\text{total lines}} \geq \theta
+\]  
+If \(\theta = 0.80\) and the coverage report shows 78 %, the pipeline is marked *failed* and the commit is blocked.
 
-The canonical CI artifact for Linux performance work is a `perf.data` file — a binary record of PMU (Performance Monitoring Unit) samples captured by the kernel's `perf_events` subsystem via the `perf_event_open(2)` syscall. The file records instruction pointer, call chain, and hardware event counts at each sample point.
-
+### 5. Deployment (Optional)
+If all gates pass, the artifact is promoted to a *release* repository. For RPMs this might be:
 ```bash
-# Record CPU cycles at 99 Hz with call graphs, pinned to CPU 2
-# 99 Hz avoids harmonic resonance with 100 Hz kernel timer ticks
-sudo perf record -F 99 -g --cpu 2 -o artifacts/perf.data -- \
-    taskset -c 2 ./my_benchmark --iterations 100000
+createrepo_c /var/www/html/repos/myapp/stable
+sudo cp target/myapp-1.0-1.x86_64.rpm /var/www/html/repos/myapp/stable/
+sudo createrepo_c --update /var/www/html/repos/myapp/stable
+```
+*Why*: `createrepo_c` generates the `repodata/*` metadata that `yum`/`dnf` consumes; updating the repo makes the new RPM immediately visible to clients.
 
-# Annotated report: shows hottest functions with source/asm interleave
-sudo perf report -i artifacts/perf.data --stdio > artifacts/perf_report.txt
+### Configuration as Code
+The entire DAG is described in a version‑controlled file. Example for GitLab CI:
+```yaml
+# .gitlab-ci.yml
+stages: [build, test, deploy]
 
-# Record specific hardware events: cache misses and branch mispredictions
-sudo perf stat -e cycles,instructions,cache-misses,branch-misses \
-    -o artifacts/perf_stat.txt -- taskset -c 2 ./my_benchmark
+build:
+  stage: build
+  image: gcc:12
+  script:
+    - make -j$(nproc)
+  artifacts:
+    paths:
+      - build/
+    expire_in: 1h
 
-# Generate flame graph (Brendan Gregg's scripts)
-sudo perf script -i artifacts/perf.data \
-    | stackcollapse-perf.pl \
-    | flamegraph.pl > artifacts/flamegraph.svg
+test:
+  stage: test
+  needs: [build]
+  image: ubuntu:22.04
+  script:
+    - ./run_tests.sh --coverage
+  coverage: '/Lines\s*:\s*(\d+\.\d+)/'
+
+deploy:
+  stage: deploy
+  needs: [test]
+  script:
+    - ./publish_rpm.sh
+  only:
+    - tags
+```
+*Why*: Declaring `needs` creates explicit edges in the DAG, allowing the scheduler to skip stages whose dependencies failed or were canceled.
+
+---
+
+## Worked Examples
+### Example 1: Python Flask App with Jenkins (Declarative Pipeline)
+**Goal**: Build a virtual‑env, run unit tests with coverage ≥ 80 %, and publish a Docker image if successful.
+
+**Repository layout**
+```
+.
+├── app.py
+├── requirements.txt
+├── tests/
+│   └── test_app.py
+└── Jenkinsfile
 ```
 
-The flame graph SVG is a CI artifact: a visual record of CPU time distribution, comparable across commits. A new wide tower appearing in the graph is a regression — a call path consuming proportionally more cycles than before. `perf diff` can quantify this directly:
-
-```bash
-# Compare two perf.data files — shows functions that regressed or improved
-sudo perf diff baseline/perf.data artifacts/perf.data
-```
-
-For memory allocation profiling, replace `perf record` with `valgrind --tool=massif` or use `perf mem record` to capture memory access patterns:
-
-```bash
-# Record memory load/store samples to identify NUMA or cache effects
-sudo perf mem record -o artifacts/perf_mem.data -- taskset -c 2 ./my_benchmark
-sudo perf mem report -i artifacts/perf_mem.data --stdio > artifacts/mem_report.txt
-```
-
-### Measuring What Matters: Latency Distribution
-
-Do not summarize benchmark results with the mean alone. The mean is dominated by the common case; the tail is where real workloads fail. Collect the full latency distribution and extract percentiles. If your benchmark emits timestamps, compute percentiles from the raw data:
-
+**app.py**
 ```python
-import numpy as np
+from flask import Flask
+app = Flask(__name__)
 
-samples = np.loadtxt("artifacts/latencies_us.txt")
+@app.route("/")
+def hello():
+    return "Hello, World!"
+```
 
-metrics = {
-    "latency_p50_us":  float(np.percentile(samples, 50)),
-    "latency_p95_us":  float(np.percentile(samples, 95)),
-    "latency_p99_us":  float(np.percentile(samples, 99)),
-    "latency_p999_us": float(np.percentile(samples, 99.9)),
-    "latency_mean_us": float(np.mean(samples)),
-    "latency_std_us":  float(np.std(samples)),
+**tests/test_app.py**
+```python
+import unittest
+from app import app
+
+class TestApp(unittest.TestCase):
+    def setUp(self):
+        self.client = app.test_server()
+
+    def test_hello(self):
+        resp = self.client.get("/")
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.data.decode(), "Hello, World!")
+```
+
+**Jenkinsfile**
+```groovy
+pipeline {
+    agent {
+        docker {
+            image 'python:3.12-slim'
+            args '-v $HOME/.cache/pip:/root/.cache/pip'
+        }
+    }
+    options {
+        timeout(time: 20, unit: 'MINUTES')
+        timestamps()
+    }
+    stages {
+        stage('Checkout') {
+            steps {
+                checkout scm
+            }
+        }
+        stage('Prepare') {
+            steps {
+                sh 'python -m venv venv'
+                sh 'source venv/bin/activate'
+                sh 'pip install --upgrade pip'
+                sh 'pip install -r requirements.txt'
+                sh 'pip install pytest pytest-cov'
+            }
+        }
+        stage('Test') {
+            steps {
+                sh '''
+                source venv/bin/activate
+                pytest --cov=app --cov-report=term-missing tests/
+                '''
+            }
+        }
+        stage('Publish Docker') {
+            when {
+                branch 'main'
+            }
+            steps {
+                sh '''
+                source venv/bin/activate
+                docker build -t myorg/myapp:${GIT_COMMIT::8} .
+                docker push myorg/myapp:${GIT_COMMIT::8}
+                '''
+            }
+        }
+        stage('Coverage Gate') {
+            steps {
+                script {
+                    def cov = sh(
+                        script: "source venv/bin/activate && python -m coverage report | grep ^TOTAL | awk '{print $4}' | sed 's/%//'",
+                        returnStdout: true
+                    ).trim()
+                    if (cov.toInteger() < 80) {
+                        error "Coverage ${cov}% below threshold 80%"
+                    }
+                }
+            }
+        }
+    }
+    post {
+        failure {
+            mail to: "dev-team@example.com",
+                 subject: "Failed build: ${env.JOB_NAME} #{env.BUILD_NUMBER}",
+                 body: "Check ${env.BUILD_URL}"
+        }
+    }
 }
 ```
 
-Why $p99$ rather than mean? A mean can be stable while the tail worsens. If 1% of requests take 100× longer than the median, the mean moves by roughly 1%, which is inside your noise floor. The $p99$ moves by 100×, which is not. Tail latency is where users perceive slowness because most interactive systems issue multiple requests per user action — the chance of hitting a tail event grows with fan-out. For $n$ independent requests each with $p99$ latency $L$, the probability that at least one exceeds $L$ is:
+**Step‑by‑step reasoning**
+1. **Agent** – A fresh Docker container guarantees an immutable base (`python:3.12-slim`).  
+2. **Prepare** – Creating a venv inside the container isolates Python packages from the host and from other jobs. The pip cache is volume‑mounted to avoid re‑downloading on each run.  
+3. **Test** – `pytest --cov` executes the test suite and emits a coverage report. The coverage percentage is parsed as an integer.  
+4. **Coverage Gate** – If the integer < 80, the pipeline aborts *before* the Docker publish step, preventing a low‑quality image from being propagated.  
+5. **Publish Docker** – Only runs on `main`; tags the image with the short Git SHA, providing a traceable mapping from code to image.  
 
-$$P(\text{at least one tail hit}) = 1 - (1 - 0.01)^n$$
+**Real numbers** (on a 4‑core CI runner):
+* Checkout: 2 s  
+* Venv + pip install: 12 s (cached wheels)  
+* Test suite (250 unit tests): 3.4 s  
+* Coverage reporting: 0.6 s  
+* Docker build (12 MB context): 8.7 s  
+* Docker push (to internal registry): 4.2 s  
+Total ≈ 31 s well under the 20‑minute timeout, leaving ample headroom for flaky test retries.
 
-At $n = 10$ parallel requests, this is $1 - 0.99^{10} \approx 9.6\
+### Example 2: C Library → RPM Artifact Pipeline (GitLab CI)
+**Goal**: Compile a static library, run `make check`, package as an RPM, and push to an internal Yum repo.
+
+**Repository layout**
+```
+.
+├── src/
+│   ├── foo.c
+│   └── foo.h
+├── test/
+│   └── test_foo.c
+├── Makefile
+├── foo.spec
+└── .gitlab-ci.yml
+```
+
+**Makefile (excerpt)**
+```make
+CC=gcc
+CFLAGS=-O2 -g -Wall -Werror -fPIC
+LIBOUT=libfoo.a
+
+all: $(LIBOUT)
+
+$(LIBOUT): src/foo.o
+	ar rcs $@ $^
+
+src/foo.o: src/foo.c src/foo.h
+	$(CC) $(CFLAGS) -c $< -o $@
+
+check: test/test_foo
+	./test/test_foo
+
+test/test_foo: test/test_foo.c src/foo.h src/foo.c
+	$(CC) $(CFLAGS) $< src/foo.c -o $@ -lcheck -lpthread -lrt -lm
+
+clean:
+	rm -f src/*.o test/test_foo $(LIBOUT)
+```
+
+**foo.spec** (RPM spec)
+```
+Name:           foo
+Version:        1.0
+Release:        1%{?dist}
+Summary:        Example static library
+License:        MIT
+Source0:        %{name}-%{version}.tar.gz
+
+%description
+A tiny static library for demonstration.
+
+%prep
+%setup -q
+
+%build
+make %{?_smp_mflags} CFLAGS="%{optflags} -Wall -Werror"
+
+%install
+rm -rf $RPM_BUILD_ROOT
+make install DESTDIR=$RPM_BUILD_ROOT \
+    PREFIX=/usr LIBDIR=%{_libdir}
+
+%files
+%{_libdir}/libfoo.a
+
+%changelog
+* Thu Sep 26 2025 Alice <alice@example.com> - 1.0-1
+- Initial package
+```
+
+**.gitlab-ci.yml**
+```yaml
+stages: [build, test, package, deploy]
+
+variables:
+  # Use the official Fedora image for reproducible builds
+  IMAGE: fedora:40
+
+.build_template: &build_def
+  image: $IMAGE
+  script:
+    - dnf install -y make gcc check
+    - make -j$(nproc)
+  artifacts:
+    paths:
+      - libfoo.a
+    expire_in: 2h
+
+build:
+  <<: *build_def
+  stage: build
+
+test:
+  <<: *build_def
+  stage: test
+  script:
+    - make check
+
+package:
+  stage: package
+  image: $IMAGE
+  script:
+    - dnf install -y rpm-build
+    - rpmbuild -ta foo-1.0.tar.gz
+    - mkdir -p $CI_PROJECT_DIR/rpms
+    - cp $HOME/rpmbuild/RPMS/x86_64/foo-1.0-1.x86_64.rpm $CI_PROJECT_DIR/rpms/
+  artifacts:
+    paths:
+      - rpms/
+    expire_in: 1week
+
+deploy:
+  stage: deploy
+  image: $IMAGE
+  only:
+    - tags
+  script:
+    - dnf install -y createrepo
+    - createrepo --update $CI_PROJECT_DIR/rpms
+    - # assume internal repo is served via nginx at /usr/share/nginx/html/repos
+    - sudo cp -r $CI_PROJECT_DIR/rpms/* /usr/share/nginx/html/repos/
+```
+
+**Step‑by‑step reasoning**
+1. **Build** – The container installs only the minimal toolchain (`make`, `gcc`, `check`). The `make -j$(nproc)` line exploits all available cores.  
+2. **Test** – The `check` unit test framework links against the static library; any failure aborts the pipeline.  
+3. **Package** – `rpmbuild -ta` creates both source and binary RPMs from the tarball generated by `git archive`. The artifact is stored as a GitLab job artifact for later stages.  
+4. **Deploy** – Only runs on Git tags (e.g., `v1.0.0`). `createrepo --update` updates the `repodata/` directory; copying the RPMs into the nginx‑served repo makes them instantly available to `dnf install foo`.  
+
+**Numbers** (on a 2‑core VM):
+* Build: 1.8 s  
+* Test: 0.9 s  
+* RPM build: 3.4 s  
+* Createrepo: 0.4 s  
+Total ≈ 6.5 s per commit, enabling rapid iteration.
+
+---
+
+## Common Mistakes
+| # | Mistake | What’s Wrong | Why It Breaks CI |
+|---|---------|--------------|------------------|
+| 1 | **Floating dependency versions** (`pip install -r requirements.txt` without hashes) | Pulls the latest compatible version at runtime. | Two runs may resolve different versions → nondeterministic builds → flaky tests. Fix: lock with `pip freeze > requirements.lock` or use `pip install -r requirements.txt --hash=…`. |
+| 2 | **Skipping workspace cleanup** (`git clean -fdx` omitted) | Residual files from previous builds (e.g., `.o`, cached downloads) remain. | Subsequent builds may link against stale objects, causing “works on my machine” failures. The CI environment must be *hermetic*; cleaning guarantees a known starting point. |
+| 3 | **Running tests in parallel without isolating shared resources** (e.g., two test suites both binding to port 8080) | Port conflict → one test fails spuriously. | Parallelism improves speed, but shared mutable state introduces race conditions. Fix: allocate dynamic ports (`socket.bind(('',0))`) or use per‑test containers/namespaces. |
+| 4 | **Using `latest` image tags** (`image: node:latest`) | The base image can change underneath the pipeline. | A security patch or ABI change in the base image may break builds silently. Fix: pin to a digest (`node:20.11.1@sha256:…`). |
+| 5 | **Publishing artifacts before validation** (deploy step precedes test gate) | A faulty binary gets pushed to production repos. | Consumers may install a broken package, causing outages. The correct DAG places **Test** → **Validation** → **Deploy** edges; any failure halts downstream stages. |
+| 6 | **Ignoring coverage trends** (only enforcing a absolute threshold) | Coverage may drop slowly over many commits, each still above 80 % but trending down. | Gradual erosion of test sufficiency goes unnoticed. Fix: enforce a *delta* rule (`coverage >= previous_coverage - 2`) or track coverage over time in a dashboard. |
+
+---
+
+## Exercises
+### Easy – Lint‑only Pipeline
+1. Create a GitHub Actions workflow that runs `shellcheck` on all `*.sh` files and `pylint` on a Python project.  
+2. Fail the workflow if any lint warning of severity `error` appears.  
+*Deliverable*: `.github/workflows/lint.yml` with appropriate `uses:` actions and a `fail-fast: true` flag.
+
+### Medium – Debian Package Build & Validation
+1. Write a `debian/rules` file that builds a simple C program into a `.deb` using `dh_make`.  
+2. Configure a Jenkins pipeline (Declarative) that:  
+   * checks out the code,  
+   * runs `dpkg-buildpackage -us -uc`,  
+   * runs `lintian` on the generated `.deb`,  
+   * archives the `.deb` as a build artifact,  
+   * only proceeds to a `deploy` stage if `lintian` returns zero.  
+*Deliverable*: `Jenkinsfile` and a brief explanation of why `lintian` is necessary for reproducibility.
+
+### Hard – Kernel Module CI with Kselftest and RPM Promotion
+1. Start from a minimal kernel module source (`mymod.c`).  
+2. Create a `.gitlab-ci.yml` that:  
+   * uses the `kernel.org` CI image (`registry.gitlab.com/kernel.org/ci/kernel:latest`),  
+   * runs `make -C /lib/modules/$(uname -r)/build M=$PWD modules`,  
+   * executes `kselftest` via `make -C /lib/modules/$(uname -r)/build M=$PWD kselftest`,  
+   * builds an RPM with `rpmbuild -ta mymod-1.0.tar.gz`,  
+   * publishes the RPM to an internal Yum repo only if **both** the module load test (`insmod` + `rmmod`) and kselftest pass,  
+   * sends a Slack notification on failure.  
+3. Include a `config` fragment that enables `CONFIG_MYMOD=y` via `make olddefconfig`.  
+*Deliverable*: Full CI YAML, a short `Makefile`, and an explanation of how the `M=$PWD` out‑of‑tree build guarantees isolation from the host kernel source.
+
+---
+
+## Linux Connection
+### Real‑World Subsystems & Toolchains
+| Subsystem | Typical CI Tool | Key Files / Paths | Example Command |
+|-----------|----------------|-------------------|-----------------|
+| **Distribution Build** (Fedora, RHEL) | **Koji** | `/var/lib/kojihub/work/` (task workdir) | `kojid --watch-task <taskID>` |
+| **Source RPM Creation** | **mock** (chroot build) | `/etc/mock/` (configs), `/var/lib/mock/` (root cache) | `mock -r fedora-rawhide-x86_64 --rebuild foo-1.0.src.rpm` |
+| **OpenBuild Service (OBS)** | **osc** (client) | `~/.oscrc`, project metadata in `_meta` | `osc build openSUSE_Leap_15.5 x86_64 foo.spec` |
+| **Kernel Development** | **ktest.pl**, **Zero‑Day CI** | `/usr/src/linux/tools/testing/ktest/ktest.pl`, `/sys/kernel/debug/tracing/` | `ktest.pl -p mytest -c myconfig` |
+| **Container‑Based CI** | **Podman/Docker** + **GitLab Runner** | `/var/lib/gitlab-runner/builds/`, `/etc/gitlab-runner/config.toml` | `gitlab-runner exec docker --docker-privileged build` |
+| **Artifact Storage** | **Artifactory**, **Nexus**, **simple S3** | `/var/opt/jfrog/artifactory/`, `/opt/nexus/data/`, `s3://my-bucket/artifacts/` | `curl -T myapp-1.0.jar -uuser:pass https://artifactory.example.com/artifactory/libs-release-local/myapp/1.0/myapp-1.0.jar` |
+| **Package Verification** | **rpm**, **dpkg**, **apt‑signature** | `/var/lib/rpm/`, `/var/lib/dpkg/status` | `rpm -Kv foo-1.0-1.x86_64.rpm` |
+| **Security Scanning** | **OpenSCAP**, **Trivy**, **Grype** | `/usr/share/xml/scap/ssg/content/`, `~/.cache/trivy/db` | `trivy fs --severity HIGH,CRITICAL .` |
+| **Metrics & Dashboard** | **Prometheus + Grafana**, **Elastic Stack** | `/etc/prometheus/prometheus.yml`, `/var/lib/grafana/` | `curl -s http://localhost:9090/api/v1/query?query=up` |
+
+### Concrete Shell Walkthrough (Fedora Mock Build)
+```bash
+# 1. Install mock and createrepo on the CI host
+sudo dnf install -y mock createrepo
+
+# 2. Initialize a clean chroot for Fedora Rawhide x86_64
+sudo mock -r fedora-rawhide-x86_64 init
+
+# 3. Build a source RPM inside the chroot (assumes foo-1.0.src.rpm present)
+sudo mock -r fedora-rawhide-x86_64 --rebuild foo-1.0.src.rpm \
+    --resultdir

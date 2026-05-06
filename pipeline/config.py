@@ -8,6 +8,7 @@ API_KEY      = os.environ["OPENAI_API_KEY"]
 BASE_URL     = os.environ.get("OPENAI_BASE_URL", "https://api.ai.it.ufl.edu")
 DRAFT_MODEL  = os.environ.get("DRAFT_MODEL",  "gpt-3.5-turbo")
 REFINE_MODEL = os.environ.get("REFINE_MODEL", "gpt-4o")
+EMBED_MODEL  = os.environ.get("EMBED_MODEL",  "text-embedding-3-small")
 
 # Paths
 BOOKS_DIR    = "books"       # put your PDFs here

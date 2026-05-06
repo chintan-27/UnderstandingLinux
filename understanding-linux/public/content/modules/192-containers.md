@@ -10,131 +10,325 @@ resources:
     title: "The Linux Programming Interface (Kerrisk)"
 ---
 
-## Why This Matters
+## Core Concepts
+### Introduction to Containers
+A container is a **process** (or group of processes) that runs in an isolated view of the system created by Linux kernel primitives. Unlike a virtual machine, which emulates hardware and runs a separate kernel, a container shares the host’s kernel and therefore incurs almost no CPU or memory overhead beyond the isolated processes themselves. The isolation and resource‑control mechanisms that make this possible are **namespaces** and **control groups (cgroups)**. A container image provides the filesystem; the runtime combines the image with a writable layer (usually via a union filesystem) to give the container a mutable root filesystem.
 
-When you run a process on Linux, it inherits the kernel's global view of the machine: every PID, every network interface, every mount point. This works for a single workload. It breaks when you need hundreds of workloads on the same hardware, each requiring isolation from the others, bounded resource consumption, and a reproducible filesystem. The solution is not a new kernel abstraction — the kernel has no `container` object, no `container_create()` syscall — but the composition of two existing subsystems: **namespaces** (controlling what a process can see) and **cgroups** (controlling what a process can consume). Every container runtime, from Docker to containerd to `systemd-nspawn`, is userspace glue that calls `clone(2)`, `unshare(2)`, `pivot_root(2)`, and writes to `/sys/fs/cgroup` in the right order.
+### Namespaces
+Namespaces wrap global system resources in a per‑namespace scope. When a process enters a namespace, subsequent system calls that refer to those resources are automatically translated to the namespace’s view. The kernel currently implements eight namespaces (the original seven plus **time**):
+
+| Namespace | Isolated resource | Key syscall flags |
+|-----------|-------------------|-------------------|
+| `mnt`     | Mount points      | `CLONE_NEWNS` |
+| `pid`     | Process IDs       | `CLONE_NEWPID` |
+| `net`     | Network devices, ports, routes | `CLONE_NEWNET` |
+| `ipc`     | System V IPC, POSIX mqueue | `CLONE_NEWIPC` |
+| `user`    | UID/GID mappings  | `CLONE_NEWUSER` |
+| `cgroup`  | cgroup version 2 view | `CLONE_NEWCGROUP` |
+| `uts`     | Hostname & domain name | `CLONE_NEWUTS` |
+| `time`    | Clock offsets (since 5.6) | `CLONE_NEWTIME` |
+
+A container runtime typically calls `clone(2)` (or `unshare(2)`) with the desired combination of `CLONE_NEW*` flags to create a new process that sees only its own namespace. For example, to start a shell in a fresh PID and mount namespace:
+
+```bash
+unshare --fork --pid --mount-proc /bin/bash
+```
+
+*Why this works*: The `fork` flag causes `unshare` to first fork, then the child calls `unshare(2)` to detach the specified namespaces before exec’ing the shell. The child therefore gets a PID namespace where its own PID is 1, and a mount namespace where it can mount a new root filesystem without affecting the host.
+
+### Cgroups (Control Groups)
+Cgroups hierarchically group processes and enforce limits on their resource consumption. Since kernel 4.5 the **unified hierarchy** (cgroup v2) is the default; it exposes a single tree under `/sys/fs/cgroup/` where each directory corresponds to a cgroup and contains control files such as:
+
+* `cpu.max` – maximum CPU bandwidth (quota/period)
+* `memory.max` – memory limit in bytes
+* `io.max` – I/O bandwidth limits
+* `pids.max` – maximum number of processes
+
+A cgroup is created simply by making a directory:
+
+```bash
+mkdir -p /sys/fs/cgroup/mycontainer
+echo "$$" > /sys/fs/cgroup/mycontainer/cgroup.procs   # attach current shell
+```
+
+*Why limits work*: The kernel scheduler checks `cpu.max` before allocating CPU time to tasks in the cgroup. If the quota for the current period is exhausted, the task is throttled until the next period. Memory accounting similarly charges each page to the cgroup; when `memory.max` is reached, further allocations trigger the OOM killer **inside** the cgroup, preventing the host from being starved.
+
+### Filesystem Layering
+Containers need a mutable root view while preserving the immutability of the underlying image for storage efficiency. The standard solution on Linux is a **union filesystem**; the most common implementation is **overlayfs**. Overlayfs combines several *lower* (read‑only) directories with a single *upper* (read‑write) directory and a *workdir* required for internal bookkeeping:
+
+```
+lowerdir  := read‑only image layers (e.g., base OS, installed packages)
+upperdir  := container‑specific writable layer
+workdir   := scratch space for overlayfs
+merged    := combined view presented to the container
+```
+
+The mount command looks like:
+
+```bash
+mount -t overlay overlay \
+  -o lowerdir=/var/lib/docker/overlay2/<id>/diff,upperdir=/var/lib/docker/overlay2/<id>/diff,workdir=/var/lib/docker/overlay2/<id>/work \
+  /var/lib/docker/overlay2/<id>/merged
+```
+
+*Why this is efficient*: Only files that are actually modified are copied up to `upperdir` (copy‑on‑write). Reads are served directly from the appropriate lower layer, so the container sees a complete filesystem without duplicating unchanged data. When the container stops, the `upperdir` can be discarded or committed as a new image layer.
 
 ---
 
-## Core Concepts
+## How It Works
+Creating a container involves four tightly coupled steps, each exposing a specific kernel interface.
 
-### Namespaces: Scoping the Kernel's Global Resources
+1. **Namespace creation** – The runtime calls `clone(2)` (or `unshare(2)`) with the desired `CLONE_NEW*` flags.  
+   Example (creating a isolated PID, mount, and UTS namespace and spawning a shell):
 
-The kernel maintains several resources as global singletons: the PID table, the network stack, the mount table, the hostname. A namespace wraps one such resource so that processes inside the namespace see a private instance, while the kernel maintains the real global state and translates between views.
+   ```c
+   #define _GNU_SOURCE
+   #include <sched.h>
+   #include <stdio.h>
+   #include <stdlib.h>
+   #include <unistd.h>
+   #include <sys/wait.h>
 
-Linux currently has seven namespace types:
+   static int child_func(void *arg) {
+       execv("/bin/bash", (char * const []){"/bin/bash", NULL});
+       perror("execv");
+       _exit(1);
+   }
 
-| Namespace | Flag | Isolates |
-|-----------|------|----------|
-| `mnt` | `CLONE_NEWNS` | Filesystem mount points |
-| `pid` | `CLONE_NEWPID` | Process ID number space |
-| `net` | `CLONE_NEWNET` | Network interfaces, routing tables, `iptables` rules |
-| `ipc` | `CLONE_NEWIPC` | System V IPC objects, POSIX message queues |
-| `uts` | `CLONE_NEWUTS` | Hostname and NIS domain name |
-| `user` | `CLONE_NEWUSER` | UID/GID mappings |
-| `cgroup` | `CLONE_NEWCGROUP` | cgroup root directory visibility |
+   int main(void) {
+       char *stack = malloc(65536) + 65536;   // grow downwards
+       pid_t pid = clone(child_func, stack,
+                         CLONE_NEWPID | CLONE_NEWNS | CLONE_NEWUTS |
+                         SIGCHLD, NULL);
+       if (pid == -1) { perror("clone"); exit(1); }
+       waitpid(pid, NULL, 0);
+       free(stack - 65536);
+       return 0;
+   }
+   ```
 
-Each namespace type maps to a kernel struct: `struct pid_namespace`, `struct mnt_namespace`, `struct net`, and so on. The process's `struct task_struct` points to a `struct nsproxy` that holds one pointer per namespace type:
+   *Why*: `clone` creates a child process that shares the parent’s memory (if not also using `CLONE_NEWVM`) but gets its own namespace instances. The child’s `execv` then runs the desired program inside those namespaces.
 
-```c
-// include/linux/nsproxy.h (simplified)
-struct nsproxy {
-    atomic_t count;
-    struct uts_namespace    *uts_ns;
-    struct ipc_namespace    *ipc_ns;
-    struct mnt_namespace    *mnt_ns;
-    struct pid_namespace    *pid_ns_for_children;
-    struct net              *net_ns;
-    struct cgroup_namespace *cgroup_ns;
-};
-```
+2. **Cgroup creation** – After the child is forked, the runtime adds it to a newly created cgroup directory and writes resource limits. With cgroup v2:
 
-When a process calls `getpid()`, the kernel calls `task_tgid_nr_ns(current, task_active_pid_ns(current))` — it looks up the PID *within the current `pid_namespace`*, not from the global table. The same thread of execution has a different PID value at each level of the PID namespace hierarchy simultaneously. A process at PID 1 inside a container might be PID 47382 on the host; both values are valid and consistent within their respective namespaces.
+   ```bash
+   # Assume $CGROUP_ROOT is /sys/fs/cgroup
+   CGROUP=$CGROUP_ROOT/mycontainer
+   mkdir -p $CGROUP
+   echo "$$" > $CGROUP/cgroup.procs                # attach the shell
 
-The `uts` namespace is especially useful for observability. Container runtimes call `sethostname(2)` inside a new `uts` namespace to set the container's name as its hostname. BPF programs running on the host can read `/proc/<pid>/uts` or call `bpf_get_current_task()` and dereference `task->nsproxy->uts_ns->name.nodename` to identify which container a traced process belongs to — without any container-runtime cooperation.
+   # Limit CPU to 25% (quota = period * 0.25)
+   echo 100000 > $CGROUP/cpu.max                 # period = 100ms (default)
+   echo 25000  > $CGROUP/cpu.max                 # quota = 25ms per period
 
-You can inspect which namespaces a process belongs to by examining the symlinks in `/proc/<pid>/ns/`:
+   # Limit memory to 200 MiB
+   echo $((200*1024*1024)) > $CGROUP/memory.max
+   ```
+
+   *Why*: The kernel’s scheduler and memory manager consult these files on every scheduling tick or page‑fault, enforcing the limits without extra overhead.
+
+3. **Filesystem setup** – The runtime prepares a root filesystem, usually via overlayfs, then calls `pivot_root(2)` (or `mount --make-rprivate` + `chdir`) to switch the container’s root view.
+
+   ```bash
+   # Prepare directories
+   LOWER=/var/lib/myimages/ubuntu/base
+   UPPER=/var/lib/mycontainers/container1/upper
+   WORK=/var/lib/mycontainers/container1/work
+   MERGED=/var/lib/mycontainers/container1/merged
+
+   mkdir -p $UPPER $WORK $MERGED
+   mount -t overlay overlay \
+     -o lowerdir=$LOWER,upperdir=$UPPER,workdir=$WORK \
+     $MERGED
+
+   # Switch root
+   cd $MERGED
+   pivot_root . .   # move old root to . (now inaccessible)
+   umount -l /      # lazy umount of the old root (now hidden)
+   exec chroot . /bin/bash
+   ```
+
+   *Why*: `pivot_root` atomically exchanges the mount namespace’s root filesystem with the new one, making the old root inaccessible (and eventually unmountable). This guarantees that all subsequent path resolution uses the layered filesystem.
+
+4. **Process execution** – Finally, the runtime `execve`s the target application (e.g., `/bin/bash`) inside the isolated namespaces, cgroup, and root filesystem. All subsequent syscalls (e.g., `open`, `bind`, `clone`) are automatically scoped to the container’s view.
+
+---
+
+## Worked Examples
+### Example 1: CPU and Memory Limits via cgroup v2
+**Goal**: Run a stress‑ng CPU worker limited to 20 % CPU and 150 MiB memory.
+
+**Step‑by‑step**:
+
+1. Create a cgroup:
+
+   ```bash
+   CGROUP=/sys/fs/cgroup/stressdemo
+   mkdir -p $CGROUP
+   ```
+
+2. Attach the shell (so that child processes inherit the cgroup):
+
+   ```bash
+   echo "$$" > $CGROUP/cgroup.procs
+   ```
+
+3. Compute CPU quota. The default period is 100 ms = 100 000 µs.  
+   Desired fraction = 0.20 → quota = period × fraction = 100 000 × 0.20 = 20 000 µs.
+
+   ```bash
+   echo 100000 > $CGROUP/cpu.max          # write period first (kernel expects "max" as "quota period")
+   echo 20000 > $CGROUP/cpu.max           # now quota (overwrites previous line)
+   ```
+
+   *Note*: Writing `cpu.max` with two numbers sets `<quota> <period>`. The order matters; the kernel reads the line as two integers.
+
+4. Set memory limit:
+
+   ```bash
+   echo $((150*1024*1024)) > $CGROUP/memory.max   # 150 MiB in bytes
+   ```
+
+5. Launch the workload (it will inherit the cgroup because we wrote the shell’s PID earlier):
+
+   ```bash
+   stress-ng --cpu 4 --timeout 30s
+   ```
+
+   *Observation*: `top` will show each stress-ng thread consuming roughly 5 % of a CPU (4 threads × 5 % = 20 %). The RSS reported by `ps` will stay near 150 MiB; if it tries to exceed, the OOM killer will terminate the stress-ng process inside the cgroup.
+
+### Example 2: Building a Minimal Container with overlayfs and pivot_root
+**Goal**: Start a shell that sees `/etc/hostname` as “container” while the host hostname remains unchanged.
+
+**Preparation** (host):
 
 ```bash
-# List all namespace identifiers for the current shell
-ls -la /proc/$$/ns/
+# 1. Gather a minimal rootfs (e.g., from Docker's ubuntu:22.04 tarball)
+mkdir -p /tmp/rootfs
+tar -xpf ubuntu-22.04-rootfs.tar.gz -C /tmp/rootfs
 
-# Compare namespaces of two processes; same inode = same namespace
-readlink /proc/$$/ns/pid
-readlink /proc/1/ns/pid
-```
+# 2. Create overlay directories
+LOWER=/tmp/rootfs
+UPPER=/tmp/container/upper
+WORK=/tmp/container/work
+MERGED=/tmp/container/merged
+mkdir -p $UPPER $WORK $MERGED
 
-### cgroups: Accounting and Enforcement
-
-Namespaces change what the kernel *returns* to a process (syscall return values, `/proc` contents, visible interfaces). cgroups change how the kernel *allocates* to a process: CPU time from the scheduler, memory pages from the allocator, I/O bandwidth from the block layer.
-
-A cgroup is a directory under `/sys/fs/cgroup` (cgroups v2, the unified hierarchy). Every process belongs to exactly one cgroup at each point in the hierarchy. You move a process into a cgroup by writing its PID to `cgroup.procs`; you set limits by writing to controller-specific interface files in that directory.
-
-**CPU bandwidth control** uses the CFS quota/period model. A cgroup is allocated a quota $Q$ microseconds of CPU time per period $P$ microseconds. Its effective CPU allocation in cores is:
-
-$$\text{CPU limit} = \frac{Q}{P}$$
-
-The CFS scheduler tracks runtime consumption per-cgroup. When a cgroup exhausts $Q$ within a period, all its tasks are throttled (moved off the run queue) until the period resets. This means a container configured for 0.5 cores can burst to 100% of one CPU for 50 ms, then be throttled for the remaining 50 ms of the period — it is not smoothly rate-limited, it is burst-then-stall.
-
-**Memory control** uses a hard limit `memory.max`. When a cgroup's resident set size reaches this limit, the kernel first tries to reclaim page cache within the cgroup. If that fails, it invokes the OOM killer, which selects a process within the cgroup to kill — not a random host process.
-
-The critical separation: cgroups do not affect what a process *sees*, only what it *gets*. A process inside a cgroup-limited container still reads host-global values from `/proc/meminfo` and `/proc/cpuinfo` unless the runtime also mounts a cgroup-aware `procfs` overlay. This is the source of the well-known JVM heap-sizing bug: older JVMs read `/proc/meminfo` to determine available memory, see the host's full RAM, and size their heap accordingly — immediately exceeding the container's `memory.max` and triggering OOM.
-
-```bash
-# Inspect the current shell's cgroup membership
-cat /proc/$$/cgroup
-
-# Inspect the cgroup hierarchy from the root
-ls /sys/fs/cgroup/
-
-# Read available controllers
-cat /sys/fs/cgroup/cgroup.controllers
-```
-
-### OverlayFS: Efficient Filesystem Layering
-
-A container needs a root filesystem that is consistent across starts, cheap to provision (no full copy), and writable per-instance. OverlayFS satisfies all three. It merges a stack of read-only `lowerdir` directories with a single read-write `upperdir` into a unified `merged` view.
-
-File lookup follows strict precedence from top to bottom: the `upperdir` is checked first, then each `lowerdir` from highest to lowest. The visible file at path $f$ is:
-
-$$\text{visible}(f) = \begin{cases} \text{upperdir}(f) & \text{if } f \in \text{upperdir} \\ \text{lowerdir}_n(f) & \text{if } f \in \text{lowerdir}_n, f \notin \text{lowerdir}_{n+1}, \ldots \\ \text{ENOENT} & \text{otherwise} \end{cases}$$
-
-Writes always go to `upperdir` via copy-on-write: before modifying a file that exists only in a lower layer, the kernel copies it up to `upperdir` first. Deletions are recorded as *whiteout* files — special device nodes with major/minor $(0, 0)$ — in `upperdir` that mask the lower-layer entry.
-
-Because lower layers are read-only and shared, every container using the same base image shares those pages in the page cache. If ten containers run from the same Ubuntu base layer, that layer's pages are mapped once in RAM.
-
-```bash
-# Manual OverlayFS mount demonstrating the layer stack
-mkdir -p /tmp/ol/{lower1,lower2,upper,work,merged}
-echo "from base"    > /tmp/ol/lower1/shared.txt
-echo "from layer2"  > /tmp/ol/lower2/shared.txt   # shadows lower1
-echo "lower2 only"  > /tmp/ol/lower2/layer2.txt
-
+# 3. Mount overlayfs
 mount -t overlay overlay \
-  -o lowerdir=/tmp/ol/lower2:/tmp/ol/lower1,upperdir=/tmp/ol/upper,workdir=/tmp/ol/work \
-  /tmp/ol/merged
-
-# lower2/shared.txt shadows lower1/shared.txt
-cat /tmp/ol/merged/shared.txt    # "from layer2"
-
-# Write goes to upperdir, original lower layer unchanged
-echo "modified" > /tmp/ol/merged/shared.txt
-cat /tmp/ol/upper/shared.txt     # "modified"
-cat /tmp/ol/lower2/shared.txt    # "from layer2" — unmodified
+  -o lowerdir=$LOWER,upperdir=$UPPER,workdir=$WORK \
+  $MERGED
 ```
 
-### OCI: The Syscall Contract Made Portable
-
-The Open Container Initiative defines two specifications that sit just above the kernel syscall layer:
-
-- **Image spec**: a container image is a stack of compressed tarballs (layers) plus a JSON manifest. Each layer is identified by its SHA-256 digest. The manifest records layer order and the image configuration (entrypoint, environment, working directory).
-- **Runtime spec**: a *bundle* is a directory containing an extracted root filesystem and a `config.json`. A conforming OCI runtime (`runc`, `crun`, `gVisor`'s `runsc`) reads `config.json` and performs the sequence: `clone(2)` with the specified namespace flags → write PIDs to cgroup → `pivot_root(2)` into the bundle rootfs → drop capabilities → `execve(2)` the entrypoint.
-
-Docker, containerd, and Kubernetes's CRI all delegate to an OCI runtime at the bottom of the stack. Understanding OCI means you can run containers without Docker:
+**Inside a new namespace** (still on host, but we will enter a fresh UTS namespace):
 
 ```bash
-# Build an OCI bundle manually and run it with runc
-mkdir -p /tmp/bundle/rootfs
-# (populate rootfs with a minimal root filesystem, e.g., from a container image)
-cd /tmp/bundle
-runc
+# 4. Clone a child with a new UTS namespace
+unshare --fork --uts --mount-proc /bin/bash <<'EOF'
+   # 5. Switch root via pivot_root
+   cd $MERGED
+   pivot_root . .          # make $MERGED the new root
+   umount -l /             # detach the old root (now hidden)
+   # 6. Set a container‑specific hostname
+   echo container > /etc/hostname
+   hostname -F /etc/hostname
+   # 7. Exec a shell
+   exec /bin/bash
+EOF
+```
+
+*Why this works*:  
+- `unshare --uts` gives the child its own hostname setting, so changes to `/etc/hostname` do not affect the host.  
+- The overlay mount provides a writable upper layer while preserving the read‑only base image.  
+- `pivot_root` swaps the mount namespace’s root, ensuring that all subsequent path resolution (including `/etc/hostname`) points to the layered filesystem.  
+- The `umount -l /` cleans up the old root to avoid “device busy” errors when later removing the overlay.
+
+---
+
+## Common Mistakes
+| Mistake | What’s wrong | Why it matters |
+|---------|--------------|----------------|
+| **Using `--privileged` or `CAP_SYS_ADMIN` unnecessarily** | Grants the container almost all host capabilities, effectively breaking namespace isolation. | A compromised container can then load kernel modules, modify `/dev/*`, or reconfigure host cgroups, leading to privilege escalation. |
+| **Assuming PID‑namespace isolation hides signals** | Sending `SIGKILL` or `SIGSTOP` to PID 1 inside the container still works because these signals are *not* namespaced. | A process inside the container can be killed from the host, breaking expectations of isolation; only signals like `SIGCHLD` are namespaced. |
+| **Mounting a bind‑mount without making it `rprivate`** | The bind‑mount propagates mount/unmount events between host and container namespaces. | The container can unintentionally mount or unmount host filesystems (e.g., `umount /` inside container will also unmount the host’s root if the mount is shared). |
+| **Neglecting to set `workdir` for overlayfs** | Overlayfs requires a dedicated workdir on the same filesystem as upperdir; omitting it yields `mount: wrong fs type, bad option, bad superblock`. | The container fails to start; debugging is frustrating because the error message is vague. |
+| **Leaving cgroup directories after container stops** | The cgroup persists, consuming inodes and potentially holding references to defunct processes. | Over time, the cgroup filesystem can fill up, causing `ENOSPC` when trying to create new cgroups; also makes resource accounting inaccurate. |
+| **Using Docker’s `-m` flag with cgroup v1 on a v2‑only system** | Docker translates `-m` to `memory.limit_in_bytes` (v1) which is ignored on unified hierarchy, resulting in no limit. | Users think they limited memory but the container can consume all host RAM, leading to OOM kills of host services. |
+
+---
+
+## Exercises
+### Easy
+1. **Namespace inspection** – Run `unshare --fork --pid --mount-proc /bin/bash`. Inside the new shell, execute `cat /proc/$$/ns/pid` and compare it with the host’s value. Explain what you see.
+2. **Simple cgroup limit** – Create a cgroup `demo` under `/sys/fs/cgroup`, attach your shell, and set `memory.max` to 50 MiB. Run `yes > /dev/null` and observe the OOM kill via `dmesg`.
+
+### Medium
+3. **CPU quota calculation** – Starting from a default period of 100 ms, determine the quota needed to limit a task to 12.5 % CPU. Write the appropriate values to `cpu.max` and verify with `htop` that the task’s CPU usage stays near the target.
+4. **Overlayfs robustness** – Prepare a lowerdir containing a file `lower.txt` with content “original”. Mount an overlay with an empty upperdir. Inside the merged view, delete `lower.txt`. Then, check the upperdir for a whiteout file. Explain how overlayfs represents deletions.
+
+### Hard
+5. **Build a container from scratch** – Using only `unshare`, `mkdir`, `mount` (overlayfs), `pivot_root`, and `execve`, start a shell that:
+   - Has its own PID, UTS, mount, and user namespaces (map host UID 1000 to container UID 0).  
+   - Is limited to 200 MiB memory and 10 % CPU via cgroup v2.  
+   - Has a hostname “builder”.  
+   Provide the exact sequence of commands (or a short script) and validate each property with appropriate checks (`ps`, `hostname`, `cat /proc/$$/status`, `cat /sys/fs/cgroup/.../cpu.max`).
+
+6. **Network namespace + veth pair** – Create a network namespace, move one end of a veth pair into it, assign IP 10.0.0.2/24 inside the namespace and 10.0.0.1/24 on the host, and enable ping between them. Show the commands and explain how the netns isolates the container’s network stack.
+
+---
+
+## Linux Connection
+### Key Subsystems and Files
+| Subsystem | Path / Tool | Typical Use in Containers |
+|-----------|-------------|---------------------------|
+| Namespaces | `/proc/<pid>/ns/` (e.g., `ns/pid`, `ns/mnt`) | Inspect or enter namespaces with `nsenter -t <pid> -n` (net), `-m` (mnt), `-u` (uts). |
+| Cgroups v2 | `/sys/fs/cgroup/` (unified hierarchy) | Create directories, write `cpu.max`, `memory.max`, `pids.max`. |
+| Overlayfs | `mount -t overlay` | Combine read‑only image layers with a writable upper layer. |
+| Capabilities | `cap_get_proc()`, `capset()` (libcap) / `capsh` | Drop unnecessary capabilities after user‑namespace setup (`CAP_NET_RAW`, `CAP_SYS_CHROOT`, etc.). |
+| User namespaces | `/proc/self/uid_map`, `/proc/self/setgroups` | Map host UIDs to container UIDs (enables root‑less containers). |
+| Network namespaces | `ip netns add <name>`, `ip link set <dev> netns <ns>` | Isolate network interfaces, ports, routing tables. |
+| Utilities | `unshare`, `nsenter`, `runc`, `crun`, `podman`, `docker` | High‑level runtime helpers that perform the steps above automatically. |
+
+### Example Commands (run on a modern Ubuntu 22.04+ host)
+
+```bash
+# 1. View the PID namespace of the current shell
+readlink /proc/$$/ns/pid
+# Output: pid:[4026531836]
+
+# 2. Enter a new network namespace and look at interfaces
+sudo ip netns add testns
+sudo ip netns exec testns ip link show
+# Shows only lo
+
+# 3. Create a cgroup v2 and limit memory to 100MiB
+CGROOT=/sys/fs/cgroup
+CGROUP=$CGROOT/my_limit
+mkdir -p $CGROUP
+echo $$ > $CGROUP/cgroup.procs
+echo $((100*1024*1024)) > $CGROUP/memory.max
+
+# 4. Verify that a memory‑hungry process is killed
+strangecat() { dd if=/dev/zero of=/dev/null bs=1M count=200; }
+strangecat   # will be OOM‑killed inside the cgroup
+dmesg | grep -i "out of memory" | tail -1
+
+# 5. Drop all capabilities except those needed for a simple server
+capsh --drop=all -- -c "echo 'capabilities retained:' && capsh --print"
+```
+
+*Why these paths matter*: They are the exact interfaces that container runtimes (runc, crun, dockerd) interact with. Understanding them lets you debug, audit, or build custom containers without relying on a black‑box CLI.
+
+---
+
+## Why This Matters
+Containers are not a mystical “black box”; they are a deliberate composition of well‑understood Linux primitives. By mastering **namespaces**, you grasp *how* isolation is achieved at the level of process IDs, mounts, networks, and even time. By mastering **cgroups**, you understand *why* a container cannot starve the host of CPU, memory, or I/O, and you can enforce precise service‑level objectives. Filesystem layering shows *how* images stay immutable and shareable while still giving each container a mutable view, enabling efficient storage and rapid startup.
+
+When you can trace a `docker run` command back to the underlying `clone(2)`, `mount -t overlay`, `cgroup` directory creation, and `pivot_root(2)`, you gain the ability to:
+
+* Diagnose failures that arise from missing namespace flags or mis‑mounted overlays.  
+* Harden containers by dropping capabilities, configuring user namespaces, and tightening cgroup limits without relying on opaque defaults.  
+* Build specialized runtimes (e.g., for lightweight edge devices or high‑performance HPC) that bypass the overhead of general‑purpose engines while still using the same kernel guarantees.  
+* Contribute to or audit container security standards (CIS Docker Benchmark, NIST SP 800‑190) because you know exactly which kernel files control each property.
+
+In short, the concepts in this lesson are the **foundations** of modern cloud infrastructure, DevOps pipelines, and secure application deployment. Knowing them transforms you from a user of container tools into an engineer who can shape, extend, and secure the very mechanisms that make containers possible.

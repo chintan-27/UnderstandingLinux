@@ -10,151 +10,233 @@ resources:
     title: "Understanding the Linux Kernel (Bovet)"
 ---
 
-## Why This Matters
-
-When a system misbehaves — a process stalls, latency spikes, a driver corrupts state — you cannot freeze the kernel and inspect it. The kernel is live, preemptive, and mediating every other operation on the machine. `/proc` counters tell you aggregates; they cannot tell you that the scheduler ran task A before task B, that an interrupt preempted a spinlock holder, or that a specific function was called 40,000 times in one second. The tracing infrastructure (ftrace, tracepoints, perf, eBPF) exists precisely because post-hoc statistics are insufficient for understanding causal sequences. Each tool occupies a different point in the tradeoff space between generality, overhead, and programmability.
-
----
-
 ## Core Concepts
+Kernel tracing and observability are the set of interfaces that let user‑space inspect the internal state of the Linux kernel without recompiling or rebooting it. The need arises because the kernel executes in a privileged mode where traditional debugging (breakpoints, printf) is infeasible; any observation must be done through mechanisms the kernel itself exposes.
 
-### ftrace: Dynamic NOP Patching for Zero Idle Overhead
+The four primary mechanisms differ in **where** they inject observation points, **how** they store data, and **what** they are optimized for:
 
-ftrace exploits the fact that the kernel is compiled with `-pg` (or `-mfentry` on x86-64), which inserts a `callq __fentry__` at the start of every function. At boot, the kernel iterates the `__mcount_loc` section — a table of every such call site — and overwrites each one with NOPs using `text_poke_early()`. The overhead when ftrace is idle is therefore exactly the cost of executing those NOPs: on x86-64, a 5-byte NOP executes in one cycle with no branch prediction involvement.
+| Mechanism | Injection point | Data storage | Typical use case | Overhead |
+|-----------|----------------|--------------|------------------|----------|
+| **ftrace** | Dynamic function entry/exit via `-pg` instrumentation (mcount) or kprobe‑style hooks | Per‑CPU ring buffer (`trace_buffer`) | Function‑level tracing, latency histograms, scheduler events | Low (≈ 1 % CPU when enabled) |
+| **Tracepoints** | Static `TRACE_EVENT` macros compiled into kernel source | Same ftrace buffer (but filtered per‑event) | Fixed‑event auditing (syscalls, interrupts, block I/O) | Very low (≈ 0.1 % when enabled) |
+| **Perf events** | Hardware performance counters (PMU) or software counters (via `perf_event_open`) | Per‑CPU counter arrays, optional mmap’d sample buffer | CPU cycles, cache misses, branch mispredictions, custom software counters | Determined by sampling rate; can be made negligible |
+| **eBPF** | User‑supplied bytecode loaded into kernel via `bpf()` syscall, attached to hooks (kprobe, tracepoint, XDP, socket, etc.) | BPF maps (hash, array, perf ring buffer, etc.) | Programmable observation: packet filtering, security auditing, custom metrics | Overhead proportional to program complexity; JIT‑compiled to native code |
 
-When you enable a tracer, `ftrace_update_ftrace_func()` calls `text_poke_bp()` to atomically replace NOPs with `callq` to the tracer dispatcher. The `_bp` variant uses a breakpoint-based protocol (INT3 → update → resume) to keep SMP systems consistent without stopping all CPUs for the full duration of the patch.
-
-Tracing state lives under `tracefs`, mounted at `/sys/kernel/debug/tracing`. This is a virtual filesystem — reads and writes to its files are syscalls into kernel tracing code, not disk I/O.
-
-### Tracepoints: Instrumentation as a Versioned API
-
-Tracepoints are developer-placed hook sites in kernel source, defined with `TRACE_EVENT()` macros in headers under `include/trace/events/`. The critical design decision is that they are *stable*: their names and argument types are maintained across kernel versions, forming a contract between the kernel and tracing consumers. This is why `perf`, `ftrace`, and eBPF can all attach to `sched:sched_switch` — the name and signature are guaranteed.
-
-The fast-path cost is a single conditional branch over a null pointer check. When no probe is attached, the branch is never taken, and modern branch predictors learn this immediately, making the overhead sub-nanosecond per call site.
-
-### perf Events: A Unified FD Interface to Hardware Counters
-
-The `perf_event` subsystem (`kernel/events/core.c`) abstracts two fundamentally different things through one interface: hardware PMU registers (which count CPU-internal events like cache misses and retired instructions at zero software overhead) and software events (context switches, page faults, tracepoints). The unifying primitive is `perf_event_open()`, which returns a file descriptor. The FD model is not cosmetic — it means event groups, inheritance across fork, and ring buffer access via `mmap()` all fall out of existing Unix machinery.
-
-Hardware PMU counters are scarce. A typical x86 core has 4–8 general-purpose programmable counters. When you request more events than available counters, the kernel multiplexes them across time slices. The scaling correction is:
-
-$$\hat{c} = c_{\text{obs}} \times \frac{T_{\text{enabled}}}{T_{\text{running}}}$$
-
-where $c_{\text{obs}}$ is the raw count, $T_{\text{enabled}}$ is the wall time the event was enabled, and $T_{\text{running}}$ is the time a physical counter was actually assigned to it. The ratio $T_{\text{running}} / T_{\text{enabled}}$ is always $\leq 1$; the further it is from 1, the less trustworthy the estimate.
-
-### eBPF: Verified, JIT-Compiled Kernel Programs
-
-eBPF is a register-based virtual machine with 11 64-bit registers (R0–R10), a fixed 512-byte stack, and a restricted ISA. You write programs in a C subset, compile with `clang -target bpf`, and load with the `bpf()` syscall. Before execution, the in-kernel verifier performs:
-
-1. **DAG check**: the CFG must be a DAG — no back edges, so no unbounded loops (bounded loops are permitted since 5.3 with bounded loop support verified by unrolling/iteration count proof).
-2. **Type tracking**: every register has a tracked type (scalar, pointer-to-map, pointer-to-stack, etc.). Dereferencing a scalar is rejected.
-3. **Bounds checking**: every memory access must be provably within bounds at verification time.
-
-If verification passes, the JIT compiler (`arch/x86/net/bpf_jit_comp.c` on x86) emits native code. The verifier's conservatism is intentional: it rejects some safe programs to keep the verifier itself simple and auditable.
-
-eBPF programs communicate with userspace via **maps** — kernel-resident typed data structures (hash tables, arrays, ring buffers, per-CPU arrays) accessed from both sides. Per-CPU map variants avoid cache-line contention by giving each CPU its own value slot, which matters when every packet or syscall increments a counter.
-
----
+Each mechanism satisfies a different **observability trade‑off**: ftrace gives fine‑grained call‑graph data with minimal code change; tracepoints provide stable, low‑overhead event names; perf events expose hardware‑level metrics; eBPF lets you write arbitrary kernel‑side logic without leaving user space.
 
 ## How It Works
+### Ftrace Internals
+When the kernel is built with `CONFIG_FUNCTION_TRACER`, each function prologue contains a call to `mcount()` (or `__trace_function()`). At boot, ftrace patches these calls to either a nop or a handler that writes a record into a per‑CPU ring buffer.
 
-### ftrace Ring Buffer: Lockless Per-CPU Design
-
-The ftrace ring buffer (`kernel/trace/ring_buffer.c`) uses one buffer per CPU. Writers never touch another CPU's buffer, eliminating inter-CPU synchronization entirely. Within a single CPU's buffer, writers claim slots using a local atomic `cmpxchg` on the write pointer. If an interrupt fires mid-write and the interrupt handler also writes a trace record, it claims a slot after the interrupted writer's reservation and commits independently — the ring buffer handles nested writers at different interrupt levels.
-
-The buffer is a power-of-two allocation. The write pointer wraps via bitmask:
-
-$$\text{slot} = \text{write\_ptr} \mathbin{\&} (\text{buf\_size} - 1)$$
-
-When the buffer fills, old events are overwritten. This is a deliberate policy: tracing must never apply backpressure to kernel execution. A tracing consumer that is too slow loses data, not performance.
-
-### Tracepoint Expansion
-
-In `include/trace/events/sched.h`:
-
+A ftrace record consists of:
 ```c
-TRACE_EVENT(sched_switch,
-    TP_PROTO(bool preempt,
-             struct task_struct *prev,
-             struct task_struct *next),
-    TP_ARGS(preempt, prev, next),
+struct trace_entry {
+    u32  type;        // enum trace_event_type
+    u32  len;         // size of record
+    unsigned long ip; // instruction pointer (return address)
+    u32  flags;
+    u64  timestamp;   // local clock (usually sched_clock)
+    /* event‑specific payload follows */
+};
+```
+The per‑CPU buffer is a **power‑of‑two sized ring** (`size = 2^n` pages). Let `B` be the buffer size in bytes and `R` the record size. The maximum number of records storable before wrap‑around is:
+$$ N_{max} = \left\lfloor \frac{B}{R} \right\rfloor $$
+If the producer rate `λ` (records/s) exceeds the consumer rate `μ` (records/s drained by user‑space), the buffer overruns after:
+$$ t_{overrun} = \frac{B}{λ - μ} $$
+Choosing `B` large enough (e.g., 4 MiB per CPU) makes overruns rare for typical tracing workloads.
+
+### Tracepoints
+A tracepoint is defined with:
+```c
+TRACE_EVENT(sys_enter,
+    TP_PROTO(const char __user *filename, int flags, umode_t mode),
+    TP_ARGS(filename, flags, mode),
     TP_STRUCT__entry(
-        __array(char, prev_comm, TASK_COMM_LEN)
-        __field(pid_t, prev_pid)
-        __field(int,   prev_prio)
-        __field(long,  prev_state)
-        __array(char, next_comm, TASK_COMM_LEN)
-        __field(pid_t, next_pid)
-        __field(int,   next_prio)
+        __string(filename, filename)
+        __field(int, flags)
+        __field(umode_t, mode)
     ),
     TP_fast_assign(
-        memcpy(__entry->prev_comm, prev->comm, TASK_COMM_LEN);
-        __entry->prev_pid   = prev->pid;
-        __entry->prev_prio  = prev->prio;
-        __entry->prev_state = prev->__state;
-        memcpy(__entry->next_comm, next->comm, TASK_COMM_LEN);
-        __entry->next_pid   = next->pid;
-        __entry->next_prio  = next->prio;
+        __assign_str(filename, filename);
+        __entry->flags = flags;
+        __entry->mode = mode;
     ),
-    TP_printk("prev_comm=%s prev_pid=%d ... next_comm=%s next_pid=%d",
-              __entry->prev_comm, __entry->prev_pid,
-              __entry->next_comm, __entry->next_pid)
+    TP_printk("fname=%s flags=%d mode=%o",
+              __get_str(filename), __entry->flags, __entry->mode)
 );
 ```
+The macro expands to a static inline function `trace_sys_enter(...)` that, when the kernel is built with `CONFIG_TRACEPOINTS`, emits a call to that function at the call‑site. The function checks a per‑event enabled flag (a single byte) before writing to the ftrace buffer—hence the negligible overhead when disabled.
 
-At the call site in `kernel/sched/core.c`:
+### Perf Events
+The `perf_event_open()` syscall creates a file descriptor that references a **performance event**. The kernel maintains per‑CPU counters (`struct perf_event`) that can be:
+* **Hardware**: driven by the CPU’s Performance Monitoring Unit (PMU). Each event selects a counter and a unit mask (UMASK) via the `config` field.
+* **Software**: maintained by the kernel (e.g., `PERF_COUNT_SW_PAGE_FAULTS`, `PERF_COUNT_SW_CONTEXT_SWITCHES`).
 
+When sampling is enabled (`sample_period` > 0), the kernel uses the **PMU interrupt** to interrupt execution, capture a sample (instruction pointer, registers, call chain), and write it to a **mmap’d circular buffer** (size `2^npages`). The interrupt rate is:
+$$ f_{int} = \frac{CPU\_freq}{sample\_period} $$
+For a 3 GHz CPU and `sample_period = 100000` cycles, `f_int ≈ 30 kHz`, yielding ~30 k samples/s per CPU.
+
+### eBPF Runtime
+An eBPF program is a sequence of 64‑bit instructions verified for safety (no loops without bounded depth, no out‑of‑bounds memory access). After verification, the kernel either:
+* **Interprets** the bytecode (slow path), or
+* **JIT‑compiles** it to native machine code (fast path, via `CONFIG_BPF_JIT`).
+
+The program accesses kernel data through **helpers** (e.g., `bpf_map_lookup_elem`, `bpf_probe_read_kernel`) and stores results in **BPF maps**. A hash map with `n` buckets and load factor `α` has expected lookup cost:
+$$ O(1 + α) $$
+Maps are backed by per‑CPU arrays when appropriate to avoid atomic contention.
+
+## Worked Examples
+### Example 1: Ftrace – Measuring Interrupt Latency
+Goal: Compute the worst‑case latency between a timer interrupt firing and the handler’s first instruction.
+
+1. Enable the `irq` tracer:
+   ```bash
+   echo irq > /sys/kernel/debug/tracing/current_tracer
+   ```
+2. Set a sufficiently large buffer (per‑CPU):
+   ```bash
+   echo 8 > /sys/kernel/debug/tracing/buffer_size_kb   # 8 MiB per CPU
+   ```
+3. Start recording:
+   ```bash
+   echo 1 > /sys/kernel/debug/tracing/tracing_on
+   ```
+4. Generate a known interrupt (e.g., via `ping`):
+   ```bash
+   ping -i 0.001 127.0.0.1 &   # 1 kHz ICMP echo requests
+   sleep 5
+   kill %1
+   ```
+5. Stop recording and extract the trace:
+   ```bash
+   echo 0 > /sys/kernel/debug/tracing/tracing_on
+   cat /sys/kernel/debug/tracing/trace > irq_latency.txt
+   ```
+6. Analyze: each line contains a timestamp (`usecs`) and the function name. The latency for an IRQ entry is:
+   $$ L = t_{handler\_entry} - t_{irq\_entry} $$
+   Using `awk` we can compute the 99th‑percentile:
+   ```bash
+   awk '/irq_enter/ {tenter=$2} /handler/ {print $2 - tenter}' irq_latency.txt \
+       | sort -n | awk '{a[NR]=$1} END{print a[int(NR*0.99)]}'
+   ```
+   On an idle x86_64 system this typically yields **L₉₉ ≈ 5‑10 µs**; under load it can rise to **> 30 µs**, demonstrating where real‑time tuning is needed.
+
+### Example 2: Tracepoints – Counting `sys_open` Invocations
+Goal: Count how many times `sys_open` is called per second by a workload.
+
+1. Ensure tracepoints are enabled:
+   ```bash
+   echo 1 > /sys/kernel/debug/tracing/events/syscalls/sys_enter_open/enable
+   ```
+2. Open the trace pipe for consumption:
+   ```bash
+   cat /sys/kernel/debug/tracing/trace_pipe &
+   ```
+3. Run a workload (e.g., `find /usr -type f -exec cat {} \;`):
+   ```bash
+   timeout 10 find /usr -type f -exec cat {} \; >/dev/null
+   ```
+4. Stop the consumer and count lines:
+   ```bash
+   kill %1   # stops cat trace_pipe
+   wc -l < /tmp/trace_pipe.out   # hypothetical file; in practice pipe output is counted live
+   ```
+   Suppose we observed **12 345** openings in 10 s → rate **λ = 1 234.5 open/s**.
+   The tracepoint adds roughly **≈ 150 ns** per event (measured via `perf stat -e tracepoint:syscalls/sys_enter_open`).
+
+### Example 3: eBPF – Tracking TCP Retransmissions per Destination IP
+Goal: Maintain a per‑destination‑IP counter of TCP retransmissions using an eBPF hash map.
+
+**eBPF C program (`retransmit.c`):**
 ```c
-trace_sched_switch(preempt, prev, next);
-```
-
-The macro expands to approximately:
-
-```c
-if (unlikely(atomic_read(&__tracepoint_sched_switch.key.enabled) > 0)) {
-    /* copy fields into ring buffer slot, call registered probes */
-}
-```
-
-The `unlikely()` hint tells the compiler to lay out the hot path (no probe attached) as straight-line code. The enabled counter is zero by default; the branch is never mispredicted after the first few executions.
-
-### perf_event_open: Counting and Sampling
-
-**Counting mode** — accumulate a single 64-bit value:
-
-```c
-#include <linux/perf_event.h>
-#include <sys/syscall.h>
-#include <sys/ioctl.h>
-#include <unistd.h>
-#include <stdint.h>
-
-struct perf_event_attr pe = {
-    .type           = PERF_TYPE_HARDWARE,
-    .config         = PERF_COUNT_HW_CACHE_MISSES,
-    .size           = sizeof(pe),
-    .disabled       = 1,
-    .exclude_kernel = 0,
-    .exclude_hv     = 1,
-    .read_format    = PERF_FORMAT_TOTAL_TIME_ENABLED
-                    | PERF_FORMAT_TOTAL_TIME_RUNNING,
-};
-
-int fd = syscall(SYS_perf_event_open, &pe,
-                 0,   /* pid: current process */
-                 -1,  /* cpu: any */
-                 -1,  /* group_fd: no group */
-                 0);  /* flags */
-
-ioctl(fd, PERF_EVENT_IOC_RESET,  0);
-ioctl(fd, PERF_EVENT_IOC_ENABLE, 0);
-
-/* ... workload ... */
-
-ioctl(fd, PERF_EVENT_IOC_DISABLE, 0);
+/* SPDX-License-Identifier: GPL */
+#include <linux/bpf.h>
+#include <linux/ip.h>
+#include <linux/tcp.h>
+#include <bpf/bpf_helpers.h>
 
 struct {
-    uint64_t value;
-    uint64_t time_enabled;
-    uint64_t time_running;
+    __uint(type, BPF_MAP_TYPE_HASH);
+    __uint(max_entries, 65536);
+    __type(key, __u32);   /* IPv4 dst */
+    __type(value, __u64); /* retransmit count */
+} retransmits SEC(".maps");
+
+SEC("tracepoint/tcp/tcp_retransmit_skb")
+int handle_retransmit(struct trace_event_raw_tcp *ctx)
+{
+    __u32 daddr = ctx->__data_loc_ipv4_dst ? 
+                  ((struct iphdr *)((unsigned long)ctx + ctx->__data_loc_ipv4_dst))->daddr : 0;
+    __u64 *cnt = bpf_map_lookup_elem(&retransmits, &daddr);
+    if (cnt) {
+        __u64 new = *cnt + 1;
+        bpf_map_update_elem(&retransmits, &daddr, &new, BPF_ANY);
+    }
+    return 0;
 }
+
+char _license[] SEC("license") = "GPL";
+```
+Compile and load:
+```bash
+clang -O2 -target bpf -c retransmit.c -o retransmit.o
+sudo bpftool prog load retransmit.o /sys/fs/bpf/retransmit type tracepoint \
+    name tcp_retransmit_skb
+sudo bpftool map pin name retransmits /sys/fs/bpf/retransmits_map
+```
+Attach to the tracepoint (already done by `bpftool prog load` with type `tracepoint`).  
+Read the map periodically:
+```bash
+while true; do
+    sudo bpftool map dump name retransmits_map | \
+        awk '{print $1, $2}' | sort -nrk2 | head -5
+    sleep 1
+done
+```
+Output shows the top‑5 destination IPs with retransmit counts, enabling quick identification of problematic flows.
+
+## Common Mistakes
+| Mistake | Why it’s wrong | Consequence |
+|---------|----------------|-------------|
+| **Leaving ftrace buffer size at default (1 MiB) while tracing high‑frequency events** | The buffer fills quickly; overrun drops oldest events, biasing analysis toward recent activity. | Missed early‑phase bugs; inaccurate latency histograms. |
+| **Attaching an eBPF program to a kprobe on a function that may be optimized away (e.g., inline)** | The kernel may inline the function, removing the probe point; the kprobe then attaches to the prologue of the caller, causing incorrect context. | Program sees wrong parameters or never fires, leading to false negatives. |
+| **Using perf’s `sample_period` without converting to CPU cycles** | `sample_period` expects cycles; supplying a time‑based value yields either massive overhead (if too small) or no samples (if too large). | Either system stall due to interrupt flood, or blind performance measurement. |
+| **Assuming tracepoint IDs are stable across kernel versions** | Tracepoints can be added, removed, or renumbered; relying on a numeric ID from `/sys/kernel/debug/tracing/available_events` breaks when the kernel is upgraded. | Scripts silently stop collecting data after a kernel update. |
+| **Not pinning BPF maps before program unload** | If a map is not pinned (`bpftool map pin`), unloading the program also removes the map, losing accumulated data. | Inability to retrieve long‑term statistics after program update or rollback. |
+
+## Exercises
+### Easy
+1. **Ftrace function graph**: Enable the `function_graph` tracer, set buffer to 4 MiB, run `ls -l /usr/bin | head -5`, then disable and display the last 20 lines of the trace. Explain why the graph shows both entry and exit timestamps.
+2. **Tracepoint syscall count**: Enable `syscalls/sys_enter_read` and `syscalls/sys_exit_read`. Run a program that reads from `/dev/zero` for 5 seconds and compute the average read size from the timestamps and returned counts.
+
+### Medium
+3. **Perf hardware counters**: Use `perf stat -e cycles,instructions,cache-references,cache-misses` to measure the CPI (cycles per instruction) of `ffmpeg -i input.mp4 -f null -`. Derive CPI from the collected numbers and discuss what a CPI > 1 indicates.
+4. **eBPF XDP drop**: Write an XDP program that drops packets destined to port 8080. Load it on `eth0` with `ip link set dev eth0 xdp obj xdp_drop.o sec xdp`. Verify with `tcpdump` that packets to port 8080 no longer appear.
+
+### Hard
+5. **Combined ftrace + perf**: Design an experiment to correlate scheduler latency (ftrace `sched_wakeup`) with CPU stall cycles (perf `stalled-cycles-frontend`). Outline the steps to synchronize timestamps, the required buffer sizes, and a method to compute the Pearson correlation coefficient from the collected data.
+6. **Dynamic eBPF map resizing**: Implement an eBPF program that uses an LRU hash map (`BPF_MAP_TYPE_LRU_HASH`) to track flow statistics. When the map reaches 90 % occupancy, trigger a userspace notification via `bpf_perf_event_output` to flush and reset the map. Provide the userspace daemon that receives the notifications and performs the reset.
+
+## Linux Connection
+- **Ftrace source**: `kernel/trace/` – core files `trace.c`, `trace_output.c`, `trace_events.c`. The ring buffer implementation lives in `kernel/trace/ring_buffer.c`.
+- **Tracepoint definitions**: Scattered throughout the kernel; e.g., `include/trace/events/sched.h` for scheduler tracepoints, `include/trace/events/syscalls.h` for syscalls.
+- **Perf events subsystem**: `kernel/events/` – `core.c` (generic event handling), `perf_cpu.c` (per‑CPU context), `perf_sys.c` (syscall interface). The syscall wrapper is `sys_perf_event_open` in `kernel/events/syscalls.c`.
+- **eBPF subsystem**: `kernel/bpf/` – `core.c` (verifier, JIT), `helpers.c` (BPF helper functions), `map.c` (map implementations). User‑space tools:
+  * `bpftool` – `/usr/sbin/bpftool` (part of `linux-tools` package)
+  * `tc` – for attaching eBPF to networking devices (`tc filter add dev eth0 ingress bpf da obj prog.o sec foo`)
+  * `ip link` – for XDP (`ip link set dev eth0 xdp obj prog.o sec xdp`)
+- **Sample commands to explore kernel config**:
+  ```bash
+  grep -E 'CONFIG_FUNCTION_TRACER|CONFIG_TRACEPOINTS|CONFIG_PERF_EVENTS|CONFIG_BPF' /boot/config-$(uname -r)
+  ```
+- **Reading ftrace buffer directly** (bypassing trace-cmd):
+  ```bash
+  sudo cat /sys/kernel/debug/tracing/trace   # raw ASCII
+  sudo cat /sys/kernel/debug/tracing/trace.bin | od -t x1   # binary raw
+  ```
+- **Perf mmap sample layout**: The sample buffer begins with a `perf_event_header` followed by an optional `perf_sample_id` and then the raw sample data (IP, TID, CPU, period, etc.). The header structure is defined in `include/linux/perf_event.h`.
+
+## Why This Matters
+Mastering these tracing mechanisms transforms kernel development from guesswork into an empirical science. Ftrace gives you the **call‑graph** needed to understand *why* a function is taking time; tracepoints provide **stable, low‑overhead event names** for longitudinal monitoring; perf events expose the **hardware‑level cost** (cycles, stalls, cache misses) that explains *how* the CPU spends its time; eBPF lets you **program arbitrary observations**—from packet filtering to custom security audits—without leaving user space or recompiling the kernel.  
+
+Together they form a layered observability stack: start with coarse, always‑on counters (perf), drill into specific events (tracepoints), inspect the exact code paths (ftrace), and finally deploy programmable sensors (eBPF) for production‑grade monitoring. The ability to correlate data across layers—e.g., linking a spike in cache‑misses (perf) to a particular scheduler latency spike (ftrace) and then validating it with an eBPF‑generated histogram—is what separates superficial debugging from deep performance optimization and reliable systems engineering. This lesson equips you to wield each tool with an understanding of its internal mechanics, avoiding common pitfalls and enabling you to design experiments that yield quantitative, actionable insights into the Linux kernel’s behavior.

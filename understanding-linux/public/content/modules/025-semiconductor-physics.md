@@ -10,115 +10,282 @@ resources:
     title: "Introduction to Solid State Physics (Kittel)"
 ---
 
-## Why This Matters
+## Core Concepts
+### Intrinsic vs. Extrinsic Semiconductors
+An intrinsic semiconductor is a pure crystal with no intentional impurities. At thermal equilibrium, electrons are excited across the band gap \(E_g\) creating equal concentrations of electrons (\(n\)) and holes (\(p\)):
+\[
+n = p = n_i = \sqrt{N_c N_v}\,e^{-E_g/(2kT)},
+\]
+where \(N_c\) and \(N_v\) are the effective density of states in the conduction and valence bands, \(k\) is Boltzmann’s constant, and \(T\) is absolute temperature. The product \(np=n_i^2\) is the **mass‑action law** and holds for both intrinsic and doped material.
 
-Every CPU, RAM chip, and storage controller in your Linux machine is built from semiconductors. The transistors switching inside your processor only work because engineers can precisely control electron flow through doped silicon — a material that can be made to behave as either a conductor or insulator on demand. Without the p-n junction, there are no diodes, no transistors, no MOSFETs, no DRAM cells. The entire computational substrate the kernel manages disappears. Understanding how charge carriers drift under electric fields and diffuse down concentration gradients is not abstract physics — it is the operating principle of every piece of hardware Linux talks to.
+Adding impurities (doping) breaks this symmetry. Donor atoms (e.g., P in Si) contribute extra electrons that are loosely bound; at room temperature they are ionized, raising the electron concentration \(n \approx N_D\) (donor density) while the hole concentration falls to \(p \approx n_i^2/N_D\). Acceptors (e.g., B in Si) capture electrons, creating mobile holes: \(p \approx N_A\), \(n \approx n_i^2/N_A\). The Fermi level \(E_F\) shifts toward the band that gains carriers:
+\[
+E_F = E_i + kT\ln\!\left(\frac{n}{n_i}\right) = E_i - kT\ln\!\left(\frac{p}{n_i}\right),
+\]
+where \(E_i\) is the intrinsic Fermi level (mid‑gap for symmetric bands). This shift explains why doped material conducts preferentially via the majority carrier.
+
+### Drift and Diffusion from First Principles
+When an electric field \(\mathbf{E}= -\nabla\phi\) acts on carriers, each experiences a force \(q\mathbf{E}\) ( \(q = +|e|\) for holes, \(-|e|\) for electrons). Between scattering events the carrier gains momentum, giving an average drift velocity
+\[
+\mathbf{v}_d = \mu \mathbf{E},
+\]
+where mobility \(\mu = q\tau/m^*\) (\(\tau\) mean free time, \(m^*\) effective mass). The drift current density is therefore
+\[
+\mathbf{J}_{\text{drift}} = q n \mu_n \mathbf{E} \quad\text{(electrons)},
+\qquad
+\mathbf{J}_{\text{drift}} = q p \mu_p \mathbf{E} \quad\text{(holes)}.
+\]
+
+If the carrier concentration varies in space, random thermal motion causes a net flux from high to low concentration. Using Fick’s law and the Einstein relation \(D = \mu kT/q\), the diffusion current density is
+\[
+\mathbf{J}_{\text{diff}} = q D_n \nabla n \quad\text{(electrons)},
+\qquad
+\mathbf{J}_{\text{diff}} = - q D_p \nabla p \quad\text{(holes)}.
+\]
+Note the minus sign for holes because they are positive charges moving down the concentration gradient.
+
+Combining both mechanisms gives the **drift‑diffusion equations**:
+\[
+\boxed{\mathbf{J}_n = q\mu_n n \mathbf{E} + q D_n \nabla n},
+\qquad
+\boxed{\mathbf{J}_p = q\mu_p p \mathbf{E} - q D_p \nabla p}.
+\]
+
+### Formation of a p‑n Junction and the Depletion Region
+When p‑ and n‑type regions are brought into contact, electrons diffuse from the n‑side to the p‑side and holes diffuse opposite. This leaves behind uncovered donor ions (\(+q\)) on the n‑side and acceptor ions (\(-q\)) on the p‑side, creating a space‑charge region. The built‑in electric field \(\mathbf{E}\) that arises opposes further diffusion until drift and diffusion currents balance.
+
+Assuming an abrupt junction and depletion approximation (no free carriers inside the space‑charge region), Poisson’s equation in one dimension reads
+\[
+\frac{d^2V}{dx^2}= -\frac{\rho(x)}{\varepsilon},
+\]
+with \(\rho = qN_D\) for \(0<x<x_n\) (n‑side) and \(\rho = -qN_A\) for \(-x_p<x<0\) (p‑side). Integrating twice and applying continuity of \(V\) and \(\mathbf{E}= -dV/dx\) at the metallurgical junction yields the depletion widths
+\[
+x_n = \sqrt{\frac{2\varepsilon V_{bi}}{q}\frac{N_A}{N_D(N_A+N_D)}},
+\qquad
+x_p = \sqrt{\frac{2\varepsilon V_{bi}}{q}\frac{N_D}{N_A(N_A+N_D)}},
+\]
+so the total width
+\[
+\boxed{W = x_n + x_p = \sqrt{\frac{2\varepsilon}{q}\left(\frac{N_A+N_D}{N_A N_D}\right)V_{bi}}}.
+\]
+
+The built‑in potential follows from equating the Fermi levels on both sides before contact:
+\[
+V_{bi} = \frac{kT}{q}\ln\!\left(\frac{N_A N_D}{n_i^2}\right).
+\]
+
+### Diode Equation (Shockley)
+Under forward bias the applied voltage reduces the barrier, allowing minority carriers to diffuse across the junction. Solving the steady‑state diffusion equation for excess minority carriers in the quasi‑neutral regions gives the saturation current
+\[
+I_s = qA\!\left(\frac{D_n p_{n0}}{L_n} + \frac{D_p n_{p0}}{L_p}\right),
+\]
+where \(A\) is the junction area, \(L_{n,p}=\sqrt{D_{n,p}\tau_{n,p}}\) diffusion lengths, and \(n_{p0}=n_i^2/N_A\), \(p_{n0}=n_i^2/N_D\) are equilibrium minority concentrations. The resulting current‑voltage relation is
+\[
+\boxed{I = I_s\!\left(e^{V/(nkT/q)}-1\right)},
+\]
+with ideality factor \(n\approx1\) for an ideal diode; recombination in the depletion region raises \(n\) toward 2.
 
 ---
 
-## Core Concepts
+## How It Works
+### Energy Bands and Carrier Statistics
+The periodic crystal potential leads to allowed energy bands separated by gaps. Near the band edges the dispersion can be approximated as parabolic:
+\[
+E_c(\mathbf{k}) = E_c + \frac{\hbar^2k^2}{2m_n^*},\qquad
+E_v(\mathbf{k}) = E_v - \frac{\hbar^2k^2}{2m_p^*}.
+\]
+The density of states per unit volume is
+\[
+g_c(E)=\frac{1}{2\pi^2}\left(\frac{2m_n^*}{\hbar^2}\right)^{3/2}\!\sqrt{E-E_c},\quad
+g_v(E)=\frac{1}{2\pi^2}\left(\frac{2m_p^*}{\hbar^2}\right)^{3/2}\!\sqrt{E_v-E}.
+\]
+Integrating the product of \(g(E)\) with the Fermi‑Dirac distribution
+\[
+f(E)=\frac{1}{1+e^{(E-E_F)/kT}}
+\]
+yields the electron and hole concentrations:
+\[
+n = \int_{E_c}^{\infty} g_c(E)f(E)dE,\qquad
+p = \int_{-\infty}^{E_v} g_v(E)[1-f(E)]dE.
+\]
+For non‑degenerate semiconductors (\(|E_F-E_{c,v}|\gg kT\)) the Fermi‑Dirac integral simplifies to the Boltzmann approximation, giving the expressions used in the Core Concepts section.
 
-### Intrinsic Semiconductors
+### Derivation of the Drift‑Diffusion Equation from the Boltzmann Transport Equation
+Starting from the Boltzmann equation in the relaxation‑time approximation:
+\[
+\frac{\partial f}{\partial t} + \mathbf{v}\cdot\nabla_{\mathbf{r}}f + \frac{q\mathbf{E}}{\hbar}\cdot\nabla_{\mathbf{k}}f = -\frac{f-f_0}{\tau},
+\]
+where \(f_0\) is the equilibrium distribution. Taking the first moment (multiply by \(q\mathbf{v}\) and integrate over \(\mathbf{k}\)) yields the continuity equation for each carrier type:
+\[
+\frac{\partial n}{\partial t} = -\frac{1}{q}\nabla\!\cdot\!\mathbf{J}_n + G_n - R_n,
+\]
+with the current density identified as
+\[
+\mathbf{J}_n = q\mu_n n\mathbf{E} + qD_n\nabla n,
+\]
+where we used the identities
+\[
+\langle\mathbf{v}\rangle = \mu_n\mathbf{E},\qquad
+\langle\mathbf{v}\delta f\rangle = -D_n\nabla n.
+\]
+An analogous derivation holds for holes. This microscopic justification shows that the drift term originates from the systematic acceleration by \(\mathbf{E}\), while the diffusion term comes from the gradient of the non‑equilibrium part of \(f\).
 
-Pure silicon forms a covalent lattice with four valence electrons per atom. At absolute zero, every electron is bound in a covalent bond and silicon is a perfect insulator. At room temperature, thermal energy promotes a small number of electrons across the **band gap** into the conduction band:
+### Poisson Equation and Electrostatics of the Depletion Region
+The space‑charge density \(\rho(x)\) in the depletion approximation is piecewise constant, leading to a linear electric field:
+\[
+\mathcal{E}(x) = 
+\begin{cases}
+\displaystyle \frac{qN_D}{\varepsilon}(x-x_n), & 0<x<x_n\\[6pt]
+\displaystyle -\frac{qN_A}{\varepsilon}(x+x_p), & -x_p<x<0\\[6pt]
+0, & |x|>x_{n,p}.
+\end{cases}
+\]
+Integrating \(\mathcal{E} = -dV/dx\) gives a quadratic potential variation, whose maximum at the junction is the built‑in voltage \(V_{bi}\). The total voltage across the junction under an external bias \(V_R\) (reverse bias positive) is \(V_{bi}+V_R\), which simply replaces \(V_{bi}\) in the depletion width formula:
+\[
+W(V_R) = \sqrt{\frac{2\varepsilon}{q}\left(\frac{N_A+N_D}{N_A N_D}\right)(V_{bi}+V_R)}.
+\]
 
-$$E_g \approx 1.1\ \text{eV} \quad \text{(Si, 300 K)}$$
+---
 
-Each promoted electron leaves behind a **hole** — a vacancy in the valence band that behaves as a positive charge carrier because neighboring electrons can fall into it, propagating the vacancy in the direction opposite to electron motion. In a pure (intrinsic) semiconductor, every promoted electron creates exactly one hole:
+## Worked Examples
+### Example 1: Depletion Width of an Abrupt Si p‑n Junction
+**Given** (room temperature \(T=300\text{ K}\)):
+- \(N_A = 1\times10^{15}\ \text{cm}^{-3}\) (p‑side)
+- \(N_D = 1\times10^{16}\ \text{cm}^{-3}\) (n‑side)
+- Relative permittivity of Si \(\varepsilon_r = 11.7\)
+- \(\varepsilon_0 = 8.854\times10^{-14}\ \text{F/cm}\)
+- Elementary charge \(q = 1.602\times10^{-19}\ \text{C}\)
+- Intrinsic concentration of Si \(n_i = 1.0\times10^{10}\ \text{cm}^{-3}\)
 
-$$n = p = n_i$$
+**Step 1 – Built‑in potential**  
+\[
+V_{bi} = \frac{kT}{q}\ln\!\left(\frac{N_A N_D}{n_i^2}\right)
+= \frac{0.02585\text{ V}}{1}\ln\!\left(\frac{(1\times10^{15})(1\times10^{16})}{(1\times10^{10})^2}\right)
+= 0.02585\ln(1\times10^{21}) \approx 0.02585\times48.35 \approx 1.25\text{ V}.
+\]
 
-The intrinsic carrier concentration at 300 K:
+**Step 2 – Permittivity**  
+\[
+\varepsilon = \varepsilon_r\varepsilon_0 = 11.7\times8.854\times10^{-14}
+= 1.036\times10^{-12}\ \text{F/cm}.
+\]
 
-$$n_i \approx 1.5 \times 10^{10}\ \text{cm}^{-3}$$
+**Step 3 – Depletion width (zero bias)**  
+\[
+W = \sqrt{\frac{2\varepsilon}{q}\left(\frac{N_A+N_D}{N_A N_D}\right)V_{bi}}
+= \sqrt{\frac{2(1.036\times10^{-12})}{1.602\times10^{-19}}
+\left(\frac{1\times10^{15}+1\times10^{16}}{(1\times10^{15})(1\times10^{16})}\right)(1.25)}.
+\]
+Compute the factor:
+\[
+\frac{2\varepsilon}{q}= \frac{2.072\times10^{-12}}{1.602\times10^{-19}}
+=1.293\times10^{7}\ \text{V}^{-1}\text{cm}^{-1}.
+\]
+\[
+\frac{N_A+N_D}{N_A N_D}= \frac{1.1\times10^{16}}{1\times10^{31}} =1.1\times10^{-15}\ \text{cm}^{3}.
+\]
+Multiply:
+\[
+1.293\times10^{7}\times1.1\times10^{-15}\times1.25
+= 1.777\times10^{-8}\ \text{cm}^{2}.
+\]
+\[
+W = \sqrt{1.777\times10^{-8}}\ \text{cm}=1.33\times10^{-4}\ \text{cm}=1.33\ \mu\text{m}.
+\]
 
-Compare this to copper: $n_{\text{Cu}} \approx 8.5 \times 10^{22}\ \text{cm}^{-3}$. Pure silicon has roughly $10^{12}$ times fewer free carriers than copper. This is why it is useless as either a conductor or a controllable switch in its intrinsic state.
+**Result** – The depletion region extends approximately **1.3 µm** into the silicon, with about 90 % on the lightly doped p‑side (\(x_p\approx1.2\ \mu\text{m}\), \(x_n\approx0.13\ \mu\text{m}\)).
 
-The temperature dependence of $n_i$ is exponential in the band gap:
+---
 
-$$n_i(T) = \sqrt{N_c N_v}\, \exp\!\left(-\frac{E_g}{2k_B T}\right)$$
+### Example 2: Forward Current of a Si p‑n Diode
+**Given** (same diode as above, junction area \(A = 1\times10^{-4}\ \text{cm}^2\)):
+- Electron diffusion coefficient \(D_n = 25\ \text{cm}^2/\text{s}\)
+- Hole diffusion coefficient \(D_p = 10\ \text{cm}^2/\text{s}
+- Electron lifetime \(\tau_n = 1\ \mu\text{s}\) → \(L_n = \sqrt{D_n\tau_n}= \sqrt{25\times10^{-6}}=5\times10^{-3}\ \text{cm}=50\ \mu\text{m}\)
+- Hole lifetime \(\tau_p = 0.5\ \mu\text{s}\) → \(L_p = \sqrt{10\times0.5\times10^{-6}}=2.24\times10^{-3}\ \text{cm}=22.4\ \mu\text{m}\)
 
-where $N_c$ and $N_v$ are the effective density of states in the conduction and valence bands. This exponential sensitivity means a 10 °C temperature rise approximately doubles $n_i$, which matters for leakage current in real devices.
+**Step 1 – Equilibrium minority concentrations**
+\[
+n_{p0}= \frac{n_i^2}{N_A}= \frac{(1\times10^{10})^2}{1\times10^{15}}=1\times10^{5}\ \text{cm}^{-3},
+\]
+\[
+p_{n0}= \frac{n_i^2}{N_D}= \frac{(1\times10^{10})^2}{1\times10^{16}}=1\times10^{4}\ \text{cm}^{-3}.
+\]
 
-### Extrinsic Semiconductors and Doping
+**Step 2 – Saturation current**
+\[
+I_s = qA\!\left(\frac{D_n p_{n0}}{L_n} + \frac{D_p n_{p0}}{L_p}\right).
+\]
+First term:
+\[
+\frac{D_n p_{n0}}{L_n}= \frac{25\times1\times10^{4}}{5\times10^{-3}}
+= \frac{2.5\times10^{5}}{5\times10^{-3}}=5.0\times10^{7}\ \text{cm}^{-2}\!\text{s}^{-1}.
+\]
+Second term:
+\[
+\frac{D_p n_{p0}}{L_p}= \frac{10\times1\times10^{5}}{2.24\times10^{-3}}
+= \frac{1.0\times10^{6}}{2.24\times10^{-3}}=4.46\times10^{8}\ \text{cm}^{-2}\!\text{s}^{-1}.
+\]
+Sum ≈ \(4.96\times10^{8}\ \text{cm}^{-2}\!\text{s}^{-1}\).
 
-Doping introduces impurity atoms to break the $n = p$ symmetry, making one carrier type dominate.
+Now
+\[
+I_s = (1.602\times10^{-19}\ \text{C})(1\times10^{-4}\ \text{cm}^2)(4.96\times10^{8})
+= 7.95\times10^{-15}\ \text{A}\approx 8\ \text{fA}.
+\]
 
-**N-type:** Substitute Group V atoms (phosphorus, arsenic) into the Si lattice. Phosphorus brings five valence electrons; four participate in covalent bonds, and the fifth sits in a shallow donor level just $\sim 0.045\ \text{eV}$ below the conduction band — compared to $1.1\ \text{eV}$ for the band gap. At 300 K, $k_B T \approx 0.026\ \text{eV}$, so virtually all donor atoms are ionized, each contributing a free electron without creating a hole. The ionized donor ($\text{P}^+$) is fixed in the lattice and cannot move.
+**Step 3 – Forward current at \(V=0.6\text{ V}\)**
+Thermal voltage \(V_T = kT/q = 0.02585\ \text{V}\). Assuming an ideality factor \(n=1\):
+\[
+I = I_s\!\left(e^{V/V_T}-1\right)
+= 8\times10^{-15}\!\left(e^{0.6/0.02585}-1\right)
+\approx 8\times10^{-15}\!\left(e^{23.2}-1\right)
+\approx 8\times10^{-15}\times1.2\times10^{10}
+\approx 9.6\times10^{-5}\ \text{A}=96\ \mu\text{A}.
+\]
 
-**P-type:** Substitute Group III atoms (boron). Boron's three valence electrons leave an incomplete bond — a shallow acceptor level just above the valence band ($\sim 0.045\ \text{eV}$). At room temperature, valence electrons are readily promoted into this level, leaving mobile holes behind.
+**Result** – With the chosen parameters the diode conducts roughly **100 µA** at 0.6 V forward bias. (If a larger area or higher doping were used, the current would scale accordingly.)
 
-Typical doping concentrations range from $10^{14}$ to $10^{20}\ \text{cm}^{-3}$, which overwhelms $n_i$ by 4–10 orders of magnitude. The majority carrier concentration equals the dopant concentration to excellent approximation:
+---
 
-$$n \approx N_D \quad \text{(n-type)}, \qquad p \approx N_A \quad \text{(p-type)}$$
+## Common Mistakes
+| # | Mistake | Why It’s Wrong | Correct Understanding |
+|---|---------|----------------|-----------------------|
+| 1 | **Assuming drift and diffusion currents always add** (same sign) | Electrons are negative; drift current \(J_n = q\mu_n nE\) points opposite to the electric field, while diffusion \(J_n = qD_n\nabla n\) points down the concentration gradient. In a p‑n junction under equilibrium the two cancel exactly. | Write the full drift‑diffusion expression and evaluate signs for each region; remember that \(q\) carries the carrier sign. |
+| 2 | **Treating mobility as a constant independent of doping** | Ionized impurity scattering increases with dopant concentration, reducing \(\mu\). At \(N_D > 10^{18}\text{ cm}^{-3}\) electron mobility in Si can drop below 100 cm²/V·s. | Use empirical models (e.g., Caughey‑Thomas) or consult mobility vs. doping charts when calculating currents or resistances. |
+| 3 | **Neglecting recombination in the depletion region** (assuming ideal diode equation holds for all bias) | Under high forward bias or in wide‑gap materials, Shockley‑Read‑Hall (SRH) recombination inside the space‑charge region becomes significant, raising the ideality factor to \(n\approx2\). | Include an SRH term \(U_{SRH}\) in the continuity equation or use the diode equation with \(n=2\) when appropriate. |
+| 4 | **Using the low‑level injection approximation when the injected carrier density approaches the doping density** | When \(\Delta n \approx N_D\) (or \(\Delta p \approx N_A\)), the majority carrier concentration is no longer essentially constant, invalidating simple linear diffusion solutions. | Solve the full ambipolar diffusion equation or perform numerical simulation for high‑level injection. |
+| 5 | **Assuming the thermal voltage \(V_T\) is always 25 mV** | \(V_T = kT/q\) varies linearly with temperature; at 400 K it is ≈34 mV, affecting exponential terms in the diode equation. | Keep \(V_T\) as a variable or compute it from the actual temperature in any calculation. |
 
-The minority carrier concentration follows from the **law of mass action**, which holds at thermal equilibrium because carrier generation and recombination rates must balance:
+---
 
-$$np = n_i^2$$
+## Exercises
+### Easy
+1. **Intrinsic concentration** – Calculate \(n_i\) for germanium at 300 K given \(E_g=0.66\text{ eV}\), \(m_n^*=0.55m_0\), \(m_p^*=0.37m_0\). Use \(N_c = 2\left(\frac{2\pi m_n^* kT}{h^2}\right)^{3/2}\) and similarly for \(N_v\).  
+2. **Mobility from scattering** – If the mean free time for electrons in Si is \(\tau = 0.1\ \text{ps}\) and \(m_n^* = 0.26m_0\), compute the mobility \(\mu_n\).
 
-So in n-type silicon with $N_D = 10^{16}\ \text{cm}^{-3}$:
+### Medium
+3. **Built‑in potential** – Derive the expression for \(V_{bi}\) starting from the condition \(E_{F_n}=E_{F_p}\) after junction formation, showing each algebraic step.  
+4. **Depletion width vs. reverse bias** – For a Si junction with \(N_A=5\times10^{15}\text{ cm}^{-3}\), \(N_D=5\times10^{16}\text{ cm}^{-3}\), plot \(W(V_R)\) for \(V_R = 0\) to \(20\text{ V}\). (You may use Python or MATLAB; include the code.)
 
-$$p = \frac{n_i^2}{N_D} = \frac{(1.5 \times 10^{10})^2}{10^{16}} = 2.25 \times 10^4\ \text{cm}^{-3}$$
+### Hard
+5. **Extracting ideality factor** – Measure the forward I‑V curve of a diode (you can use a simple bench setup). Fit the data to \(I = I_s(e^{V/(nV_T)}-1)\) to obtain \(n\) and \(I_s\). Discuss what a value \(n>1\) reveals about recombination mechanisms.  
+6. **Mini kernel module** – Write a loadable kernel module that maps a PCI BAR of a dummy device (e.g., using `pci_get_device`) with `ioremap`, reads a 32‑bit register, and prints its value via `pr_info`. Provide the Makefile and insertion/removal commands.
 
-Doping with donors suppresses hole concentration by twelve orders of magnitude. This asymmetry is exactly what gives a p-n junction its rectifying behavior.
+---
 
-### Drift
+## Linux Connection
+Semiconductor physics appears everywhere in the Linux kernel, from low‑level device drivers to performance‑critical subsystems. Below are concrete ways to observe and interact with semiconductor‑derived concepts.
 
-An applied electric field $\mathcal{E}$ exerts force $q\mathcal{E}$ on free carriers. Electrons accelerate opposite to $\mathcal{E}$; holes accelerate along $\mathcal{E}$. But carriers do not accelerate indefinitely — they scatter off lattice vibrations (phonons) and ionized impurity atoms at a mean interval $\tau$ (the **mean free time**). Each collision randomizes momentum, so the carrier starts fresh and re-accelerates. The average velocity gained between collisions is:
+### 1. Inspecting Hardware Exposed by Semiconductor Devices
+```bash
+# List all PCI devices and their kernel drivers
+lspci -nnk | grep -E 'VGA|3D|Audio|Ethernet' -A2
 
-$$v_d = \frac{q\mathcal{E}}{m^*}\tau = \mu\mathcal{E}$$
-
-where $\mu = q\tau/m^*$ is the **carrier mobility** ($\text{cm}^2/\text{V·s}$). This is structurally the same as terminal velocity under drag: the field accelerates, scattering dissipates, and a steady state emerges.
-
-In silicon at 300 K:
-
-| Carrier | Mobility | Reason for difference |
-|---------|----------|-----------------------|
-| Electron | $\mu_n \approx 1400\ \text{cm}^2/\text{V·s}$ | Lower effective mass $m^*$ |
-| Hole | $\mu_p \approx 450\ \text{cm}^2/\text{V·s}$ | Higher effective mass, complex valence band |
-
-Mobility degrades with temperature (more phonon scattering, $\mu \propto T^{-3/2}$) and with doping concentration (more ionized impurity scattering). This is why heavily doped silicon has lower electron mobility than lightly doped silicon — relevant when sizing resistive poly-silicon structures in CMOS.
-
-The total **drift current density** sums both carrier contributions:
-
-$$J_{\text{drift}} = (nq\mu_n + pq\mu_p)\mathcal{E} = \sigma\mathcal{E}$$
-
-This is Ohm's Law derived from first principles. The conductivity $\sigma = nq\mu_n + pq\mu_p$ is controllable over many orders of magnitude by adjusting $n$ and $p$ through doping — the fundamental reason silicon is useful.
-
-### Diffusion
-
-Carriers also move in response to **concentration gradients**, with no electric field required. Random thermal motion is isotropic, but if more carriers exist on the left than the right, more random steps cross the boundary leftward-to-rightward than the reverse. The net flux is down the gradient — diffusion.
-
-The diffusion current densities are:
-
-$$J_n^{\text{diff}} = qD_n \frac{dn}{dx}, \qquad J_p^{\text{diff}} = -qD_p \frac{dp}{dx}$$
-
-The sign difference: electrons diffusing down a concentration gradient (positive $dn/dx$ meaning carriers move in $-x$) produce a current in $+x$ because current is defined opposite to electron flow. Holes diffusing down their gradient produce current in the same direction as their motion.
-
-Mobility and diffusion coefficient are not independent. At equilibrium, zero net current flows, so drift and diffusion must exactly cancel everywhere. Applying this condition to the equilibrium carrier distribution (which follows a Boltzmann exponential in the electrostatic potential) yields the **Einstein relation**:
-
-$$\frac{D_n}{\mu_n} = \frac{D_p}{\mu_p} = \frac{k_B T}{q} \equiv V_T$$
-
-At 300 K, the **thermal voltage** $V_T \approx 25.85\ \text{mV}$. This is not an empirical fit — it is forced by thermodynamics. Any model where this relation is violated predicts spontaneous current flow at equilibrium, violating the second law.
-
-Practical values: $D_n \approx 36\ \text{cm}^2/\text{s}$, $D_p \approx 12\ \text{cm}^2/\text{s}$ in lightly doped silicon at 300 K.
-
-### The P-N Junction
-
-Bring p-type and n-type silicon into metallurgical contact. The steep concentration gradient at the interface drives immediate diffusion:
-
-- Electrons diffuse from n → p (high $n$ to low $n$)
-- Holes diffuse from p → n (high $p$ to low $p$)
-
-As electrons vacate the n-side near the junction, they leave behind positively charged, immobile donor ions ($\text{P}^+$, $\text{As}^+$). As holes vacate the p-side, they expose negatively charged acceptor ions ($\text{B}^-$). A region forms near the junction that is depleted of free carriers — the **depletion region** — containing only fixed ionic charge.
-
-This fixed charge distribution creates an electric field $\mathcal{E}$ pointing from the positive charge on the n-side to the negative charge on the p-side (n→p direction). This field drives drift currents that oppose the diffusion:
-
-- Drift pushes electrons back toward n (field opposes diffusion)
-- Drift pushes holes back toward p
-
-Equilibrium is reached when drift current density exactly equals diffusion current density for each carrier species separately (not just in total). The junction reaches a steady state with a **built-in electric field** but zero net current.
-
-### The Depletion Region and Built-in Potential
-
-The built-in potential $V_{bi}$ is the electrostatic potential difference across the depletion region at equilibrium. It can be derived directly from the Einstein relation and the requirement of zero net current:
+# Example output (truncated):
+# 00:02.0 VGA compatible controller [0300]: Intel Corporation UHD Graphics 630 [8086:5912] (rev 02)
+#     Subsystem: Lenovo Device [17aa:225e]
+#     Kernel driver in use: i915
+#     Kernel modules: i915
+```
+The `i915` driver is the DRM (Direct Rendering Module) driver for Intel

@@ -10,126 +10,254 @@ resources:
     title: "Unix Network Programming (Stevens)"
 ---
 
-## Why This Matters
-
-Distributed systems fail non-uniformly. A process can crash cleanly, silently stop responding, lose network reachability while remaining healthy, or fail in one subsystem while others continue. Treating these as equivalent produces software that either hangs indefinitely on a dead peer, tears down connections that would have recovered, or holds connections whose intermediate path has been silently invalidated. TCP is built around specific assumptions about which failure modes it can detect — and the gap between what TCP *believes* and what *is* explains a large class of production incidents.
-
----
-
 ## Core Concepts
+### Failure Models in Networked Systems
+A failure model abstracts how a system’s internal state deviates from its specification when a fault occurs. In the context of TCP, the relevant state includes:
+* **Sequence numbers** (`SND.UNA`, `SND.NXT`, `RCV.NXT`)
+* **Timer states** (retransmission timer, keepalive timer, persistence timer)
+* **Connection‑control flags** (SYN, FIN, RST, ACK)
 
-### Crash Failure
+Each model describes a distinct class of state corruption.
 
-A process or host stops executing and produces no further output. From a remote peer, a crash is initially **indistinguishable from silence**: TCP has no out-of-band channel through which the kernel learns that a peer has crashed. The only signal available is the *absence* of responses over time, which is epistemologically identical to the network being slow or partitioned.
+#### Crash Failure (Fail‑Stop)
+A crash failure removes all local state atomically. The process ceases to execute; any in‑kernel socket buffers are released by the kernel’s `skb_free` path when the file descriptor table is torn down. From the peer’s viewpoint, the connection appears to have vanished: no ACKs, no RST, and the socket transitions to `TCP_CLOSE_WAIT` → `TCP_LAST_ACK` only if the peer attempts to close.
 
-A clean crash on a local machine does produce a signal: the kernel sends a `FIN` on behalf of the dying process as it closes the socket during process teardown. What it cannot do is send a `FIN` after a power failure, kernel panic, or OOM kill that happens before the socket is closed — in those cases, the remote peer receives nothing.
+#### Omission Failure (Fail‑Silent)
+An omission failure leaves the process alive but prevents a specific action, most commonly the transmission of a required packet. The kernel still holds the socket, timers continue to run, and the local state machine progresses only insofar as events are received. The peer experiences missing ACKs or data segments, triggering retransmission logic.
 
-### Omission Failure
+#### Partition Failure
+A partition failure isolates sets of nodes such that no packet can cross the cut. Both endpoints retain their local state, but the inter‑partition link delivers zero packets. The connection remains in `TCP_ESTABLISHED` on both sides until retransmission timers expire, at which point each side aborts independently.
 
-A process or network element fails to deliver some messages but keeps running. A lossy link is an omission failure. TCP's retransmission machinery tolerates transient omission: a lost segment triggers a retransmit and is not treated as fatal. The problem is *sustained total omission* — at some retransmission threshold, TCP cannot distinguish "segment lost, retransmit" from "peer gone." The retransmission backoff schedule is what defines that threshold in practice.
+#### Partial Failure
+A partial failure corrupts a subset of the protocol’s functions while leaving others intact. Examples include:
+* **Zero‑window syndrome** – the application can receive data (read() succeeds) but never calls `write()` or `send()`, causing the advertised window to shrink to zero.
+* **Selective ACK loss** – the receiver generates ACKs but the sender’s ACK‑processing code is buggy, so SACK blocks are ignored.
 
-### Partition Failure (Network Partition)
+Partial failures are detectable only by observing asymmetric progress (e.g., flow‑control updates in one direction but not the other).
 
-Both endpoints are healthy and running, but the network path between them is severed. Neither side can reach the other. This is the most dangerous failure mode for distributed state because both sides retain what they believe to be a valid, `ESTABLISHED` connection — the state at the two endpoints becomes **inconsistent**. A partition is invisible to TCP unless something generates traffic. A partition that resolves within the idle timeout leaves no trace.
+### Fate Sharing
+Fate sharing is a design principle: **store all state required to recover a communication association at the endpoints that create the association**.  
+*Why?* If state were stored in intermediate network elements (routers, switches), a failure of those elements would destroy the state and prevent recovery, even if the endpoints are still alive. By contrast, endpoint‑resident state survives as long as at least one endpoint remains operational, allowing the connection to be resumed after transient network faults.
 
-### Partial Failure
-
-A system fails in a way that affects some components but not others: a NIC that passes traffic asymmetrically, a server reachable on one port but not another, a userspace daemon that has crashed while the kernel is running, or a NAT router that has silently expired a flow entry while both endpoints believe the connection is alive. Partial failures are the most common class of real-world failure and the hardest to detect, because neither endpoint's health checks report a problem.
-
----
+In TCP, the association state (sequence numbers, timers, socket buffers) lives entirely in the socket structures allocated by `inet_csk_alloc_sock`. The network merely transports segments; it never stores connection‑specific data.
 
 ## How It Works
+### Interaction of Failure Models and Fate Sharing in TCP
+TCP’s reliability mechanisms are derived directly from the failure models:
 
-### What TCP Can and Cannot Detect
+| Failure Model | Detection Mechanism (fate‑sharing) | Recovery Action |
+|---------------|-----------------------------------|-----------------|
+| Crash         | Missing keepalive ACKs → retransmission timeout → RST | Abort connection, notify application via `ECONNRESET` |
+| Omission      | Missing data ACKs → retransmission timer exponential backoff → duplicate ACKs → fast retransmit | Resend missing segment(s) |
+| Partition     | Symmetric loss of ACKs → both sides exceed retransmission retry limit → abort | Connection fails on both ends |
+| Partial       | Asymmetric flow‑control (e.g., zero window) → persistence timer probes → application‑level timeout | Application may close or trigger error handling |
 
-By default, TCP has no heartbeat. A connection can remain `ESTABLISHED` in the kernel socket table indefinitely with no data exchanged, consuming a file descriptor, memory for send/receive buffers, and an entry in the conntrack table — while the peer is dead and has been for hours.
+The keepalive mechanism is an *application‑level* heartbeat that leverages fate sharing: the endpoint sends a probe segment with no payload; the peer must reflect it with an ACK if the TCP stack is alive. Because the probe contains no application data, it does not interfere with normal data flow but still tests liveness.
 
-When a keepalive probe is sent, exactly four states are distinguishable:
+#### Keepalive Timing Derivation
+Linux exposes three sysctl variables:
 
-| State | What happens |
-|---|---|
-| Peer alive, path intact | Probe is ACKed; connection confirmed live |
-| Peer crashed | No response; a dead machine cannot send RST |
-| Peer crashed, rebooted, lost state | Reboot causes peer's stack to RST the probe (unknown connection) |
-| Peer alive, path partitioned | No response arrives |
+* `$t_{idle}$` – `net.ipv4.tcp_keepalive_time` (seconds of inactivity before first probe)  
+* `$t_{intvl}$` – `net.ipv4.tcp_keepalive_intvl` (seconds between probes)  
+* `$N_{probe}$` – `net.ipv4.tcp_keepalive_probes` (number of unanswered probes before abort)
 
-**States 2 and 4 are identical from TCP's perspective.** This is not a bug — it is a fundamental epistemological limit. TCP operates on segment exchange; if no segment arrives, it cannot determine *why*. Any keepalive scheme inherits this limit.
+The worst‑case detection time `$T_{det}$` for a crashed peer is:
 
-### Keepalive Mechanics
+$$
+T_{det} = t_{idle} + N_{probe} \cdot t_{intvl}
+$$
 
-When `SO_KEEPALIVE` is set, the kernel sends probe segments after the connection has been idle for `tcp_keepalive_time` seconds. The probe uses a sequence number equal to `SND.NXT - 1` — one below the current send window. This is deliberately outside the valid window: a live peer's TCP stack must respond with an ACK (to correct the sequence number), but the probe consumes no sequence space and delivers no data.
+*Derivation*: After `$t_{idle}$` seconds of silence, the first probe is sent. If the peer is dead, each probe elicits no ACK; after `$N_{probe}$` consecutive failures, the kernel aborts the connection and returns `ETIMEDOUT` to any pending `send()`.
 
-If the peer does not ACK, the kernel retransmits at `tcp_keepalive_intvl` intervals up to `tcp_keepalive_probes` times, then closes the connection and delivers `ETIMEDOUT` to the application.
+Example values (default on many distros):
+* `$t_{idle}=7200\ \text{s}$` (2 h)
+* `$t_{intvl}=75\ \text{s}$`
+* `$N_{probe}=9$`
 
-The total failure detection time is:
+$$
+T_{det}=7200 + 9 \times 75 = 7200 + 675 = 7875\ \text{s} \approx 2\ \text{h}\ 11\ \text{m}\ 15\ \text{s}
+$$
 
-$$t_{\text{fail}} = t_{\text{idle}} + (n_{\text{probes}} \times t_{\text{interval}})$$
+### Retransmission Timeout (RTO) Computation
+TCP’s omission/retransmission logic relies on the Jacobson/Karels algorithm:
 
-With Linux defaults — `tcp_keepalive_time` = 7200 s, `tcp_keepalive_probes` = 9, `tcp_keepalive_intvl` = 75 s:
+$$
+\begin{aligned}
+\text{RTT}_{\text{sample}} &= T_{\text{ack}} - T_{\text{send}} \\
+\text{SRTT} &\leftarrow (1 - \alpha) \cdot \text{SRTT} + \alpha \cdot \text{RTT}_{\text{sample}} \\
+\text{RTTVAR} &\leftarrow (1 - \beta) \cdot \text{RTTVAR} + \beta \cdot |\text{RTT}_{\text{sample}} - \text{SRTT}| \\
+\text{RTO} &\leftarrow \text{SRTT} + 4 \cdot \text{RTTVAR}
+\end{aligned}
+$$
 
-$$t_{\text{fail}} = 7200 + (9 \times 75) = 7875\text{ s} \approx 2.19\text{ hours}$$
+with $\alpha = 1/8$, $\beta = 1/4$. The RTO is clamped between `$tcp\_rto\_min$` (typically 200 ms) and `$tcp\_rto\_max$` (typically 120 s). After each timeout, the delay doubles (exponential backoff) up to `$tcp\_retries2$` attempts (default 15), yielding a total abort time of roughly 13‑30 minutes depending on the initial RTO.
 
-This means a connection to a crashed peer holds a file descriptor, socket buffers, and any associated application state for over two hours before the kernel gives up.
+## Worked Examples
+### Example 1: Crash Failure Detection via Keepalive
+**Scenario**: Client `C` and server `S` maintain an idle TCP connection. `S` crashes abruptly (power loss).  
 
-### The Partition Hazard
+**Step‑by‑step**:
+1. `C` has not sent data for `$t_{idle}=7200$` s. Kernel triggers the keepalive timer.
+2. First keepalive probe: `C` sends a segment with `SEQ=SND.UNA`, no payload, `ACK` flag set.
+3. `S` is down → no response. Keepalive timer rearms after `$t_{intvl}=75$` s.
+4. After `$N_{probe}=9$` probes (total elapsed `$T_{det}=7875$` s), kernel aborts the socket:
+   * `tcp_write_timeout()` calls `inet_csk_clear_xmit_timer()`.
+   * `sk->sk_err = ETIMEDOUT`; error queue receives the error.
+   * Any blocking `read()`/`write()` returns `-1` with `errno = ETIMEDOUT`.
+5. As part of abort, TCP transmits a **RST** segment (if the socket is still in `ESTABLISHED` state) to inform the peer’s IP stack that the connection is no longer valid.
 
-Keepalives solve crash detection but introduce a new failure sensitivity. Suppose a router between client and server crashes and reboots in 45 seconds. If keepalive probes are in flight during that window, the client receives no ACKs. After $n_{\text{probes}}$ failures, TCP closes the connection and delivers `ETIMEDOUT` — even though the server is alive and the network has recovered.
+**Experimental verification**:
+```bash
+# Terminal 1: start a simple echo server
+$ nc -l -p 8080 &
+# Terminal 2: connect client and enable keepalive
+$ ./client 127.0.0.1 8080   # client sets SO_KEEPALIVE via setsockopt
+# In another terminal, kill the server after 30s of idle
+$ kill %1
+# Observe client side:
+$ ss -ti state established '( dport = :8080 )'
+```
+The `ss` output will show `timer:(keepalive,7200ms,0)` changing to `timer:(keepalive,75ms,8)` after the first probe, eventually transitioning to `timer:(off,0,0)` and the socket disappearing.
 
-This is a **false positive**: keepalives distinguish "dead peer" from "alive peer" only when the network is stable. When the network itself is the thing that failed transiently, keepalives incorrectly classify a live peer as dead. Stevens (TCP/IP Illustrated, Vol. 1, §23.5) notes explicitly that the keepalive feature *can cause an otherwise good connection to be terminated because of a temporary loss of connectivity*. The tradeoff is: shorter keepalive timers detect crashes faster and produce more false positives on flaky networks; longer timers tolerate partitions better and hold dead connections longer.
+### Example 2: Omission Failure and Retransmission Backoff
+**Scenario**: Server application correctly receives data but fails to call `send()` for the ACK (bug in application logic).  
 
-### Partial Failure: NAT State Expiry
+**Step‑by‑step**:
+1. Client sends segment with `SEQ=1000`, `LEN=200`. Kernel places data in send buffer, starts retransmission timer with initial RTO `$RTO_0 = 1$ s` (default `tcp_rto_min` after RTT estimation).
+2. Server’s TCP layer receives segment, sends ACK (`ACK=1200`). Application never reads the ACK from its socket buffer, so the ACK is never transmitted to the network (omission).
+3. Client does not see ACK → retransmission timer expires after `$RTO_0$`. Kernel retransmits the same segment, doubles the timer (`$RTO_1 = 2$ s`), increments retry counter.
+4. This repeats: after `$n$` timeouts, `$RTO_n = 2^n$ s` (capped at `$tcp\_rto\_max$ = 120$ s). The kernel continues until `$tcp\_retries2$` (default 15) attempts are exhausted.
+5. After the final timeout, the connection is aborted with `ETIMEDOUT`. The server, still believing the data was sent, may have buffered the data internally; its socket remains in `ESTABLISHED` until the application closes it or receives the RST from the client.
 
-A client opens an SSH session through a NAT router, works, then leaves the terminal idle. The NAT router maintains a state table mapping `(client_ip, client_port, server_ip, server_port)` to the router's external address. That entry has an idle timeout — commonly 5–30 minutes for TCP, often shorter in cloud environments and home routers.
+**Numerical example**:
+* Initial RTO = 1 s, backoff factor 2, max 120 s, max attempts = 8 (for illustration).
+* Sequence of timeouts: 1, 2, 4, 8, 16, 32, 64, 120 s → cumulative ≈ 243 s (≈4 min) before abort.
 
-After the timeout, the NAT entry is silently deleted. Now:
+**Verification**:
+```bash
+# Terminal 1: run a server that reads but never ACKs
+$ ./omitack_server 8080 &
+# Terminal 2: client that sends a single packet and waits for reply
+$ ./client 127.0.0.1 8080 <<< "ping"
+# Use tcpdump to see retransmissions:
+$ sudo tcpdump -i lo -nn -s 0 -v 'tcp[tcpflags] & (tcp-syn|tcp-fin|tcp-rst) != 0 or tcp[13] == 0x10'
+```
+You will observe the client retransmitting the same packet with increasing intervals.
 
-- Client kernel: socket is `ESTABLISHED`
-- Server kernel: socket is `ESTABLISHED`
-- NAT router: **no record of this connection**
+### Example 3: Partition Failure and Symmetric Abort
+**Scenario**: Two hosts, `A` and `B`, are connected via a router. An administrator inserts an iptables rule that drops all packets between them.
 
-Any packet from either end traverses the router and is either dropped or generates an ICMP port-unreachable. Neither TCP stack knows anything is wrong until it sends data — at which point the sender gets no ACK and begins retransmitting. If the NAT entry is truly gone, it will never recover unless the client initiates a new connection. SSH's `ServerAliveInterval` and TCP keepalives both exist to force periodic traffic through the NAT before the state entry expires — they keep the NAT table alive as a side effect of crash detection.
+**Step‑by‑step**:
+1. TCP connection established (`SYN/SYN-ACK/ACK`). Both sides enter `ESTABLISHED`.
+2. No application traffic; after `$t_{idle}$`, keepalive probes start.
+3. Each keepalive probe is dropped by the router → no ACK returned.
+4. After `$N_{probe}$` failed keepalives, each side aborts locally (`ETIMEDOUT`) and sends a RST (if the socket is still open). The RST is also dropped, so each side sees only its own abort.
+5. End result: both sockets transition to `CLOSED` without ever observing the peer’s RST.
 
-The keepalive must fire before the NAT timeout. If $t_{\text{idle}} > t_{\text{NAT}}$, the NAT drops the entry before the first probe is sent, and the keepalive accomplishes nothing. This is why cloud deployments often require $t_{\text{idle}} \leq 60\text{ s}$ regardless of other considerations.
+**Experimental setup using network namespaces**:
+```bash
+# Create two namespaces linked by a veth pair
+$ sudo ip netns add nsA
+$ sudo ip netns add nsB
+$ sudo ip link add vethA type veth peer name vethB
+$ sudo ip link set vethA netns nsA
+$ sudo ip link set vethB netns nsB
+$ sudo ip netns exec nsA ip addr add 10.0.0.1/24 dev vethA
+$ sudo ip netns exec nsB ip addr add 10.0.0.2/24 dev vethB
+$ sudo ip netns exec nsA ip link set vethA up
+$ sudo ip netns exec nsB ip link set vethB up
 
----
+# Start server in nsB, client in nsA
+$ sudo ip netns exec nsB nc -l -p 8080 &
+$ sudo ip netns exec nsA nc 10.0.0.2 8080
+
+# Introduce partition: drop all traffic between the veths
+$ sudo iptables -A FORWARD -i vethA -o vethb -j DROP
+$ sudo iptables -A FORWARD -i vethb -o vethA -j DROP
+
+# Observe with ss inside each namespace
+$ sudo ip netns exec nsA ss -ti state established '( dport = :8080 )'
+$ sudo ip netns exec nsB ss -ti state established '( sport = :8080 )'
+```
+After `$T_{det}$` seconds, both `ss` outputs will show the socket gone.
+
+### Example 4: Partial Failure – Zero‑Window Condition
+**Scenario**: Server’s application calls `read()` but never consumes data; the advertised receive window shrinks to zero.
+
+**Step‑by‑step**:
+1. Client sends data; server’s TCP layer accepts it, increments `RCV.NXT`, and sends an ACK with `window=0`.
+2. Client’s sender receives zero‑window ACK → invokes **persistence timer** (default `$tcp\_keepalive\_intvl$`‑based, but specifically `$tcp\_persist\_min$` = 5 s, doubling up to `$tcp\_persist\_max$` = 120 s).
+3. Persistence timer triggers a **window probe**: a single‑byte segment (`SEQ=SND.UNA`) is sent to elicit a window update.
+4. Application still not reading → window remains zero; probe elicits another zero‑window ACK.
+5. Timer backs off exponentially (5 s, 10 s, 20 s, 40 s, 80 s, 120 s, then stays at 120 s). After `$tcp\_retries2$` probes (default 15), the connection is aborted with `ETIMEDOUT`.
+
+**Code to probe the condition**:
+```c
+/* server side – deliberately do not read */
+int conn = accept(listenfd, (struct sockaddr *)&cli, &len);
+while (1) {
+    /* intentionally block on select() without reading */
+    select(conn+1, &(fd_set){ .fds_bits[0] = 1 << (conn % __NFDBITS) }, NULL, NULL, NULL);
+}
+```
+Client side can monitor the send queue growth via `/proc/<pid>/net/tcp` or `ss -i`.
+
+## Common Mistakes
+| Mistake | Why It’s Wrong | Correct Understanding |
+|---------|----------------|-----------------------|
+| **Confusing crash vs omission** | Both manifest as missing ACKs, but crash removes *all* state (process gone), while omission leaves the endpoint alive and timers running. | Crash → RST after keepalive failure; omission → retransmission backoff until RTO limit. |
+| **Assuming TCP keepalive probes are application‑level messages** | Keepalive probes are generated by the kernel TCP stack, not by the application; they contain no payload and are ACK‑only. | Application must enable `SO_KEEPALIVE`; the kernel decides when to send probes based on idle time. |
+| **Believing that setting `net.ipv4.tcp_keepalive_time` alone guarantees failure detection** | Detection also depends on `tcp_keepalive_intvl` and `tcp_keepalive_probes`; if probes are unanswered, the connection may persist indefinitely if the count is zero. | All three sysctls must be tuned together; `T_detect = keepalive_time + keepalive_intvl * keepalive_probes`. |
+| **Thinking that `tcp_retries2` controls keepalive retries** | `tcp_retries2` governs retransmission timeout attempts for *data* segments; keepalive uses a separate internal counter derived from `tcp_keepalive_probes`. | Adjust `tcp_keepalive_probes` to change keepalive retry count. |
+| **Using `tcpdump` without filtering for keepalive packets and missing them in high‑traffic traces** | Keepalive probes are small (typically 1‑byte payload, ACK flag) and can be lost in a flood of data packets. | Filter with `tcp[13] == 0x10` (pure ACK) and optionally `tcp[offset] == 0` to capture zero‑length ACKs. |
+| **Assuming a zero window always indicates a bug** | A zero window is legitimate when the receiver’s application is temporarily busy (e.g., waiting for I/O). | Persistence timer is designed to probe the window; only if the window stays zero after retries does it signal a failure. |
+
+## Exercises
+### Easy
+1. **Get and print current TCP keepalive parameters**  
+   Write a C program that calls `getsockopt(fd, IPPROTO_TCP, TCP_KEEPIDLE, …)` etc., and prints the values in seconds. Verify against `/proc/sys/net/ipv4/tcp_keepalive_*`.
+
+2. **Observe keepalive probes with `tcpdump`**  
+   Start an idle `nc` listener, connect a client, enable `SO_KEEPALIVE`, and run:
+   ```bash
+   sudo tcpdump -i any -nn -s 0 -v 'tcp[13] == 0x10 && tcp[20:2] == 0'
+   ```
+   Explain the output fields (SEQ, ACK, window).
+
+### Medium
+3. **Simulate a crash failure and measure detection time**  
+   - Set `net.ipv4.tcp_keepalive_time=5`, `net.ipv4.tcp_keepalive_intvl=2`, `net.ipv4.tcp_keepalive_probes=3`.  
+   - Start a server, connect a client, then kill the server with `kill -9`.  
+   - Use `ss -ti` to poll the connection state every second and record when the socket disappears. Compare measured delay to the formula $T_{det}$.
+
+4. **Demonstrate exponential backoff for omitted ACKs**  
+   Patch a simple TCP echo server to drop outgoing ACKs (e.g., using `nfqueue` or an `iptables -j DROP` rule on outgoing ACK packets).  
+   Run a client that sends a single 100‑byte segment and use `tcptrace` or Wireshark to plot the inter‑retransmission intervals. Verify they follow 1×, 2×, 4× … up to the configured max.
+
+### Hard
+5. **Create a network partition using namespaces and observe symmetric abort**  
+   Replicate the namespace scenario from Worked Example 3, but also capture the RST attempts with `tcpdump` on the veth interfaces. Show that each side sends a RST but never receives one due to the drop, and both sides independently transition to `CLOSED`.
+
+6. **Inject a partial failure (zero‑window bug) and automate recovery detection**  
+   Write a server that calls `read()` but never consumes data, and a client that streams data at 1 Mbps.  
+   - Use `ss -i` to monitor the sender’s `cwnd` and `send_queue`.  
+   - When the persistence timer triggers, log the interval between window probes.  
+   - After the connection aborts, have the client reconnect with SO_KEEPALIVE enabled and verify that the new connection resumes normal flow.
 
 ## Linux Connection
+### Kernel Subsystems and Data Structures
+* **Socket allocation** – `inet_csk_alloc_sock()` in `net/ipv4/af_inet.c` creates a `struct inet_connection_sock` (`icsk`) embedding a `struct tcp_sock`.  
+* **Keepalive timer** – managed by `icsk->icsk_keepalive_timer`. The function `tcp_keepalive_timer(struct timer_list *t)` (in `net/ipv4/tcp_timer.c`) is invoked when the idle period expires. It:
+  1. Checks `tp->keepalive_probes_sent` vs `tp->keepalive_probes`.  
+  2. Sends a probe via `tcp_write_wakeup(tsk)` → ultimately `tcp_transmit_skb()` with an empty segment (`TCP_FLAG_ACK`).  
+  3. On failure, increments the probe counter and rearms the timer with interval `tp->keepalive_intvl`.  
+  4. On exceeding the probe limit, calls `tcp_write_timeout()` which sets `sk->sk_err = ETIMEDOUT` and triggers `tcp_done()` → socket moves to `CLOSED`.
 
-### Kernel Parameters
+* **Retransmission timer** – `icsk->icsk_retransmit_timer` handler `tcp_retransmit_timer()` (same file) implements the Jacobson/Karels RTO update and exponential backoff.  
+* **Persistence timer** – `icsk->icsk_persist_timer` handler `tcp_persist_timer()` sends zero‑window probes.
 
-Keepalive defaults live in the IPv4 sysctl namespace under `/proc/sys/net/ipv4/` and are managed by the kernel's TCP stack in `net/ipv4/tcp.c` and `net/ipv4/tcp_timer.c`.
-
-```bash
-# Inspect current values
-sysctl net.ipv4.tcp_keepalive_time    # default: 7200
-sysctl net.ipv4.tcp_keepalive_probes  # default: 9
-sysctl net.ipv4.tcp_keepalive_intvl   # default: 75
-
-# Equivalent reads via procfs
-cat /proc/sys/net/ipv4/tcp_keepalive_time
-cat /proc/sys/net/ipv4/tcp_keepalive_probes
-cat /proc/sys/net/ipv4/tcp_keepalive_intvl
-
-# Apply more aggressive values for fast failure detection (runtime, not persistent)
-sudo sysctl -w net.ipv4.tcp_keepalive_time=60
-sudo sysctl -w net.ipv4.tcp_keepalive_probes=3
-sudo sysctl -w net.ipv4.tcp_keepalive_intvl=10
-
-# To persist across reboots, write to /etc/sysctl.d/
-echo "net.ipv4.tcp_keepalive_time = 60"    | sudo tee /etc/sysctl.d/99-keepalive.conf
-echo "net.ipv4.tcp_keepalive_probes = 3"   | sudo tee -a /etc/sysctl.d/99-keepalive.conf
-echo "net.ipv4.tcp_keepalive_intvl = 10"   | sudo tee -a /etc/sysctl.d/99-keepalive.conf
-sudo sysctl -p /etc/sysctl.d/99-keepalive.conf
-```
-
-With these values: $t_{\text{fail}} = 60 + (3 \times 10) = 90\text{ s}$.
-
-These are system-wide defaults that apply to every new socket with `SO_KEEPALIVE` set. Existing sockets are unaffected by sysctl changes.
-
-### Per-Socket Keepalive Configuration
-
-The Linux-specific options `TCP_KEEPIDLE`, `TCP_KEEPINTVL`, and `TCP_KEEPCNT` (defined in `<netinet/tcp.h>`, available since Linux 2.4) override the sysctl defaults on a per-socket basis. The `SOL_SOCKET`-level `SO_KEEPALIVE` must be set first; the `IPPROTO_TCP`-level options only control timing.
-
-```c
-#include <sys/socket.h>
-#include <netinet/tcp
+### Sysctl Interface
+| Variable | Path | Meaning | Units |
+|----------|------|---------|-------|
+| `net.ipv4.tcp_keepalive_time` | `/proc/sys/net/ipv4/tcp_keepalive_time` | `$t_{idle}$` | seconds |
+| `net.ip

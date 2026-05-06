@@ -10,176 +10,313 @@ resources:
     title: "The Linux Programming Interface (Kerrisk)"
 ---
 
-## Why This Matters
-
-When a kernel panic dumps its backtrace over a serial cable at 3 AM, or when `pppd` turns a raw UART into a network link, or when SSH multiplexes dozens of interactive sessions through pseudoterminals — all of that runs through the TTY subsystem. The reason this layer exists isn't abstraction for its own sake: without a swappable line discipline, every protocol that uses serial hardware (PPP, SLIP, Bluetooth HCI, HDLC) would have to be reimplemented inside every UART driver. Without the TTY core managing `termios` state, every application would negotiate baud rates and echo behavior directly with hardware. The TTY layer enforces a contract: drivers speak bytes, line disciplines speak protocol, and applications speak POSIX.
-
----
-
 ## Core Concepts
+### UART as a State Machine
+A UART converts parallel data from the CPU into a serial bit‑stream and vice‑versa. The transmitter holds a **shift register** that is loaded with a byte (plus start/stop bits) and then shifts it out at the programmed baud rate. The receiver samples the incoming line at a rate 16× the baud rate, detects the falling edge of the start bit, and then shifts bits into a register until the expected number of data bits, parity bit, and stop bits have been sampled. If the stop bit is not high, a **framing error** is flagged. This deterministic timing makes the UART a simple synchronous‑looking state machine despite the asynchronous line.
 
-### The Three-Layer Stack
+### Serial Communication Fundamentals
+Asynchronous serial link requires explicit framing because there is no separate clock line. Each character begins with a **start bit** (logic 0) that synchronizes the receiver, followed by 5‑8 data bits, an optional parity bit, and 1‑2 stop bits (logic 1). The line returns to the idle state (logic 1) between characters. The probability of a sampling error grows with baud rate; therefore UARTs typically use 16× oversampling to allow the receiver to locate the bit centre within ±1/32 of a bit‑time, giving a tolerance of about ±3 % before framing errors appear.
 
-Data between a user process and serial hardware passes through three layers with strict boundaries:
+### TTY Layer Abstraction
+The Linux **TTY (Teletype) layer** is a character‑device subsystem that presents a uniform interface (`struct tty_operations`) to drivers, line disciplines, and user‑space programs. It decouples hardware specifics (UART registers, DMA, IRQs) from higher‑level semantics (canonical input, echo, signal generation). A `struct tty_struct` aggregates:
+* a pointer to the **tty driver** (e.g., 8250 UART driver),
+* a **line discipline** (e.g., `n_tty` for canonical processing),
+* termios configuration,
+* read/write buffers,
+* wait queues for blocking I/O.
 
-```
-User process  (read/write on /dev/ttyS0)
-      ↕
-  TTY Core          — file descriptor ownership, session management, signal delivery
-      ↕
-Line Discipline     — data transformation: echo, erase, newline cooking, framing
-      ↕
-  TTY Driver        — hardware register I/O, DMA, interrupt handling
-```
+When a UART driver receives a byte, it places it in the tty’s **receive buffer**; the line discipline then processes the buffer (e.g., stripping start/stop bits, applying parity checks) before making data available to `read()` system calls.
 
-The driver's only job is byte transport. It pushes received bytes into the flip buffer via `tty_insert_flip_char()` and gets bytes to transmit via its `write()` op. It never calls line discipline functions directly — that boundary is enforced by the core. The line discipline never touches hardware — that's enforced by the fact that it only has access to the `tty_struct`, not the driver's private data.
-
-This matters concretely: when `pppd` opens `/dev/ttyS0` and issues:
-
-```c
-int disc = N_PPP;
-ioctl(fd, TIOCSETD, &disc);
-```
-
-…the PPP line discipline replaces `N_TTY` on that UART. The driver doesn't change. The hardware doesn't change. Only the byte-processing layer changes. The same mechanism works for `N_HDLC`, `N_SLIP`, `N_GSM` (multiplexed GSM modems), and `N_BLUETOOTH_HCI`.
-
-### Why Line Disciplines Are Swappable
-
-Line disciplines exist as a separate layer specifically because the set of protocols that run over serial hardware is open-ended. If the discipline were compiled into the driver, adding PPP support would require modifying every UART driver. Instead, a discipline registers itself:
-
-```c
-static struct tty_ldisc_ops ppp_ldisc = {
-    .owner      = THIS_MODULE,
-    .magic      = TTY_LDISC_MAGIC,
-    .name       = "ppp",
-    .open       = ppp_asynctty_open,
-    .close      = ppp_asynctty_close,
-    .read       = ppp_asynctty_read,
-    .write      = ppp_asynctty_write,
-    .receive_buf = ppp_async_input,
-    .write_wakeup = ppp_async_wakeup,
-};
-
-tty_register_ldisc(N_PPP, &ppp_ldisc);
-```
-
-The `receive_buf` hook is what the TTY core calls when the driver delivers bytes upward. The discipline owns all interpretation from that point forward.
-
-You can inspect which discipline is active on a TTY:
-
-```bash
-# Read current line discipline number (0 = N_TTY, 3 = N_PPP, etc.)
-cat /proc/tty/ldiscs
-
-# Or via ldattach — attach a discipline to a serial port from userspace
-ldattach --debug --speed 115200 SLIP /dev/ttyS0
-```
-
-Discipline numbers are defined in `include/uapi/linux/tty.h`.
-
-### UART Hardware: Registers and Timing
-
-A UART converts parallel bus data to a serial bit stream using an agreed timing contract. Both ends configure the same baud rate; the receiver samples each bit at its center. The bit duration is:
-
-$$T_{bit} = \frac{1}{B}$$
-
-where $B$ is the baud rate in bits/s. At 115200 baud:
-
-$$T_{bit} = \frac{1}{115200} \approx 8.68\ \mu s$$
-
-A full 8N1 frame (8 data bits, no parity, 1 stop bit) requires 10 bit-times including the start bit, so each byte takes:
-
-$$T_{frame} = \frac{10}{B}$$
-
-At 115200 baud, that's $\approx 86.8\ \mu s$ per byte, yielding a maximum throughput of $115200 / 10 = 11520$ bytes/s — not 115200. This distinction matters when sizing receive buffers and interrupt latency budgets.
-
-The 16550 UART's register map (base address $A$, 1-byte stride) illustrates how software controls framing:
-
-| Offset | Name | Function |
-|--------|------|----------|
-| +0 | RBR/THR | Receive Buffer / Transmit Holding |
-| +1 | IER | Interrupt Enable |
-| +2 | IIR/FCR | Interrupt ID / FIFO Control |
-| +3 | LCR | Line Control (word length, parity, stop bits) |
-| +4 | MCR | Modem Control (DTR, RTS, loopback) |
-| +5 | LSR | Line Status (data ready, overrun, framing errors) |
-| +6 | MSR | Modem Status (CTS, DCD, DSR, RI) |
-
-The LCR format directly encodes `c_cflag` bits. For 8N1, bits [1:0] = `11` (8 data bits), bit 2 = 0 (1 stop bit), bits [5:3] = `000` (no parity):
-
-$$\text{LCR} = 0b00000011 = 0x03$$
-
-For 7E1 (7 data bits, even parity, 1 stop bit): bits [1:0] = `10`, bit 3 = 1 (parity enable), bit 4 = 1 (even parity):
-
-$$\text{LCR} = 0b00011010 = 0x1A$$
-
-**Modem control lines** are managed through MCR and MSR. The CPU drives DTR and RTS via MCR writes; the remote device drives CTS, DCD, DSR, and RI, which appear in the MSR:
-
-| Line | Register | Direction (DTE perspective) | Meaning |
-|------|-----------|-----------------------------|---------|
-| DTR  | MCR[0]   | Output | Terminal is powered and ready |
-| RTS  | MCR[1]   | Output | Terminal's receive buffer has space |
-| CTS  | MSR[4]   | Input  | Remote permits transmission |
-| DCD  | MSR[7]   | Input  | Modem has established carrier |
-| DSR  | MSR[5]   | Input  | Modem is powered and ready |
-
-Hardware flow control works by the driver checking CTS before writing to THR, and asserting/deasserting RTS based on how full the receive FIFO is. USB-to-serial adapters (FTDI, CP210x, CH341) emulate these registers in firmware; the driver maintains shadow copies because the USB protocol adds latency that makes polling MSR directly impractical.
-
-### TTY Drivers vs. Console Drivers
-
-These are separate registration paths, not separate hardware abstractions. A TTY driver registers via `tty_register_driver()` and is used for process I/O after the VFS is up. A console driver registers via `register_console()` and must be functional during early boot — before `initcalls`, before `/dev` exists, before the scheduler is running in its final form.
-
-The same UART can serve both. The console side uses a stripped-down `write()` callback that spins on the transmit-holding-register-empty bit (LSR[5]) rather than using interrupts, because interrupt infrastructure may not be fully initialized yet:
-
-```c
-static void my_console_write(struct console *co, const char *s, unsigned count)
-{
-    struct uart_port *port = &my_ports[co->index];
-    /* Spin-wait: no interrupts, no DMA */
-    uart_console_write(port, s, count, my_putchar);
-}
-
-static struct console my_console = {
-    .name   = "ttyS",
-    .write  = my_console_write,
-    .device = uart_console_device,
-    .setup  = my_console_setup,
-    .flags  = CON_PRINTBUFFER | CON_ENABLED,
-    .index  = -1,
-};
-```
-
-`CON_PRINTBUFFER` causes the console to replay the kernel log ring buffer once it comes up, which is how you see early boot messages on a serial console even though it registered after some of them were emitted.
-
-To configure the early serial console from the kernel command line:
-
-```bash
-# In bootloader (GRUB, U-Boot, etc.)
-console=ttyS0,115200n8
-
-# Inspect active consoles at runtime
-cat /sys/class/tty/console/active   # e.g., "ttyS0 tty0"
-```
-
----
+### Consoles as TTY Devices
+A Linux console is simply a TTY device bound to the **virtual console driver** (`vt_driver`). The console registers itself as a tty driver (`/dev/tty0` is the current VT, `/dev/tty1`‑`/dev/tty63` are specific VTs). Output from `printk` is directed to the current console tty via `tty_put_char()`. Input from the keyboard passes through the keyboard driver, then the `n_tty` line discipline (which handles Ctrl‑C, Ctrl‑Z, etc.), and finally appears on the tty’s read queue. Because the console implements the same tty interface as a UART, the same termios settings and ioctls apply.
 
 ## How It Works
+### UART Internal Workings
+#### Transmitter
+1. **Load**: CPU writes a byte to the UART’s **THR** (Transmit Holding Register).  
+2. **Shift**: The UART moves the byte to the **TSR** (Transmit Shift Register) and adds a start bit (0), parity (if enabled), and stop bits (1 or 2).  
+3. **Shift‑out**: At each **baud tick** (`T_bit = 1/baud`), the TSR shifts one bit out onto the TX line.  
+4. **Idle**: After the stop bit(s), the line stays high until the next THR load.
 
-### Registering a TTY Driver
+#### Receiver
+1. **Idle detection**: Line high = idle.  
+2. **Start detection**: A falling edge triggers a **start bit search**; the UART waits ½ bit‑time then samples to confirm a low.  
+3. **Bit sampling**: Using a 16× clock, the UART samples the line at multiples of `T_bit/16`. The ideal sample point is at 8/16 (the middle of the bit).  
+4. **Assembly**: Each sampled bit is shifted into the **RSR** (Receive Shift Register). After the programmed number of data bits, parity, and stop bits are collected, the UART checks the stop bit. If it is not high, a framing error (FE) flag is set.  
+5. **Transfer**: The assembled byte (with error flags) is moved to the **RBR** (Receive Buffer Register) and the **data ready** interrupt is raised.
 
-`struct tty_driver` is allocated with `tty_alloc_driver()` (the modern replacement for `alloc_tty_driver()`). Each field has a non-obvious consequence:
+#### Timing Math
+The UART’s internal baud‑rate generator divides the reference clock (`UART_CLK`) by a programmable divisor. Most 16550‑compatible UARTs use 16× oversampling:
+
+$$
+\text{Divisor} = \frac{UART\_CLK}{16 \times \text{Desired Baud}}
+$$
+
+*Example*: With a 1.8432 MHz crystal and a target of 115 200 baud,
+$$
+\text{Divisor} = \frac{1\,843\,200}{16 \times 115\,200} = 1.0
+$$
+The exact divisor yields zero error. For a 24 MHz clock:
+$$
+\text{Divisor} = \frac{24\,000\,000}{16 \times 115\,200} = 13.02 \rightarrow 13
+$$
+Actual baud:
+$$
+\text{Baud}_{actual} = \frac{24\,000\,000}{16 \times 13} = 115\,384.6\ \text{baud}
+$$
+Relative error:
+$$
+\frac{115\,384.6 - 115\,200}{115\,200} \approx +0.16\%
+$$
+Well within the typical ±3 % tolerance, so communication succeeds.
+
+### TTY Layer Mechanism
+When a process opens `/dev/ttyS0`, the VFS routes the request to the **8250 UART driver** (`serial8250_open()`). The driver:
+* allocates a `struct uart_port`,
+* registers an IRQ handler,
+* initializes the UART’s divisors and line control register (LCR) based on the termios settings stored in the attached `struct tty_struct`.
+
+Data flow:
+1. **User → Kernel**: `write(fd, buf, n)` calls the tty’s `write()` method, which copies data to the UART’s THR via the driver’s `transmit_chars()`.
+2. **Kernel → Hardware**: The UART transmitter shifts bits out as described above.
+3. **Hardware → Kernel**: Receive interrupt invokes the driver’s `receive_chars()`, which moves bytes from RSR to the tty’s **receive buffer**.
+4. **Kernel → User**: The line discipline (e.g., `n_tty`) processes the buffer (echo, canonical editing, signal generation) and then makes data available for `read()`.
+
+Key termios flags (bitwise):
+* `CBAUD` (bits in `c_cflag`) encode the baud rate via `B0…B4000000`.
+* `CSIZE` (`CS5`‑`CS8`) sets data bits.
+* `PARENB` enables parity; `PARODD` selects odd parity.
+* `CSTOPB` selects 2 stop bits (else 1).
+* `CREAD` enables receiver; `CLOCAL` ignores modem control lines.
+* `IXON`, `IXOFF` enable software flow control (start/stop characters).
+
+Changing these flags requires a **read‑modify‑write** of `c_cflag` followed by `tcsetattr(fd, TCSAFLUSH, &tty)`.
+
+### Serial Port Configuration
+Configuration proceeds through the POSIX termios API. The steps are:
+1. Open the device with `O_RDWR | O_NOCTTY` (avoid becoming controlling terminal unintentionally).
+2. Fetch current state: `tcgetattr(fd, &tty)`.
+3. Mask undesired bits, set desired bits.
+4. Commit: `tcsetattr(fd, TCSAFLUSH, &tty)` (waits for output to drain and then applies changes immediately).
+
+Example: setting 115 200 baud, 8N1, no flow control.
+```c
+#include <termios.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <errno.h>
+
+int configure_uart(int fd)
+{
+    struct termios tty;
+    if (tcgetattr(fd, &tty) != 0) {
+        perror("tcgetattr");
+        return -1;
+    }
+
+    /* Clear previous settings, possibly unaware of the driver's state. */
+    tty.c_cflag &= ~(CSIZE | PARENB | CSTOPB | CRTSCTS);   /* mask */
+    /* 8 data bits, no parity, 1 stop bit */
+    tty.c_cflag |= CS8 | CREAD | CLOCAL;                  /* enable receiver, ignore modem lines */
+    /* Input flags: ignore break, no parity check, no strip */
+    tty.c_iflag &= ~(IGNBRK | PARMRK | INPCK | ISTRIP | IXON | IXOFF | IXANY);
+    /* Raw output */
+    tty.c_oflag &= ~(OPOST);
+    /* Non‑canonical input */
+    tty.c_lflag &= ~(ECHO | ECHONL | ICANON | ISIG | IEXTEN);
+    tty.c_cc[VMIN]  = 0;   /* read returns immediately */
+    tty.c_cc[VTIME] = 10;  /* 1 second timeout (tenths of sec) */
+
+    /* Baud rate */
+    cfsetispeed(&tty, B115200);
+    cfsetospeed(&tty, B115200);
+
+    if (tcsetattr(fd, TCSAFLUSH, &tty) != 0) {
+        perror("tcsetattr");
+        return -1;
+    }
+    return 0;
+}
+```
+The call to `cfsetispeed()/cfsetospeed()` writes the appropriate divisor into the UART’s **DLAB** (Divisor Latch Access Baud) registers via the driver’s `set_termios()` method.
+
+## Worked Examples
+### Example 1: Configuring a Serial Port (9600 8N1)
+Goal: Open `/dev/ttyS1`, set 9600 baud, 8 data bits, no parity, 1 stop bit, enable receiver, ignore modem lines, and use canonical input (line‑editing) with echo.
+
+**Step‑by‑step**
+1. **Open** the device. `O_NOCTTY` prevents the port from becoming the controlling terminal (important for background daemons).
+```c
+int fd = open("/dev/ttyS1", O_RDWR | O_NOCTTY);
+if (fd < 0) {
+    perror("open");
+    exit(EXIT_FAILURE);
+}
+```
+2. **Get** current termios.
+```c
+struct termios tty;
+if (tcgetattr(fd, &tty) < 0) { perror("tcgetattr"); close(fd); exit(EXIT_FAILURE); }
+```
+3. **Clear** flags we will set.
+```c
+tty.c_cflag &= ~(CSIZE | PARENB | CSTOPB | CRTSCTS);
+tty.c_iflag &= ~(IGNBRK | PARMRK | INPCK | ISTRIP | IXON | IXOFF | IXANY);
+tty.c_lflag &= ~(ECHO | ECHONL | ICANON | ISIG | IEXTEN);
+tty.c_oflag &= ~(OPOST);
+```
+4. **Set** desired bits.
+```c
+tty.c_cflag |= CS8 | CREAD | CLOCAL;   /* 8‑bit, enable receiver, ignore modem lines */
+tty.c_iflag |= IGNBRK;                 /* ignore break condition */
+tty.c_lflag |= ECHO | ICANON;          /* enable echo and canonical input */
+```
+5. **Set** baud rate via convenience functions.
+```c
+cfsetispeed(&tty, B9600);
+cfsetospeed(&tty, B9600);
+```
+6. **Apply** changes, waiting for output to finish.
+```c
+if (tcsetattr(fd, TCSAFLUSH, &tty) < 0) {
+    perror("tcsetattr");
+    close(fd);
+    exit(EXIT_FAILURE);
+}
+```
+7. **Use** the port (e.g., `write(fd, "AT\r\n", 4);`) then `close(fd)` when done.
+
+**Why each step matters**
+* Clearing before setting avoids inheriting stale flags that could enable parity or hardware flow control unintentionally.
+* `CREAD` must be set; otherwise the receiver circuitry is disabled and no data will appear in the buffer.
+* `CLOCAL` tells the driver to ignore modem status lines (CTS, DSR, DCD, RI). Without it, the driver may wait for DSR to assert before allowing transmission, causing apparent hangs.
+* `ICANON` enables line‑editing (erase, kill, re‑print) and makes `read()` return only when a newline (`\n`) is seen, which is convenient for interactive commands.
+* `ECHO` causes input characters to be retransmitted; omitting it yields a silent terminal.
+
+### Example 2: Simple Serial Driver (Transmit & Receive)
+This example demonstrates a minimal program that sends a known byte pattern over a loopback connector (TX tied to RX) and verifies reception.
 
 ```c
-static struct tty_driver *tiny_tty_driver;
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <termios.h>
+#include <errno.h>
+#include <string.h>
 
-static int __init tiny_init(void)
+#define LOOPBACK_DEV "/dev/ttyS2"
+#define TEST_PATTERN 0xA5   /* 10100101b – easy to spot on a scope */
+
+static int configure_port(int fd)
 {
-    int retval;
+    struct termios tty;
+    if (tcgetattr(fd, &tty) < 0) { perror("tcgetattr"); return -1; }
 
-    /*
-     * TINY_TTY_MINORS: how many device nodes to create (/dev/ttty0 .. tttyN-1).
-     * Each minor gets its own tty_port, open count, and termios state.
-     */
-    tiny_tty_driver = tty_alloc_driver(TINY_TTY_MINORS,
-                                       TTY_DRIVER_REAL_RAW |
-                                       TTY_DRIVER_DYNAMIC_
+    /* 8N1, 115200 baud, no flow control */
+    tty.c_cflag &= ~(CSIZE | PARENB | CSTOPB | CRTSCTS);
+    tty.c_cflag |= CS8 | CREAD | CLOCAL;
+    tty.c_iflag &= ~(IGNBRK | PARMRK | INPCK | ISTRIP | IXON | IXOFF | IXANY);
+    tty.c_oflag &= ~(OPOST);
+    tty.c_lflag &= ~(ECHO | ECHONL | ICANON | ISIG | IEXTEN);
+    tty.c_cc[VMIN] = 1;   /* block until at least 1 byte received */
+    tty.c_cc[VTIME] = 0;
+
+    cfsetispeed(&tty, B115200);
+    cfsetospeed(&tty, B115200);
+
+    return tcsetattr(fd, TCSAFLUSH, &tty);
+}
+
+int main(void)
+{
+    int fd = open(LOOPBACK_DEV, O_RDWR | O_NOCTTY);
+    if (fd < 0) {
+        perror("open LOOPBACK_DEV");
+        return EXIT_FAILURE;
+    }
+    if (configure_port(fd) < 0) { close(fd); return EXIT_FAILURE; }
+
+    unsigned char tx = TEST_PATTERN;
+    ssize_t w = write(fd, &tx, 1);
+    if (w != 1) {
+        perror("write");
+        close(fd);
+        return EXIT_FAILURE;
+    }
+
+    unsigned char rx;
+    ssize_t r = read(fd, &rx, 1);
+    if (r != 1) {
+        perror("read");
+        close(fd);
+        return EXIT_FAILURE;
+    }
+
+    if (rx == tx) {
+        printf("Loopback test PASSED: sent 0x%02X, received 0x%02X\n", tx, rx);
+    } else {
+        printf("Loopback test FAILED: sent 0x%02X, received 0x%02X\n", tx, rx);
+    }
+    close(fd);
+    return EXIT_SUCCESS;
+}
+```
+**Explanation**
+* `VMIN=1, VTIME=0` makes `read()` block until a byte arrives, simplifying the test.
+* The loopback connector guarantees that what we transmit is immediately received, letting us verify UART configuration without external equipment.
+* If the test fails, likely causes are baud‑rate mismatch, incorrect parity/stop‑bit settings, or the port being held reset by modem control lines (missing `CLOCAL`).
+
+### Example 3: Using the TTY Layer to Implement a Console‑Like Output
+A program that writes directly to the system console (`/dev/tty0`) to display messages even when no foreground shell is attached. This mimics what `printk` does, but from user space.
+
+```c
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <sys/ioctl.h>
+#include <linux/vt.h>
+#include <errno.h>
+
+int main(void)
+{
+    int fd = open("/dev/tty0", O_WRONLY);
+    if (fd < 0) {
+        perror("open /dev/tty0");
+        return EXIT_FAILURE;
+    }
+
+    /* Ensure we have control of the VT (optional, but useful if switching VTs). */
+    if (ioctl(fd, VT_GETACTIVE, &(int){0}) < 0) {
+        perror("VT_GETACTIVE");
+        /* Not fatal; we can still write to the current VT. */
+    }
+
+    const char *msg = "Hello from user‑space console\\n";
+    if (write(fd, msg, strlen(msg)) < 0) {
+        perror("write");
+        close(fd);
+        return EXIT_FAILURE;
+    }
+
+    /* Switch to VT 2 (if available) to demonstrate VT control. */
+    int target = 2;
+    if (ioctl(fd, VT_ACTIVATE, target) < 0) {
+        perror("VT_ACTIVATE");
+    }
+    /* The kernel will automatically wait for the VT switch to complete. */
+    close(fd);
+    return EXIT_SUCCESS;
+}
+```
+**Why this works**
+* `/dev/tty0` is a special alias for the currently active virtual terminal. Writing to it goes through the VT driver’s `write()` implementation, which ultimately calls the underlying tty’s `write()` (same path as a UART).
+* The `VT_GETACTIVE`/`VT_ACTIVATE` ioctls manipulate the VT scheduler; they are part of the TTY layer’s console functionality.
+* No termios configuration is needed because the console defaults to a sane state (115200 baud‑equivalent, 8N1, echo off) for kernel messages; user‑space can change it with `tcsetattr` if desired.
+
+## Common Mistakes
+### Mistake 1: Incorrect Baud‑Rate Divisor Leading to >3 % Error
+**What’s wrong**: Using a divisor that yields a baud rate outside the receiver’s tolerance causes frequent framing errors (FE).  
+**Why it matters**: The UART receiver samples each bit at the centre of the bit‑time. If the transmitter’s bit period deviates by more than ~3 %, the sampling point drifts into the transition zone, and the receiver interprets the bit incorrectly, setting FE and possibly OE (overrun) flags.  
+**How to avoid**: Compute the divisor with the exact formula, round

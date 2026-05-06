@@ -10,108 +10,230 @@ resources:
     title: "Introduction to Linear Algebra (Strang)"
 ---
 
-## Why This Matters
-
-When you write a sorting algorithm, choose a data structure, or read kernel source code, you are constantly making implicit bets about how things scale. The Linux kernel's `CFS` scheduler stores runnable tasks in a red-black tree (`kernel/sched/fair.c`) precisely because red-black tree operations run in $O(\log n)$ time — with millions of tasks, $\log_2(10^6) \approx 20$ comparisons per insertion is acceptable; $O(n)$ linear scan is not. The `ext4` directory index uses an HTree (essentially a B-tree variant) for the same reason. These are not style choices. They are load-bearing algorithmic decisions, and you cannot evaluate or challenge them without a rigorous language for comparing growth rates.
-
----
-
 ## Core Concepts
+### Discrete Mathematics
+Discrete mathematics studies structures that are fundamentally countable—integers, graphs, sets, and formal languages—rather than continua. Its importance in computer science stems from the fact that data stored in memory is ultimately a finite arrangement of bits; reasoning about algorithms therefore reduces to reasoning about discrete objects.  
 
-### The ≺ Relation (Asymptotic Dominance)
+### Logic and Proof
+A proposition is a declarative sentence that is either true or false. Logical connectives (¬, ∧, ∨, →, ↔) combine propositions into compound statements whose truth values are given by truth tables. A proof is a finite sequence of propositions where each follows from earlier ones by a rule of inference (modus ponens, universal instantiation, etc.). The soundness of these rules guarantees that if the premises are true, the conclusion must be true—this is why proofs give certainty beyond empirical testing.  
 
-We write $f(n) \prec g(n)$ to mean $g$ grows strictly faster than $f$:
+### Induction
+Mathematical induction proves statements of the form ∀n∈ℕ P(n). It consists of two steps:  
 
-$$f(n) \prec g(n) \iff \lim_{n \to \infty} \frac{f(n)}{g(n)} = 0$$
+1. **Base case**: Show P(0) (or P(1)) holds.  
+2. **Inductive step**: Assume P(k) (induction hypothesis) and prove P(k+1).  
 
-This is a statement about **eventual behavior**, not behavior at any specific $n$. The relationship is absolute: no constant factor or finite head start can reverse it. If $f \prec g$, then for all sufficiently large $n$, $g$ wins — permanently.
+The principle follows from the well‑ordering of ℕ: if there existed a smallest counter‑example, the inductive step would produce a smaller one, a contradiction. Thus induction lets us lift a local truth to an infinite domain.  
 
-For monomials, the rule is exact:
+### Sets and Relations
+A set S is an unordered collection of distinct elements; membership is denoted x∈S. The Cartesian product S×T = {(s,t) | s∈S, t∈T} forms ordered pairs. A relation R⊆S×T is any subset of this product; it encodes which pairs are related. Properties such as reflexivity (∀x (x,x)∈R), symmetry, and transitivity are defined directly from this set‑theoretic view, enabling precise reasoning about equivalence and order.  
 
-$$n^\alpha \prec n^\beta \iff \alpha < \beta$$
+### Functions
+A function f:S→T is a relation where each s∈S appears in exactly one ordered pair (s,f(s)). This functional property guarantees well‑definedness: given an input, the output is unambiguous. Functions are the mathematical counterpart of pure procedures in programming, which is why they model system calls, library routines, and transformations on data structures.  
 
-### The Asymptotic Hierarchy
+### Combinatorics
+Combinatorics counts configurations of finite sets. Two fundamental primitives:  
 
-$$1 \prec \log \log n \prec \log n \prec n^\epsilon \prec n^c \prec n^{\log n} \prec c^n \prec n^n \prec c^{c^n}$$
+* **Permutations** – arrangements where order matters. The number of permutations of n distinct objects is n! = n·(n‑1)…·1.  
+* **Combinations** – selections where order does not matter. The number of k‑subsets of an n‑set is the binomial coefficient  
+  $$ \binom{n}{k} = \frac{n!}{k!\,(n-k)!}. $$  
 
-where $0 < \epsilon < 1 < c$ are arbitrary constants. The most important counterintuitive consequence: $\log n \prec n^\epsilon$ for **any** $\epsilon > 0$, no matter how small. The crossover point may be astronomically large — for $\log n$ vs. $n^{0.0001}$, it is around $n = 10^{43000}$ — but the inequality is unconditionally true for all sufficiently large $n$. Asymptotic reasoning requires you to think past any finite threshold.
+These formulas arise from the multiplication principle: for each step of constructing an object, multiply the number of choices available at that step.  
 
-The $n^{\log n}$ entry is less familiar but appears in algorithms like the naive matrix multiplication improvement: $n^{\log n}$ grows faster than any polynomial but slower than any exponential, because $\log n \to \infty$ while remaining $o(n)$.
+### Graphs and Trees
+A graph G=(V,E) consists of a vertex set V and an edge set E⊆{{u,v} | u,v∈V, u≠v}. The degree deg(v) is the number of incident edges. A key identity, the **handshaking lemma**, follows from double‑counting edge‑incidences:  
 
-### Big-O, Big-Ω, and Big-Θ
+$$ \sum_{v\in V}\deg(v) = 2|E|. $$  
 
-These notations encode the $\prec$ relation into bounds rather than exact comparisons:
-
-| Notation | Meaning | Formal Definition |
-|---|---|---|
-| $f = O(g)$ | $f$ grows no faster than $g$ | $\exists\, c > 0,\, n_0 : f(n) \le c \cdot g(n)\ \forall\, n > n_0$ |
-| $f = \Omega(g)$ | $f$ grows no slower than $g$ | $g = O(f)$ |
-| $f = \Theta(g)$ | $f$ and $g$ grow at the same rate | $f = O(g)$ and $f = \Omega(g)$ |
-
-$O$ is an **upper** bound, not a tight one. Any $O(n)$ algorithm is also trivially $O(n^2)$, $O(n^3)$, and $O(2^n)$. When someone says "the algorithm is $O(n^2)$", they are asserting an upper bound; whether it is tight requires showing $\Omega(n^2)$ separately to get $\Theta(n^2)$.
-
-The little-o analogue of $O$ is $o$: $f = o(g)$ means $f \prec g$ strictly, i.e., $\lim_{n\to\infty} f(n)/g(n) = 0$. So $n = o(n^2)$ but $n \ne o(n)$.
-
-### Why Constant Factors Vanish (and Why That is Sometimes Wrong)
-
-If $f(n) = 10^9 \cdot n$ and $g(n) = n^2$, then $f \prec g$ because:
-
-$$\lim_{n \to \infty} \frac{10^9 \cdot n}{n^2} = \lim_{n \to \infty} \frac{10^9}{n} = 0$$
-
-The crossover is at $n = 10^9$. Below that threshold, $f$ is faster despite having worse asymptotic class. Asymptotic analysis is correct about scalability but says nothing about performance at small $n$. The Linux kernel routinely uses $O(n)$ structures (linear arrays, linked lists) for small fixed-size collections — e.g., the per-CPU run queues for `SCHED_FIFO` tasks, where $n$ is bounded — precisely because cache locality dominates at small $n$, making the theoretically inferior structure faster in practice.
-
----
+A tree is a connected acyclic graph. Equivalently, a tree on n vertices has exactly n‑1 edges; removing any edge disconnects it, and adding any edge creates a cycle. Trees model hierarchical data (directory hierarchies, process trees, DNS zones) because they guarantee a unique simple path between any two vertices.  
 
 ## How It Works
+The discrete tools compose to solve computational problems:  
 
-### Placing a Function in the Hierarchy
+* **Logic** provides the language for specifications and the inference rules used by automated theorem provers and model checkers (e.g., SPIN, CBMC).  
+* **Proof techniques** (direct, contradiction, induction) are the backbone of correctness arguments for algorithms and kernel code.  
+* **Induction** lets us prove properties of loops and recursive functions that operate over unbounded data structures (e.g., linked lists, B‑trees).  
+* **Sets and relations** underlie relational databases, access‑control matrices, and the formal definition of file permissions as a relation between subjects and objects.  
+* **Functions** capture deterministic system calls; their partiality models error‑return values (‑1 with errno).  
+* **Combinatorics** yields exact counts for resource allocations (e.g., number of ways to assign PIDs, page‑frame allocations) and informs probabilistic analyses (hash‑table collision probability ≈ 1‑e^{‑k²/(2N)}).  
+* **Graph theory** models network topologies, dependency graphs (make, systemd), and control‑flow graphs used by compilers and static analysers.  
+* **Trees** give logarithmic‑time search (red‑black trees, B‑trees) and enable efficient hierarchical naming (filesystem paths, XML/JSON).  
 
-Suppose a measured running time fits $T(n) = 3n^2 \log n + 500n$. To classify it:
+Together they form a rigorous foundation: any program can be viewed as a discrete dynamical system whose state lives in a countable space, and whose evolution is described by logical transitions.  
 
-**Step 1: Find the dominant term.**
+## Worked Examples
+### Example 1: Inductive Proof of $2^n > n$ for all $n\ge 1$
+**Goal**: Prove $\forall n\in\mathbb{Z}_{>0},\;2^n>n$.  
 
-$$\lim_{n \to \infty} \frac{500n}{3n^2 \log n} = \lim_{n \to \infty} \frac{500}{3n \log n} = 0$$
+**Base case (n=1)**: $2^1=2>1$. ✔  
 
-The $500n$ term is dominated and drops. The function behaves like $n^2 \log n$ asymptotically.
+**Inductive hypothesis**: Assume $2^k>k$ for some arbitrary $k\ge1$.  
 
-**Step 2: Locate $n^2 \log n$ in the hierarchy.**
+**Inductive step**: Show $2^{k+1}>k+1$.  
 
-$n^2 \log n$ is not a pure power, so it does not sit exactly at any $n^c$ tier. Compare it against $n^{2+\epsilon}$ for arbitrary $\epsilon > 0$:
+\[
+\begin{aligned}
+2^{k+1} &= 2\cdot 2^k \\
+&> 2\cdot k \quad\text{(by IH)}\\
+&= k + k \\
+&\ge k+1 \quad\text{(since }k\ge1\text{)}.
+\end{aligned}
+\]
 
-$$\lim_{n \to \infty} \frac{n^2 \log n}{n^{2+\epsilon}} = \lim_{n \to \infty} \frac{\log n}{n^\epsilon} = 0$$
+Thus $2^{k+1}>k+1$. By induction, the statement holds for all positive $n$.  
 
-So $n^2 \log n \prec n^{2+\epsilon}$ for any $\epsilon > 0$, but $n^2 \prec n^2 \log n$ (since $\log n \to \infty$). It inhabits the gap between $n^2$ and $n^{2+\epsilon}$, which $\Theta$ notation cannot express as a single power. A valid tight bound is $\Theta(n^2 \log n)$; a valid but loose upper bound is $O(n^{2.001})$.
+### Example 2: Counting Permutations with Restrictions
+**Problem**: How many ways to arrange the letters of “LINUX” such that the letter **U** is never first?  
 
-### Solving Recurrences: The Master Theorem
+Total permutations of 5 distinct letters: $5! = 120$.  
 
-Many divide-and-conquer runtimes are defined recursively. The general form is:
+Count the forbidden permutations where **U** is first: fix U at position 1, then permute the remaining 4 letters → $4! = 24$.  
 
-$$T(n) = a\, T\!\left(\frac{n}{b}\right) + f(n), \quad a \ge 1,\ b > 1$$
+Allowed count = total – forbidden = $120 - 24 = 96$.  
 
-The Master Theorem compares $f(n)$ against the **branching cost** $n^{\log_b a}$, which is the total work across all recursive calls if the divide step were free:
+Alternatively, apply the multiplication principle directly: choose first letter from {L,I,N,X} (4 options), then arrange the remaining 4 letters arbitrarily → $4\cdot4! = 96$.  
 
-| Case | Condition | Result |
-|---|---|---|
-| 1 | $f(n) = O\!\left(n^{\log_b a - \epsilon}\right)$ | $T(n) = \Theta\!\left(n^{\log_b a}\right)$ — recursion dominates |
-| 2 | $f(n) = \Theta\!\left(n^{\log_b a}\right)$ | $T(n) = \Theta\!\left(n^{\log_b a} \log n\right)$ — costs balance |
-| 3 | $f(n) = \Omega\!\left(n^{\log_b a + \epsilon}\right)$ | $T(n) = \Theta(f(n))$ — top-level work dominates |
+### Example 3: Graph Model of Linux Process Hierarchy
+The Linux kernel maintains a **process tree** where each node is a `task_struct`. Edges point from parent to child via the `children` list.  
 
-**Merge sort:** $a = 2$, $b = 2$, $f(n) = n$. Then $\log_b a = \log_2 2 = 1$, $f(n) = \Theta(n^1)$. Case 2:
+*Vertices*: each process PID.  
+*Edges*: (parent → child).  
 
-$$T(n) = \Theta(n \log n)$$
+Properties:  
 
-**Binary search:** $a = 1$, $b = 2$, $f(n) = 1$. Then $\log_2 1 = 0$, $f(n) = \Theta(n^0) = \Theta(1)$. Case 2:
+* The tree is rooted at the init process (PID 1).  
+* Depth of a node equals the number of `execve`‑generations from init.  
+* The handshaking lemma applied to this tree yields:  
 
-$$T(n) = \Theta(\log n)$$
+\[
+\sum_{v\in V}\deg(v) = 2(|V|-1),
+\]
 
-**Karatsuba multiplication:** $a = 3$, $b = 2$, $f(n) = n$. Then $\log_2 3 \approx 1.585$, $f(n) = O(n^{1.585 - \epsilon})$. Case 1:
+since a tree with $|V|$ vertices has $|V|-1$ edges.  
 
-$$T(n) = \Theta\!\left(n^{\log_2 3}\right) \approx \Theta\!\left(n^{1.585}\right)$$
+We can verify this with a shell command:  
 
-This is why Karatsuba beats the $\Theta(n^2)$ schoolbook algorithm for large integers — the kernel uses it internally in `lib/math/` for big number operations.
+```bash
+# Count total processes and sum of their numbers of children
+ps -e -o pid,ppid | awk '
+    {pp[$2]++; cnt++}
+    END {
+        sum=0; for (p in pp) sum+=pp[p];
+        printf "processes=%d, sum_child_degrees=%d, 2*(procs-1)=%d\n",
+               cnt, sum, 2*(cnt-1);
+    }'
+```
 
-### Verifying Asymptotic Claims with Limits
+On a typical system the equality holds, confirming the tree invariant.  
 
-To prove $\log n \prec n^{0.0001}$, apply L'Hôpital's rule (differentiating with respect to $n$, treating $\log$ as $\ln$ — the base only changes the result by a constant factor):
+## Common Mistakes
+1. **Treating a relation as a set of elements rather than a set of ordered pairs**  
+   *What’s wrong*: Writing “R = {a, b, c}” when R⊆A×B.  
+   *Why it matters*: This conflates membership with pairing, breaking definitions of domain, range, and properties like reflexivity. A relation must be a subset of the Cartesian product; otherwise statements such as “(a,a)∈R” are meaningless.  
 
-$$\lim_{n \to \infty} \frac{\ln n}{n^{0.0001}} \xrightarrow{\text{L'H}} \lim_{n \to \infty} \frac{1/n}{0.0001 \cdot n^{-0.9999
+2. **Assuming induction proves the statement for “all numbers” without verifying the base case**  
+   *What’s wrong*: Skipping or misstating the base case (e.g., proving P(k)→P(k+1) but never checking P(0)).  
+   *Why it matters*: The inductive step alone only shows that if the statement holds somewhere, it holds forever forward; without a true base, the chain may start from a false premise, leading to vacuously true conclusions.  
+
+3. **Using $n!$ to count combinations**  
+   *What’s wrong*: Applying the permutation formula when order does not matter.  
+   *Why it matters*: Overcounts by a factor of $k!$; e.g., choosing 2 fruits from {apple, banana, cherry} yields $\binom{3}{2}=3$ pairs, not $3!/1!=6$. Recognizing whether the problem cares about arrangement is essential for correct complexity estimates (e.g., number of possible cache lines vs. number of ways to fill them).  
+
+4. **Confusing directed and undirected edges when applying the handshaking lemma**  
+   *What’s wrong*: Using $\sum\deg(v)=2|E|$ on a directed graph.  
+   *Why it matters*: In a digraph, the sum of out‑degrees equals the sum of in‑degrees equals |E|, not 2|E|. Misapplying the lemma leads to erroneous conclusions about network reliability or routing tables.  
+
+## Exercises
+### Easy  
+1. Prove by induction that $\sum_{i=1}^{n} i = \frac{n(n+1)}{2}$ for all $n\ge1$.  
+
+2. How many distinct IPv4 addresses are available in the subnet `192.168.10.0/27`?  
+
+### Medium  
+3. Let $G$ be a simple undirected graph with 10 vertices and 15 edges. Using the handshaking lemma, determine the average degree of a vertex and argue whether $G$ can be bipartite.  
+
+4. Write a C function that, given an array of $n$ distinct integers, returns the number of permutations that place the smallest element in the first position. Provide a brief complexity analysis.  
+
+### Hard  
+5. Consider the Linux `inotify` watch limit (`/proc/sys/fs/inotify/max_user_watches`). Derive an expression for the maximum number of distinct file‑system events that can be simultaneously monitored if each watch generates at most $e$ events per second and the kernel queues events in a buffer of size $B$ bytes, each event occupying $s$ bytes.  
+
+6. Prove that the set of all finite binary strings forms a countable set by constructing an explicit bijection with $\mathbb{N}$. Show how this bijection underlies the encoding of kernel module parameters as strings in `/sys/module/<name>/parameters/`.  
+
+## Linux Connection
+### Memory Management – Slab Allocator
+The SLAB allocator caches frequently used kernel objects (e.g., `task_struct`, `inode`). Each cache is a **set** of free objects; allocation removes an element, deallocation inserts it. The allocator uses **combinatorics** to decide slab size:  
+
+\[
+\text{objects per slab} = \left\lfloor\frac{\text{PAGE\_SIZE}}{\text{object size} + \text{metadata}}\right\rfloor.
+\]
+
+```c
+/* Simplified slab cache definition (linux/slab.h) */
+struct kmem_cache {
+    unsigned int object_size;
+    unsigned int size;          /* includes metadata */
+    unsigned int reciprocal;    /* 1/size for fast division */
+    const char *name;
+    /* ... */
+};
+```
+
+A practical view:  
+
+```bash
+# Show slab caches and their object counts
+cat /proc/slabinfo | head -20
+```
+
+### Process Scheduling – Red‑Black Tree
+The Completely Fair Scheduler (CFS) maintains a **red‑black tree** (`rb_root`) keyed by `vruntime`. Insertion and deletion are $O(\log n)$, guaranteeing fair CPU allocation.  
+
+```c
+/* From linux/sched.h */
+struct cfs_rq {
+    struct rb_root tasks_timeline;
+    /* ... */
+};
+```
+
+Observing the tree in action:  
+
+```bash
+# Display the vruntime of each thread (requires perf with sched tracing)
+perf record -e sched:sched_switch -a sleep 5
+perf script | grep "sched_switch" | head -5
+```
+
+### Networking – Netfilter State Machine
+`nf_conntrack` tracks connection states as a **directed graph** where vertices are protocol states (NEW, ESTABLISHED, RELATED, INVALID) and edges are transitions triggered by packets. The firewall rules correspond to cutting edges.  
+
+```bash
+# List current tracked connections (shows state graph)
+conntrack -L | grep ESTABLISHED | wc -l
+```
+
+### File System – Extent Trees (EXT4)
+EXT4 stores file extents in a **binary tree** (`extent_status` tree) to map logical file offsets to physical blocks, enabling $O(\log n)$ lookup and reducing fragmentation.  
+
+```bash
+# Dump extent tree of a file
+hdparm --fibmap /path/to/file | grep -i extent
+```
+
+### Cryptography – Modular Arithmetic in RSA
+The Linux `crypto` API relies on number‑theoretic results (Euler’s theorem, Chinese Remainder Theorem). Modular exponentiation uses repeated squaring, whose correctness follows from induction on the exponent bits.  
+
+```bash
+# Benchmark RSA signature generation using OpenSSL (uses kernel crypto)
+openssl speed -evp rsa2048
+```
+
+## Why This Matters
+Discrete mathematics is not a collection of abstract facts; it is the exact language the Linux kernel and user‑space tools use to reason about resources, correctness, and performance.  
+
+* When you **prove** a kernel invariant with induction, you gain confidence that a scheduler will never starve a task, even under arbitrary workloads.  
+* When you **count** possible memory layouts with combinatorics, you can predict the probability of allocator fragmentation and tune slab sizes accordingly.  
+* When you **model** the process hierarchy as a tree, you can quickly compute inheritance of credentials or trace a signal’s path with simple tree walks.  
+* When you **apply** graph algorithms to network topologies, you can detect loops in routing tables or compute minimal cut sets for firewall hardening.  
+
+By mastering these foundational structures—sets, relations, functions, inductive reasoning, counting, and graph theory—you acquire the mental toolkit to read kernel source, design efficient system programs, and troubleshoot subtle bugs that stem from mismatched assumptions about discrete state. This is why fluency in discrete mathematics is a prerequisite for expert Linux development and system administration.

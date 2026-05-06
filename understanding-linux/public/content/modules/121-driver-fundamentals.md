@@ -10,153 +10,340 @@ resources:
     title: "The Linux Programming Interface (Kerrisk)"
 ---
 
-## Why This Matters
+## Core Concepts
+A device driver is the kernel’s *structured* interface to a piece of hardware. Its purpose is threefold:
 
-Hardware enumeration and driver binding solve a concrete resource-ownership problem: when a PCI device appears on the bus, something must claim its BARs, install an IRQ handler, and present a coherent interface to the rest of the kernel — without racing against another driver attempting the same thing, without leaking those resources if initialization fails halfway through, and without requiring a reboot when the device disappears. The Linux device model enforces this through a single ownership discipline: the bus subsystem owns devices, drivers declare what they can handle, and the kernel mediates the binding. This is why you can `rmmod` a driver while the hardware stays powered, reload it, and have the device reappear in `/dev` — the binding is dynamic by design, not a boot-time coincidence.
+1. **Abstraction** – hide hardware‑specific details behind a uniform kernel API (e.g., `file_operations` for character devices, `struct scsi_host_template` for SCSI, `struct net_device_ops` for network).  
+2. **Resource management** – claim, configure, and release the hardware’s limited resources (memory regions, IRQ lines, DMA channels) in a way that prevents collisions with other drivers.  
+3. **Lifecycle handling** – react to hot‑plug events, power state changes, and module unload while preserving system invariants.
 
-Without the bus–device–driver triangle, every subsystem (PCI, USB, I²C, platform) would need its own hotplug logic, its own power management callbacks, and its own sysfs representation. The unification means that suspend/resume, uevent generation, and driver rebinding work identically whether you are writing a GPU driver or an I²C temperature sensor driver.
+### Why a driver is necessary
+Without a driver, the kernel would have to know the exact register layout, timing constraints, and interrupt behavior of every possible device. That would make the kernel monolithic, fragile, and unable to support new hardware without recompilation. A driver isolates this variability in a loadable module, letting the core kernel stay small and stable.
+
+### Device identification
+* **PCI** – each device exposes a 256‑byte configuration space. The first 4 bytes contain:
+  - `vendor_id` (16 bits, bits 0‑15)  
+  - `device_id` (16 bits, bits 16‑31)  
+  The pair `(vendor_id, device_id)` is a 32‑bit identifier used by the kernel’s PCI core to match a `struct pci_device_id` table against the device.  
+  Example: Intel 82579LM Gigabit Ethernet → `vendor_id=0x8086`, `device_id=0x1502`.
+
+* **USB** – devices present a series of descriptors. The first two bytes of the device descriptor are `idVendor` and `idProduct` (both 16 bits). The kernel matches these against the `id_table` in a `struct usb_driver`.
+
+* **Platform** – devices are described in the device tree or ACPI; the kernel uses a `struct of_device_id` or `struct acpi_device_id` containing a `compatible` string and, optionally, a `type` field.
+
+### Resources and their allocation
+| Resource | Typical source | Kernel representation | Allocation API |
+|----------|----------------|-----------------------|----------------|
+| Memory-mapped I/O (MMIO) | PCI BAR, platform `reg` property | `struct resource` (start, end, flags) | `pci_iomap()`, `devm_ioremap_resource()` |
+| Interrupt line | PCI `Interrupt Line`, platform `interrupts` | `unsigned int irq` | `request_irq()`, `devm_request_irq()` |
+| DMA channel | PCI `DMA` capability, platform `dma-ranges` | `dma_addr_t` (bus address) | `dma_set_mask()`, `dma_alloc_coherent()` |
+
+**BAR size calculation** – a BAR writes a pattern of all‑1s, reads back the complement; the size is `~(value) + 1`. For example, if a BAR returns `0xFFFFF000`, the size is `0x1000` (4 KB).
+
+### Driver lifecycle (simplified)
+1. **Module init** (`module_init`) – allocate driver‑wide structures, register with a bus type (`pci_register_driver`, `usb_register`, `platform_driver_register`).  
+2. **Device enumeration** – bus scans hardware, creates a `struct device`.  
+3. **Matching** – bus core compares device’s IDs with driver’s `id_table`; on match calls `probe(struct device *dev)`.  
+4. **Probe** – driver claims resources, maps MMIO, requests IRQ, creates kernel objects (e.g., `cdev_add`, `netdev_register`).  
+5. **Normal operation** – driver handles I/O via file operations, interrupt handlers, or workqueues.  
+6. **Remove** (`remove`/`disconnect`) – undo all probe steps: free IRQ (`free_irq`), unmap MMIO (`iounmap`), delete kernel objects, release memory (`dma_free_coherent`).  
+7. **Module exit** (`module_exit`) – unregister from bus type, clean global resources.
 
 ---
 
-## Core Concepts
+## How It Works
+### Step‑by‑step from module load to device operation
+1. **Loading** – `modprobe` triggers `sys_init_module()` → kernel copies the ELF image into module space, resolves symbols, runs the module’s `init` function.  
+2. **Registration** – the init function calls a bus‑specific register API (e.g., `pci_register_driver(&my_pci_driver)`). This links the driver’s `struct pci_driver` into the PCI core’s driver list and adds a `probe` callback.  
+3. **Device discovery** – the PCI core walks the config space of every PCI bus/function (via `pci_scan_bus`). For each device it reads `vendor_id` and `device_id`, creates a `struct pci_dev`, and attempts to match against all registered drivers. Matching is O(N × M) but limited by small tables; the kernel uses a radix tree for speed.  
+4. **Probe invocation** – if a match is found, the core calls `driver->probe(pci_dev)`. The probe must:
+   - Enable the device: `pci_enable_device(dev)` (sets the command register’s I/O and memory enable bits, checks for broken BARs).  
+   - Query BARs: `pci_resource_start(dev, bar)`, `pci_resource_len(dev, bar)`.  
+   - Request memory regions: `devm_request_mem_region(&dev->dev, start, len, name)`.  
+   - Map MMIO: `ioaddr = devm_ioremap_resource(&dev->dev, &res)`.  
+   - Allocate DMA mask if needed: `dma_set_mask_and_coherent(&dev->dev, DMA_BIT_MASK(64))`.  
+   - Request IRQ: `ret = devm_request_irq(&dev->dev, dev->irq, my_isr, IRQF_SHARED, name, dev)`.  
+   - Register kernel objects (e.g., `cdev_init(&my_cdev, &fops); cdev_add(&my_cdev, devt, 1);`).  
+   - Return 0 on success; any negative error aborts binding and triggers rollback.  
+5. **Binding** – on successful probe, the core sets `dev->driver = driver` and increments the driver’s usage count. The device appears in sysfs under `/sys/bus/pci/devices/<bus>:<slot>.<func>/`.  
+6. **Operation** – user space opens the device node (`/dev/mydev`). The VFS routes `read()`/`write()` to the driver’s `file_operations`. Interrupts arrive via the registered ISR; the ISR typically schedules a workqueue or tasklet to do heavy processing because sleeping is forbidden in interrupt context.  
+7. **Removal** – hot‑unload or `rmmod` calls the driver’s `remove` callback, which performs the inverse of probe steps, then the core decrements the usage count and frees the `struct device`.
 
-### What a Driver Actually Is
+### Why each step matters
+- **Enabling the device** ensures the processor can actually generate memory/I/O transactions to the device; forgetting this leads to silent failures.  
+- **Resource reservation (`request_mem_region`)** prevents two drivers from mapping the same physical address, which would cause memory corruption.  
+- **Mapping with `ioremap`** creates a virtual address that respects CPU cache attributes (e.g., strong ordering for device memory). Direct use of the physical address would bypass the MMU and break on architectures with strict alignment requirements.  
+- **IRQ sharing flags** (`IRQF_SHARED`) let multiple devices use the same line; the kernel checks the shared handler’s return value (`IRQ_HANDLED` vs `IRQ_NONE`) to know whether to invoke the next handler.  
+- **DMA mask** tells the kernel whether the device can address the full RAM; a 32‑bit mask on a system with >4 GB RAM forces the kernel to use bounce buffers, impacting performance.
 
-A driver is a set of function pointers registered with a bus subsystem. It is not a process, not a thread, and not a file — it has no execution context of its own. When the kernel needs to initialize a device, it calls into those function pointers directly, running in whatever context triggered the bind (a kworker thread for hotplug, or the thread calling `insmod` for a driver loaded against already-enumerated hardware).
+---
 
-At the C level, every driver ultimately embeds a `struct device_driver`:
-
-```c
-struct device_driver {
-    const char              *name;
-    struct bus_type         *bus;
-    int  (*probe)  (struct device *dev);
-    void (*remove) (struct device *dev);
-    int  (*suspend)(struct device *dev, pm_message_t state);
-    int  (*resume) (struct device *dev);
-    const struct attribute_group **groups;  /* sysfs attributes */
-    /* ... */
-};
-```
-
-Bus-specific drivers (PCI, USB, platform) wrap this in a larger structure. `struct pci_driver` contains a `struct device_driver` as its `driver` field and adds PCI-specific fields like `id_table` and an `err_handler`. The bus layer calls the generic `device_driver` callbacks; the PCI layer installs wrapper callbacks that translate between the generic `struct device *` and the bus-specific `struct pci_dev *`.
-
-### The Bus–Device–Driver Triangle
-
-Every `struct device` has a pointer to a `struct bus_type`. Every `struct device_driver` has a pointer to the same `struct bus_type`. The bus type owns two lists — `klist_devices` and `klist_drivers` — and a `.match` function pointer.
-
-The matching protocol is strictly bidirectional:
-
-- When a new device is registered via `device_register()`, the bus calls `driver_match_device(drv, dev)` for every driver already on `klist_drivers`.
-- When a new driver is registered via `driver_register()`, the bus calls `driver_match_device(drv, dev)` for every device already on `klist_devices`.
-
-This bidirectionality is why driver load order does not matter. If you `modprobe e1000e` before the NIC is enumerated, the driver sits idle on `klist_drivers`. When PCI enumeration later calls `pci_device_add()`, the bus finds the driver and triggers probe. The converse — hardware present before driver loads — works identically.
-
-```
-Bus
- ├── klist_devices  →  [dev A] [dev B] [dev C]
- └── klist_drivers  →  [drv X] [drv Y]
-
-device_register(dev C):
-    for each drv in klist_drivers:
-        if bus.match(drv, dev C): __device_attach(drv, dev C) → probe()
-
-driver_register(drv Y):
-    for each dev in klist_devices:
-        if bus.match(drv Y, dev): __device_attach(drv Y, dev) → probe()
-```
-
-The complexity of a full scan on each register event is $O(d \cdot r)$ where $d$ is the number of devices and $r$ is the number of registered drivers on that bus. For PCI this is bounded and fast; for USB with hundreds of interface drivers the table-walk cost is why `MODULE_DEVICE_TABLE` exists — `udev` resolves the match in userspace before asking the kernel to load anything.
-
-### Device IDs and Matching
-
-A PCI driver declares its supported hardware as an array of `struct pci_device_id`, terminated by a zeroed sentinel:
+## Worked Examples
+### Example 1: Simple character driver (“memdev”)
+This driver exposes a single read‑only memory region that returns an incrementing counter on each read. It demonstrates dynamic major/minor allocation, `cdev` usage, and proper cleanup.
 
 ```c
-static const struct pci_device_id my_ids[] = {
-    { PCI_DEVICE(0x10de, 0x1234) },          /* exact vendor+device match */
-    { PCI_DEVICE_CLASS(PCI_CLASS_NETWORK_ETHERNET, 0xffff00) }, /* class match */
-    { 0 }
-};
-MODULE_DEVICE_TABLE(pci, my_ids);
-```
+/* memdev.c – loadable character driver */
+#include <linux/module.h>
+#include <linux/fs.h>
+#include <linux/cdev.h>
+#include <linux/uaccess.h>
+#include <linux/mutex.h>
 
-`MODULE_DEVICE_TABLE` embeds the table in the `.modinfo` ELF section of the `.ko` file. The tool `depmod` reads every installed module's `.modinfo` and writes `/lib/modules/$(uname -r)/modules.alias`, mapping device ID patterns to module names. When `udev` receives a kernel hotplug uevent containing `MODALIAS=pci:v000010DEd00001234...`, it runs `modprobe` with that alias, which consults `modules.alias` and loads the right module — without any hardcoded device–driver mapping.
+#define MEMDEV_NAME "memdev"
+#define MEMDEV_SIZE 4096   /* 4 KiB buffer */
 
-You can inspect this pipeline directly:
+static dev_t devt;          /* major:minor */
+static struct cdev memdev_cdev;
+static uint8_t *memdev_buf;
+static unsigned long memdev_counter;
+static DEFINE_MUTEX(memdev_lock);
 
-```bash
-# See the modalias the kernel assigned to a PCI device
-cat /sys/bus/pci/devices/0000:01:00.0/modalias
-
-# See what module that alias resolves to
-modprobe --resolve-alias $(cat /sys/bus/pci/devices/0000:01:00.0/modalias)
-
-# Dump the device ID table embedded in a module
-modinfo -F alias e1000e
-
-# See the full alias map for all installed modules
-grep e1000e /lib/modules/$(uname -r)/modules.alias
-```
-
-The `pci_bus_match()` function computes the match by ANDing each field in the candidate `pci_device_id` entry with a mask derived from which fields are non-zero. For a `PCI_DEVICE()` entry, vendor and device must match exactly; all other fields are wildcarded. For a class match entry, the class code is masked against the provided mask before comparison:
-
-$$\text{match} = \bigl((\text{dev.class} \;\&\; \text{id.class\_mask}) = \text{id.class}\bigr) \;\land\; \ldots$$
-
-### Probing
-
-Probe is the point of no return. Once `probe()` returns 0, the kernel marks the device as bound and will not call any other driver's probe for this device until `remove()` is called. Inside probe, you must either complete all initialization successfully or undo every partially completed step — the kernel will not clean up for you.
-
-The canonical probe structure uses a goto-chain to unwind in reverse order:
-
-```c
-static int my_probe(struct pci_dev *pdev, const struct pci_device_id *id)
+/* ---- file operations ---- */
+static ssize_t memdev_read(struct file *filp,
+                           char __user *buf,
+                           size_t count,
+                           loff_t *ppos)
 {
-    struct my_priv *priv;
-    int err;
+    size_t n;
+    size_t offset = *ppos;
 
-    /* Step 1: enable the device — powers BARs and enables bus mastering path */
-    err = pci_enable_device(pdev);
-    if (err)
-        return err;                      /* nothing to undo yet */
+    mutex_lock(&memdev_lock);
+    if (offset >= MEMDEV_SIZE) {
+        mutex_unlock(&memdev_lock);
+        return 0;   /* EOF */
+    }
+    n = min(count, MEMDEV_SIZE - offset);
+    if (copy_to_user(buf, memdev_buf + offset, n)) {
+        mutex_unlock(&memdev_lock);
+        return -EFAULT;
+    }
+    *ppos += n;
+    /* increment the whole buffer on each read to show state change */
+    memdev_counter++;
+    memset(memdev_buf, (uint8_t)(memdev_counter & 0xFF), MEMDEV_SIZE);
+    mutex_unlock(&memdev_lock);
+    return n;
+}
 
-    /* Step 2: claim ownership of all BARs registered for this device */
-    err = pci_request_regions(pdev, "my_driver");
-    if (err)
+static const struct file_operations memdev_fops = {
+    .owner   = THIS_MODULE,
+    .read    = memdev_read,
+    .llseek  = no_llseek,
+};
+
+/* ---- module init/exit ---- */
+static int __init memdev_init(void)
+{
+    int ret;
+
+    /* allocate dynamic major */
+    ret = alloc_chrdev_region(&devt, 0, 1, MEMDEV_NAME);
+    if (ret < 0) {
+        pr_err("alloc_chrdev_region failed\n");
+        return ret;
+    }
+    pr_info("memdev: major %d, minor %d\n", MAJOR(devt), MINOR(devt));
+
+    cdev_init(&memdev_cdev, &memdev_fops);
+    memdev_cdev.owner = THIS_MODULE;
+    ret = cdev_add(&memdev_cdev, devt, 1);
+    if (ret) {
+        pr_err("cdev_add failed\n");
+        unregister_chrdev_region(devt, 1);
+        return ret;
+    }
+
+    memdev_buf = kmemdup(memdev_buf, MEMDEV_SIZE, GFP_KERNEL);
+    if (!memdev_buf) {
+        cdev_del(&memdev_cdev);
+        unregister_chrdev_region(devt, 1);
+        return -ENOMEM;
+    }
+    /* initialise buffer */
+    memdev_counter = 0;
+    memset(memdev_buf, 0, MEMDEV_SIZE);
+
+    return 0;
+}
+
+static void __exit memdev_exit(void)
+{
+    kfree(memdev_buf);
+    cdev_del(&memdev_cdev);
+    unregister_chrdev_region(devt, 1);
+    pr_info("memdev: unloaded\n");
+}
+
+module_init(memdev_init);
+module_exit(memdev_exit);
+MODULE_LICENSE("GPL");
+MODULE_AUTHOR("Student");
+MODULE_DESCRIPTION("Simple counter character driver");
+```
+
+**Step‑by‑step explanation**
+1. `alloc_chrdev_region(&devt,0,1,…)` asks the kernel for a free major number; the returned `devt` encodes major in the high 20 bits and minor in the low 12 bits (`devt = (major<<20) | minor`).  
+2. `cdev_init()` fills a `struct cdev` with the supplied `file_operations`.  
+3. `cdev_add()` links the cdev to the device number and makes it visible in `/sys/class/`.  
+4. The buffer is allocated with `kmalloc` (here `kmemdup` for zero‑init). All memory is managed manually; in real drivers you’d use devm_* variants tied to the device’s lifetime.  
+5. On each `read`, we copy `n` bytes from the buffer to user space with `copy_to_user`, update `ppos`, and then mutate the whole buffer to demonstrate stateful behavior.  
+6. `module_exit` reverses every allocation in the exact opposite order to avoid use‑after‑free.
+
+**Run it**
+```bash
+# Build (assumes kernel headers installed)
+make -C /lib/modules/$(uname -r)/build M=$PWD modules
+
+# Load
+sudo insmod memdev.ko
+# Check major number
+grep memdev /proc/devices   # e.g., 250 memdev
+
+# Create device node (udev would do this automatically)
+sudo mknod /dev/memdev c 250 0
+
+# Read a few bytes
+sudo dd if=/dev/memdev bs=1 count=16 | hexdump -C
+# Subsequent reads will show different values because the driver mutates the buffer
+```
+
+### Example 2: Minimal PCI driver for a dummy device
+We’ll use QEMU’s `virtio-pci` as a stand‑in; the driver reads the device’s vendor/device ID, enables BAR0, maps it, and toggles a fake LED by writing to offset 0x0.
+
+```c
+/* dummy_pci.c – PCI driver example */
+#include <linux/module.h>
+#include <linux/pci.h>
+#include <linux/io.h>
+
+#define DRIVER_NAME "dummy_pci"
+
+static const struct pci_device_id dummy_pci_ids[] = {
+    { PCI_DEVICE(0x1af4, 0x1050), },   /* virtio-pci device */
+    { 0, }
+};
+MODULE_DEVICE_TABLE(pci, dummy_pci_ids);
+
+static int dummy_pci_probe(struct pci_dev *pdev,
+                           const struct pci_device_id *ent)
+{
+    int retval;
+    resource_size_t bar0_start, bar0_len;
+    void __iomem *bar0_addr;
+
+    dev_info(&pdev->dev, "Found %s (vendor %04x, device %04x)\n",
+             pci_name(pdev), pdev->vendor, pdev->device);
+
+    /* 1. Enable the device (turn on memory and bus master bits) */
+    retval = pci_enable_device(pdev);
+    if (retval) {
+        dev_err(&pdev->dev, "pci_enable_device failed: %d\n", retval);
+        return retval;
+    }
+
+    /* 2. Ask for BAR0 resources */
+    bar0_start = pci_resource_start(pdev, 0);
+    bar0_len   = pci_resource_len(pdev, 0);
+    if (!bar0_len) {
+        dev_err(&pdev->dev, "BAR0 zero size\n");
+        retval = -ENODEV;
         goto err_disable;
+    }
 
-    /* Step 3: map BAR 0 into kernel virtual address space */
-    void __iomem *base = pci_iomap(pdev, 0, 0);
-    if (!base) { err = -ENOMEM; goto err_release; }
+    /* 3. Reserve the region to prevent other drivers from grabbing it */
+    retval = devm_request_mem_region(&pdev->dev,
+                                     bar0_start, bar0_len, DRIVER_NAME);
+    if (retval) {
+        dev_err(&pdev->dev, "request_mem_region failed: %d\n", retval);
+        goto err_disable;
+    }
 
-    /* Step 4: allocate driver-private state */
-    priv = kzalloc(sizeof(*priv), GFP_KERNEL);
-    if (!priv) { err = -ENOMEM; goto err_unmap; }
+    /* 4. Map BAR0 into kernel virtual space */
+    bar0_addr = devm_ioremap_resource(&pdev->dev,
+                                      &pdev->resource[0]);
+    if (IS_ERR(bar0_addr)) {
+        retval = PTR_ERR(bar0_addr);
+        dev_err(&pdev->dev, "ioremap failed: %pe\n", &pdev->resource[0]);
+        goto err_disable;
+    }
 
-    priv->base = base;
-    pci_set_drvdata(pdev, priv);
+    /* 5. Example: toggle a fake LED at offset 0x0 */
+    iowrite32(0x1, bar0_addr + 0x0);   /* turn on */
+    /* In a real driver you would read back status, set up queues, etc. */
+
+    dev_info(&pdev->dev, "BAR0 mapped at %pa, size %#zx\n",
+             &bar0_start, bar0_len);
     return 0;
 
-err_unmap:
-    pci_iounmap(pdev, base);
-err_release:
-    pci_release_regions(pdev);
 err_disable:
     pci_disable_device(pdev);
-    return err;
+    return retval;
 }
+
+static void dummy_pci_remove(struct pci_dev *pdev)
+{
+    dev_info(&pdev->dev, "Removing %s\n", pci_name(pdev));
+    /* No explicit cleanup needed – devm_* functions auto‑release on remove */
+}
+
+static struct pci_driver dummy_pci_driver = {
+    .name     = DRIVER_NAME,
+    .id_table = dummy_pci_ids,
+    .probe    = dummy_pci_probe,
+    .remove   = dummy_pci_remove,
+};
+
+module_pci_driver(dummy_pci_driver);
+MODULE_LICENSE("GPL");
+MODULE_AUTHOR("Student");
+MODULE_DESCRIPTION("Minimal PCI driver example");
 ```
 
-Every `goto err_*` label undoes exactly one step. This pattern is not stylistic — it is a contract with the kernel that resources are never leaked across a failed probe.
+**Explanation of each probe step**
+| Step | Reason |
+|------|--------|
+| `pci_enable_device()` | Sets the PCI_COMMAND register’s `IO_EN` and `MEM_EN` bits; also checks for broken BARs and enables bus mastering if needed. Without this, the device will not respond to MMIO or DMA. |
+| `pci_resource_start/len()` | Reads the BAR values already fixed by firmware/BIOS; the kernel does **not** reprogram BARs here (that’s done by `pci_alloc_irq_vectors` or `pci_alloc_irq` for MSI). |
+| `devm_request_mem_region()` | Inserts the range into the global `/proc/iomem` tree; prevents another driver from claiming the same physical addresses. |
+| `devm_ioremap_resource()` | Calls `ioremap()` which sets the appropriate page protection (`_PAGE_DEVICE`) and returns a kernel virtual address. On some architectures (e.g., ARM) this also ensures strong ordering. |
+| `iowrite32()` | Writes a 32‑bit value to the device register. The macro expands to `__raw_writel()` which issues a store with the correct memory barrier for the architecture. |
+| `devm_*` variants | Bind the lifetime of the allocated resource to the `struct device`; when `remove` is called, the kernel automatically releases memory, unmaps iomap, and disables the device. This eliminates a large class of leaks. |
 
-### Resources and Ownership
+**Testing on QEMU**
+```bash
+# Start QEMU with a virtio-pci device (uses the same IDs as above)
+qemu-system-x86_64 -enable-kvm \
+    -device virtio-pci-pci,bus=pcie.0 \
+    -nographic -serial mon:stdio
 
-Hardware resources are tracked in a kernel-global tree of `struct resource` nodes. Each node records a physical address range (or IRQ number, or DMA channel), a name, flags, and parent/child/sibling pointers. The tree enforces exclusivity: `request_mem_region(start, len, name)` fails with `NULL` if any overlapping region is already claimed.
+# In another terminal, build and load the driver
+make -C /lib/modules/$(uname -r)/build M=$PWD modules
+sudo insmod dummy_pci.ko
+dmesg | tail -20   # should show probe messages
 
-A PCI device's BARs are physical address windows into the device's register space. BAR 0 of a typical device might occupy $2^{20}$ bytes (1 MiB) of physical address space starting at some address assigned by the PCI host controller during enumeration. The kernel maps this into virtual address space with `pci_iomap()`, and the resulting `void __iomem *` pointer must only be accessed with `ioread32()`/`iowrite32()` and friends — never with plain pointer dereferences — because the mapping may be non-cacheable and the compiler must not reorder or coalesce accesses across it.
+# Unload
+sudo rmmod dummy_pci
+dmesg | tail -5
+```
 
-The virtual address returned by `pci_iomap(pdev, bar, len)` is:
+---
 
-$$V_{\text{base}} = \text{ioremap}(P_{\text{BAR}}, \text{len})$$
+## Common Mistakes
+| Mistake | What’s wrong | Why it breaks |
+|---------|--------------|----------------|
+| **Using `kmalloc` without a matching `kfree` in `remove`** | Memory allocated in `probe` is never freed. | The leaked RAM accumulates each time the driver is loaded/unloaded, eventually exhausting low‑memory zones and causing `malloc` failures in other kernel subsystems. |
+| **Calling `request_irq` with `IRQF_DISABLED`** | Forces the IRQ line to stay disabled while the handler runs. | On SMP systems this degrades interrupt latency for all devices sharing the line and can cause lock‑up if the handler sleeps (which it must not). |
+| **Accessing user‑space buffers directly (`memcpy` from `buf`)** | Bypasses `copy_to_user`/`copy_from_user`. | On architectures with separate user/kernel address spaces (most), this triggers a page fault that the kernel cannot handle, leading to an oops. |
+| **Failing to set a DMA mask (`dma_set_mask`) before allocating coherent memory** | The device may receive addresses it cannot decode (e.g., a 32‑bit device getting a 4 GB+ address). | Results in silent DMA corruption or device hangs; the kernel may print “DMAR: DRHD: handling fault” on Intel VT‑d. |
+| **Not checking the return value of `pci_enable_device`** | Assuming the device is always usable. | Some platforms have mis‑wired BARs or disabled devices in BIOS; the driver will then try to map invalid addresses, causing a kernel page fault. |
+| **Using `spin_lock` instead of `spin_lock_irqsave` in interrupt context** | Does not disable local interrupts while holding the lock. | If the same IRQ occurs again while the lock is held, you get deadlock (the second handler spins forever). |
+| **Sleeping (e.g., `msleep`) inside an ISR or with `spinlock` held** | The scheduler may be invoked while interrupts are disabled or from atomic context. | Leads to “BUG: scheduling while atomic” warnings and can crash the system. |
+| **Hard‑coding major numbers** | `register_chrdev_region(major, 1, …)` with a fixed major. | If another driver already uses that major, registration fails and the module won’t load; also makes the driver non‑portable across kernels. |
+| **Neglecting to call `pci_set_drvdata` / `pci_get_drvdata`** | Storing driver‑specific data in a global variable instead of per‑device. | On SMP or hot‑plug scenarios, data gets clobbered between multiple instances of the same device type. |
 
-where $P_{\text{BAR}}$ is the physical base address the PCI host controller assigned to that
+---
+
+## Exercises
+### 1. Easy – Hello‑World module
+*Write a loadable module that prints “Hello, world!” on load and “Goodbye!” on unload using `pr_info`. Use `module_init` and `module_exit`. Verify with `d

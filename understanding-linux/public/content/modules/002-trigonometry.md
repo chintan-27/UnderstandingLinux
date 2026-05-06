@@ -10,163 +10,158 @@ resources:
     title: "Introduction to Linear Algebra (Strang)"
 ---
 
-## Why This Matters
-
-Every repeating phenomenon in computing — audio samples, clock signals, ADC readings, network jitter profiles — decomposes into sinusoids. This is not a metaphor. The Linux audio stack (`ALSA`, `PulseAudio`, `PipeWire`) fills ring buffers with PCM samples computed from exactly the formula below. The kernel's `clocksource` subsystem and hardware PLLs lock frequencies by minimizing phase error between two sinusoids. `scipy.signal`, `numpy.fft`, and every DSP library you will ever call are manipulating amplitudes, frequencies, and phases. If you do not own this math, you are guessing.
-
----
-
 ## Core Concepts
+A sinusoid is the graph of a function of the form  
+$$y = A\sin(\omega x + \phi)$$  
+where  
 
-### The Sinusoid
+* **Amplitude** $A$ is the peak deviation from zero; it determines the signal’s power ($\propto A^2$).  
+* **Angular frequency** $\omega = 2\pi f$ (rad · s⁻¹) counts how many radians the argument advances per unit of the independent variable $x$ (often time).  
+* **Phase** $\phi$ shifts the wave left/right; physically it represents the initial state of an oscillator at $x=0$.  
 
-$$f(t) = A \sin(2\pi f t + \phi)$$
-
-- $A$ — **amplitude**: peak displacement from zero. Doubling $A$ doubles the energy in the signal (power scales as $A^2$).
-- $f$ — **frequency** in Hz. Determines pitch for audio, color for light, switching rate for a clock line.
-- $\phi$ — **phase** in radians: a horizontal shift. It does not change energy, but it determines how two signals interact when summed.
-- $T = 1/f$ — **period**: time for one complete cycle. A 440 Hz signal has $T = 1/440 \approx 2.27\ \text{ms}$.
-
-**Why sine specifically?** Sine and cosine are the only functions satisfying:
-
-$$\frac{d^2 y}{dt^2} = -\omega^2 y$$
-
-Any system with a restoring force proportional to displacement — a spring, an LC tank circuit, a vibrating membrane — obeys this equation and therefore oscillates sinusoidally. The math does not prefer sine; nature keeps producing it because this differential equation appears everywhere.
-
-### Angular Frequency
-
-$$\omega = 2\pi f \quad \text{(radians per second)}$$
-
-One full cycle covers $2\pi$ radians, so $\omega$ is the rate at which the phase angle advances. The sinusoid becomes:
-
-$$f(t) = A \sin(\omega t + \phi)$$
-
-You will see $\omega$ everywhere in DSP and kernel clock code because it eliminates the $2\pi$ factor in derivatives: $\frac{d}{dt}\sin(\omega t) = \omega\cos(\omega t)$.
-
-### Cosine Is Not a Separate Concept
-
-$$\cos\theta = \sin\!\left(\theta + \frac{\pi}{2}\right)$$
-
-Cosine is sine advanced by a quarter cycle. When you see both in DSP code, one is always derivable from the other. They appear together because real and imaginary components of a complex exponential are cosine and sine respectively — which leads directly to the next point.
-
-### Euler's Formula and Phasors
-
-$$e^{i\theta} = \cos\theta + i\sin\theta$$
-
-A sinusoid is the projection of a rotating complex number onto the real (or imaginary) axis. A point moving at constant angular velocity $\omega$ on the unit circle traces a sine wave when viewed edge-on. This is not just notational convenience — it is the reason sinusoids are preserved under differentiation, integration, and linear filtering: the only effect is a change in amplitude and phase, never a change in shape.
-
-A **phasor** encodes amplitude and phase as a single complex number:
-
-$$\tilde{s} = A e^{i\phi} = A(\cos\phi + i\sin\phi)$$
-
-The time-domain signal is recovered as:
-
-$$s(t) = \operatorname{Re}\!\left[\tilde{s}\cdot e^{i\omega t}\right] = A\cos(\omega t + \phi)$$
-
-Phasors reduce phase arithmetic to complex multiplication. Adding a phase offset $\Delta\phi$ is multiplication by $e^{i\Delta\phi}$. This is exactly what DSP libraries exploit internally.
-
-### Phase
-
-$$s_1(t) = \sin(\omega t), \qquad s_2(t) = \sin(\omega t + \phi)$$
-
-When $\phi = 0$: constructive — summing gives $2\sin(\omega t)$.  
-When $\phi = \pi/2$: orthogonal — the signals share no correlated energy.  
-When $\phi = \pi$: destructive — the sum is identically zero.
-
-The time delay corresponding to a phase shift is:
-
-$$\Delta t = \frac{\phi}{\omega} = \frac{\phi}{2\pi f}$$
-
-A $\pi$ phase shift at 440 Hz corresponds to $\Delta t = 1/(2\times 440) \approx 1.14\ \text{ms}$ — the travel time difference equivalent to about 39 cm of path length in air.
-
----
+A complex number $z = a+ib$ can be expressed in **polar form** as  
+$$z = r\bigl(\cos\theta + i\sin\theta\bigr) = re^{i\theta},$$  
+with magnitude $r=\sqrt{a^2+b^2}$ and argument $\theta=\operatorname{atan2}(b,a)$.  
+Euler’s formula $e^{i\theta}=\cos\theta+i\sin\theta$ links the exponential, trigonometric, and polar representations, enabling the treatment of sinusoids as complex exponentials—a cornerstone of frequency‑domain analysis.
 
 ## How It Works
+### Derivation of Fundamental Identities from the Unit Circle
+Consider a point $P=(\cos\theta,\sin\theta)$ on the unit circle $x^2+y^2=1$. By definition of cosine and sine as the $x$‑ and $y$‑coordinates,
+$$\cos^2\theta+\sin^2\theta = 1 \quad\text{(Pythagorean identity).}$$  
+Differentiating $\sin\theta$ and $\cos\theta$ with respect to $\theta$ yields
+$$\frac{d}{d\theta}\sin\theta = \cos\theta,\qquad 
+\frac{d}{d\theta}\cos\theta = -\sin\theta,$$
+which follows from the geometry of the circle (arc length $= \radius \cdot \Delta\theta$).
 
-### Discrete Sinusoids: The Bridge to Code
+### Angle‑Addition Formulas via Euler’s Formula
+Start with $e^{i(\alpha+\beta)} = e^{i\alpha}e^{i\beta}$. Expanding each side with Euler’s formula gives  
+$$\cos(\alpha+\beta)+i\sin(\alpha+\beta)=
+(\cos\alpha+i\sin\alpha)(\cos\beta+i\sin\beta).$$  
+Multiplying the right‑hand side and equating real and imaginary parts produces  
+$$\boxed{\cos(\alpha+\beta)=\cos\alpha\cos\beta-\sin\alpha\sin\beta}$$  
+$$\boxed{\sin(\alpha+\beta)=\sin\alpha\cos\beta+\cos\alpha\sin\beta}.$$  
+Setting $\beta=\alpha$ yields the double‑angle formulas  
+$$\sin(2\alpha)=2\sin\alpha\cos\alpha,\qquad 
+\cos(2\alpha)=\cos^2\alpha-\sin^2\alpha.$$
 
-The continuous formula $A\sin(\omega t)$ becomes, when sampled at rate $f_s$:
+### From Time‑Domain to Frequency‑Domain
+A real‑valued sinusoid $x(t)=A\cos(\omega_0 t+\phi)$ can be written as the sum of two complex exponentials:
+$$x(t)=\frac{A}{2}e^{i(\omega_0 t+\phi)}+\frac{A}{2}e^{-i(\omega_0 t+\phi)}.$$  
+Thus its Fourier transform consists of two Dirac impulses at $\pm\omega_0$, each weighted by $\frac{A}{2}e^{\pm i\phi}$. This representation is what the Linux kernel’s **ALSA** subsystem uses when it converts PCM samples to spectral data for equalizers or noise‑suppression filters.
 
-$$s[n] = A \sin\!\left(\frac{2\pi f\, n}{f_s}\right)$$
+## Worked Examples
+### Example 1: Extracting Amplitude, Angular Frequency, and Phase
+Given $y(t)=5\sin\bigl(4t-\pi/3\bigr)$.
 
-where $n$ is the sample index and $t = n/f_s$. Every audio driver on Linux fills its DMA buffer with values of this formula (or a sum of them). The index $n$ is an integer; the frequency ratio $f/f_s$ determines how many samples per cycle.
+1. **Amplitude**: coefficient of sine → $A=5$.  
+2. **Angular frequency**: coefficient of $t$ inside the argument → $\omega=4\;\text{rad/s}$.  
+3. **Ordinary frequency**: $f=\omega/(2\pi)=\dfrac{4}{2\pi}\approx0.6366\;\text{Hz}$.  
+4. **Phase**: $\phi=-\pi/3$ rad (≈ −60°).  
 
-```python
-import math
+*Verification*: At $t=0$, $y(0)=5\sin(-\pi/3)=-5\cdot\frac{\sqrt3}{2}\approx-4.33$, which matches the shifted sine wave.
 
-SAMPLE_RATE = 44100   # Hz — standard CD quality
-FREQUENCY   = 440.0   # Hz — concert A
-AMPLITUDE   = 0.8     # normalized: 1.0 = full scale
-DURATION    = 1.0     # seconds
+### Example 2: Polar Form and Principal Argument
+Let $z=-1+i\sqrt3$.
 
-num_samples = int(SAMPLE_RATE * DURATION)
-omega = 2 * math.pi * FREQUENCY
+1. Magnitude: $r=\sqrt{(-1)^2+(\sqrt3)^2}= \sqrt{1+3}=2$.  
+2. Raw arctangent: $\arctan\bigl(\frac{\sqrt3}{-1}\bigr)=\arctan(-\sqrt3)=-\pi/3$.  
+3. Since the point lies in quadrant II ($x<0, y>0$), add $\pi$:  
+   $\theta = -\pi/3+\pi = 2\pi/3$.  
+4. Polar form: $$z = 2\bigl(\cos(2\pi/3)+i\sin(2\pi/3)\bigr)=2e^{i\,2\pi/3}.$$
 
-samples = [
-    AMPLITUDE * math.sin(omega * n / SAMPLE_RATE)
-    for n in range(num_samples)
-]
-# samples[n] is the normalized air pressure at t = n / SAMPLE_RATE
-# For 16-bit PCM: multiply by 32767 and cast to int16
-```
+### Example 3: Deriving $\sin(2x)=2\sin x\cos x$ from Euler’s Formula (step‑by‑step)
+1. Write $e^{i2x} = (e^{ix})^2$.  
+2. Expand left side with Euler: $\cos(2x)+i\sin(2x)$.  
+3. Expand right side: $(\cos x+i\sin x)^2 = \cos^2x-\sin^2x + i\,2\sin x\cos x$.  
+4. Equate imaginary parts: $\sin(2x)=2\sin x\cos x$.  
 
-At 44100 Hz, 440 Hz gives exactly $44100/440 = 100.227\ldots$ samples per cycle — not an integer, which is why naive looping introduces phase discontinuities at buffer boundaries. The correct approach is to accumulate phase, not recompute $t$ from scratch each buffer.
+## Common Mistakes
+| Mistake | Why It’s Wrong | Correct Approach |
+|---------|----------------|------------------|
+| Using $\tan^{-1}(y/x)$ without `atan2` to find the argument of a complex number. | $\tan^{-1}$ returns values only in $(-\pi/2,\pi/2)$; it cannot distinguish quadrants II and III, leading to an argument off by $\pi$. | Use `atan2(y, x)` (C: `atan2(y, x)`; Bash: `awk -v y=$Y -v x=$X 'BEGIN{printf "%f", atan2(y,x)}'`). |
+| Confusing angular frequency $\omega$ with ordinary frequency $f$ and omitting the $2\pi$ factor when converting. | The argument of $\sin$ or $\cos$ must be dimensionless; $\omega t$ is in radians, while $f t$ is in cycles. Missing $2\pi$ yields a period off by a factor of $2\pi$. | Always apply $\omega = 2\pi f$; verify by checking that the period $T = 2\pi/\omega = 1/f$. |
+| Assuming $\sin^2\theta+\cos^2\theta=1$ holds for complex $\theta$. | The identity derives from the real unit circle; for complex $\theta$, $\sin$ and $\cos$ become hyperbolic, and the sum equals $\cosh(2\operatorname{Im}\theta)$. | Restrict the identity to real arguments; for complex arguments use $\sin^2z+\cos^2z=1$ still holds (it’s an identity of analytic functions) but the geometric interpretation changes; verify via series expansion if needed. |
+| Neglecting phase when modeling a signal as $A\sin(\omega t)$ only. | Phase determines the initial condition of a physical oscillator; ignoring it can cause sign errors in interference or control‑loop calculations. | Keep $\phi$ explicit; when measuring a signal, compute $\phi = \operatorname{atan2}\bigl(\text{quadrature component},\text{in‑phase component}\bigr)$. |
 
-### Superposition: Waveforms as Sums of Sinusoids
+## Exercises
+1. **(Easy)** A discrete‑time signal is given by $x[n]=3\cos\bigl(\frac{\pi}{4}n+\pi/6\bigr)$. State its amplitude, angular frequency (rad/sample), and ordinary frequency (cycles/sample).  
+2. **(Medium)** Convert the complex number $z=-2-2i$ to polar form, giving the principal argument in radians.  
+3. **(Hard)** A sinusoidal voltage $v(t)=V_m\sin(2\pi 50 t+\pi/4)$ drives a resistive load $R=10\;\Omega$.  
+   a) Derive the instantaneous power $p(t)=v^2(t)/R$ and express it as a sum of a constant term and a sinusoid at twice the line frequency.  
+   b) Compute the average power over one period.  
+   c) Write a short C program (using `<math.h>`) that samples $v(t)$ at 1 kHz for 0.2 s and prints the RMS value; compile and run it on a Linux box, showing the command line.
 
-Any periodic signal with period $T$ decomposes as:
+## Linux Connection
+Trigonometric routines appear throughout the Linux stack, from the kernel’s fixed‑point approximations to user‑space libraries that implement the IEEE‑754 `sin`, `cos`, and `atan2` functions.
 
-$$x(t) = \sum_{k=0}^{\infty} A_k \sin(k \omega_0 t + \phi_k), \qquad \omega_0 = \frac{2\pi}{T}$$
+* **libm (glibc)** – The standard math library.  
+  ```bash
+  # Locate the sin implementation in glibc (x86‑64)
+  objdump -d /lib/x86_64-linux-gnu/libm.so.6 | grep -A5 "<sin>"
+  ```
+  The source (in `sysdeps/ieee754/ldbl-96/s_sinl.c`) uses a minimax polynomial approximation after argument reduction via the `rempio2` kernel.
 
-The $k=1$ term is the **fundamental**; $k > 1$ terms are **harmonics**. The waveform *shape* — square, sawtooth, triangle — is entirely determined by which harmonics are present and at what relative amplitudes and phases. This is the Fourier series.
+* **Kernel fixed‑point sin/cos** – Used in drivers where floating‑point is prohibited (e.g., early boot, real‑time schedulers).  
+  ```c
+  /* Example from arch/x86/lib/tsc.c (simplified) */
+  static inline s32 sin_fixed(s32 x)   /* x in Q2.30 format */
+  {
+      /* table‑lookup + linear interpolation */
+  }
+  ```
+  You can inspect it with:
+  ```bash
+  grep -R "sin_fixed" /usr/src/linux-headers-$(uname -r)/arch/x86/lib/
+  ```
 
-A 440 Hz square wave:
+* **ALSA PCM API** – Applications capture or play audio samples; many effects (e.g., tremolo, vibrato) are implemented by modulating amplitude or frequency with a sinusoid.  
+  ```bash
+  # Generate a 440 Hz sine wave for 2 seconds using sox (uses libm internally)
+  play -n synth 2 sine 440
+  ```
+  To see the underlying syscalls, trace with `strace`:
+  ```bash
+  strace -e trace=write play -n synth 2 sine 440 2>&1 | head
+  ```
 
-$$x(t) = \frac{4}{\pi}\sum_{k=1,3,5,\ldots} \frac{1}{k}\sin(2\pi \cdot 440k \cdot t)$$
+* **FFTW (Fastest Fourier Transform in the West)** – Library used by audio analysis tools (e.g., `audacity`, `praat`) to compute the spectrum of a signal; internally it multiplies data by complex exponentials $e^{-i2\pi k n/N}$.  
+  ```bash
+  # Install and test FFTW
+  sudo apt-get install fftw3-dev
+  cat > test_fft.c <<'EOF'
+  #include <fftw3.h>
+  #include <math.h>
+  #include <stdio.h>
+  int main(void){
+      const int N=8;
+      double in[N]; fftw_complex out[N];
+      fftw_plan p = fftw_plan_dft_r2c_1d(N,in,out,FFTW_ESTIMATE);
+      for(int i=0;i<N;i++) in[i]=sin(2*M_PI*2*i/N); /* 2‑cycle sinusoid */
+      fftw_execute(p);
+      for(int i=0;i<N;i++)
+          printf("bin %d: %g + %gi\n", i, out[i][0], out[i][1]);
+      fftw_destroy_plan(p);
+      return 0;
+  }
+  EOF
+  gcc test_fft.c -lfftw3 -lm -o test_fft && ./test_fft
+  ```
+  The output shows a peak at bin 2 (and its conjugate at bin 6), confirming the sinusoid’s frequency.
 
-Only odd harmonics, amplitudes decaying as $1/k$. Truncate the sum at 20 kHz (the hearing limit) and you get the audible approximation. A sawtooth includes all harmonics ($1/k$), which is why it sounds brighter than a square.
+* **V4L2 (Video4Linux2)** – Color space conversion routines (e.g., RGB↔YCbCr) use sine/cos‑based rotation matrices for hue adjustments.  
+  ```bash
+  # List available pixel formats that involve conversion
+  v4l2-ctl --list-formats-ext | grep -E "YUV|HSV"
+  ```
 
-### Phase Differences Are Physical Path Differences
+These concrete interfaces show how the abstract trigonometric concepts are turned into runnable code, system calls, and library functions on a modern Linux system.
 
-Two microphones recording the same point source, mic 2 at distance $d$ further away. Sound travels at $c \approx 343\ \text{m/s}$, so the extra delay is $\Delta t = d/c$:
+## Why This Matters
+Trigonometry supplies the mathematical language for any phenomenon that repeats or rotates—oscillating voltages, rotating phasors, wheel encoders, or the phase of a carrier wave. In Linux, this language is realized in:
 
-$$s_2(t) = \sin\!\bigl(\omega(t - \Delta t)\bigr) = \sin(\omega t - \omega \Delta t)$$
+* **Audio pipelines** (ALSA, PulseAudio, JACK) where signals are generated, filtered, and analyzed using sinusoids and their Fourier transforms.  
+* **Graphics stacks** (DRM/KMS, Mesa, Wayland compositors) that perform rotations, hue shifts, and projection via sine/cos‑based matrices.  
+* **Control loops** in the kernel (e.g., CFS scheduler’s vruntime calculation, timers) that rely on periodic updates derived from angular frequencies.  
+* **Numerical libraries** (FFTW, GSL, libm) that provide highly optimized, correctly‑rounded implementations of the transcendental functions, enabling scientific computing, machine‑learning preprocessing, and real‑time signal processing on commodity hardware.
 
-The phase difference:
-
-$$\Delta\phi = \omega \Delta t = \frac{2\pi f d}{c}$$
-
-When $d = \lambda/2$ (half a wavelength), $\Delta\phi = \pi$, and summing the two channels gives silence at frequency $f$. This is **comb filtering** — notches at $f = c/(2d),\ 3c/(2d),\ 5c/(2d),\ldots$. It is why placing two microphones at different distances from a speaker causes audible frequency-dependent cancellation, and why JACK session engineers care about microphone placement even in software routing.
-
-### Phasor Arithmetic in Code
-
-```python
-import cmath
-
-def make_phasor(amplitude: float, phase_rad: float) -> complex:
-    """Encode amplitude + phase as a complex number."""
-    return amplitude * cmath.exp(1j * phase_rad)
-
-def shift_phase(phasor: complex, delta_phi: float) -> complex:
-    """Rotate phasor by delta_phi radians — O(1) phase manipulation."""
-    return phasor * cmath.exp(1j * delta_phi)
-
-def to_signal(phasor: complex, omega: float, t: float) -> float:
-    """Recover real time-domain value at time t."""
-    return (phasor * cmath.exp(1j * omega * t)).real
-
-# Example: 1 kHz signal, phase-shifted 90 degrees
-p = make_phasor(1.0, 0.0)
-p_shifted = shift_phase(p, math.pi / 2)
-# p_shifted now represents cos(ωt) instead of sin(ωt)
-```
-
-Multiplying two phasors: amplitudes multiply, phases add — $A_1 e^{i\phi_1} \cdot A_2 e^{i\phi_2} = A_1 A_2\, e^{i(\phi_1+\phi_2)}$. This is the algebraic foundation of every digital filter and mixer.
-
----
-
-## Linux Connections
-
-### ALSA: Where the Samples Live
-
-ALSA exposes audio hardware through `/dev/snd/`. The userspace API fills a ring buffer; the kernel DMA-transfers
+By mastering the definitions, derivations, and practical manifestations of sinusoids, phase, and frequency, you gain the ability to read, modify, and extend the very subsystems that turn electrical impulses into sound, images, and control actions on a Linux system. This bridges the gap between abstract mathematics and the concrete, performance‑critical code that powers the open‑source stack.

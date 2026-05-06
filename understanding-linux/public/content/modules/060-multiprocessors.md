@@ -10,150 +10,242 @@ resources:
     title: "Computer Architecture A Quantitative Approach (Hennessy)"
 ---
 
-## Why This Matters
-
-When a single processor reads a memory location, the answer is unambiguous. Add a second processor with its own cache, and the same physical address now has multiple live copies — one per L1 cache that loaded it. The moment any core writes, those copies diverge. Without a protocol to manage this, two threads can read the same address and see different values indefinitely. This failure is not theoretical and not rare: it is the default behavior of unsynchronized shared memory, and every SMP kernel, every lock implementation, and every atomic operation exists specifically to fight it.
-
-Beyond coherence, memory access time is non-uniform on multi-socket hardware. A thread on socket 1 accessing memory physically attached to socket 0 crosses an inter-socket interconnect on every miss. That latency penalty is silent, produces no errors, and can cut memory-bound throughput by 30–50%. Understanding NUMA is not optional for anyone writing or tuning software on server hardware.
-
----
-
 ## Core Concepts
+### Multiprocessor Taxonomy and Interconnects
+A multiprocessor system couples *N* processing cores via an interconnect that determines how memory references travel. The three classic classifications are:
 
-### Private Caches Create the Coherence Problem
+| Class | Memory Access | Typical Interconnect | Scalability Limitation |
+|-------|---------------|----------------------|------------------------|
+| UMA (Uniform Memory Access) | All cores see identical latency & bandwidth to any address | Shared bus, crossbar, or early mesh | Bus contention limits *O(N)* bandwidth |
+| NUMA (Non‑Uniform Memory Access) | Each core has *local* memory with low latency; remote memory incurs higher latency & lower bandwidth | Point‑to‑point links (Intel QPI/UPI, AMD Infinity Fabric), hierarchical mesh | Remote‑access penalty grows with hop count |
+| COMA (Cache‑Only Memory Architecture) | Main memory is distributed as caches; no backing DRAM per node | Same as NUMA but requires coherence to maintain a global view | Directory size scales with total cache capacity |
 
-Each core has its own L1 (and usually L2) cache. When core 0 loads address `0x1000`, the line is fetched into core 0's L1. When core 1 loads the same address, it gets its own copy in its own L1. Both caches hold the data; neither knows the other exists. This is the fundamental problem: the coherence invariant — *at any point, all processors agree on the value of every memory location* — is already broken the moment one copy is modified without notifying the other.
+The choice of interconnect directly influences **latency** (*L*) and **bandwidth** (*B*) seen by a core. For a simple bus, the effective bandwidth per core is *B/N* because every transaction occupies the bus; a crossbar can provide *B* per port, scaling linearly with *N* until the switch fabric saturates.
 
-Private caches exist because shared caches serialize access: if every core competed for a single L1, the cache itself would become the bottleneck. The coherence problem is therefore not a design flaw; it is the direct consequence of a necessary performance trade-off.
+### Why Private Caches Create a Coherence Problem
+Each core typically possesses a private L1 (and often L2) cache to reduce average memory‑access time:
+\[
+\text{AMAT}= \underbrace{t_{hit}}_{\text{cache hit}} + m \cdot t_{miss},
+\]
+where *m* is the miss rate. When two cores cache the same memory line, a write by one core leaves the other with a **stale copy** unless the system propagates the update or invalidates the other copy.  
 
-### Write Serialization
+**Coherence** requires two properties:
 
-Coherence requires more than eventual visibility — it requires **order**. If P1 writes value `A` and then P2 writes value `B` to the same address, every observer must see the writes in the same sequence. Without a total order on writes to each address, P3 could permanently hold `A` while P4 permanently holds `B`. The two processors would disagree about the current value of the location, and no amount of waiting would resolve it.
+1. **Write Propagation (or Invalidation)** – After a write, any subsequent read of that address must return the written value.
+2. **Write Serialization** – Writes to the same location must appear in a single total order to all observers.
 
-Write serialization is the guarantee that this cannot happen. On x86, it is enforced by the cache coherence protocol plus the Total Store Order (TSO) memory model. On ARM, which has a weaker memory model, explicit barrier instructions are required to achieve the same effect.
+If either property fails, programs observing shared data can see impossible values (e.g., a read‑modify‑write loop diverging).
 
-### MESI: The Standard Coherence Protocol
+### Snooping vs. Directory‑Based Coherence: First‑Principle Rationale
+Both approaches solve the same problem but trade **communication overhead** against **state storage**.
 
-The dominant mechanism for snooping-based coherence is the **MESI** state machine. Every cache line carries one of four states:
+* **Snooping** – Every core watches a *shared broadcast medium* (bus or equivalent). On a write, the core issues a *BusRdX* (read‑exclusive) transaction; all snoopers check their caches and, if they hold the line, either supply data (if in Shared state) or invalidate (if in Modified/Exclusive).  
+  *Why it works*: The broadcast guarantees that **all** cores see the request, so the invalidation/replacement is guaranteed to reach every possible holder.  
+  *Cost*: Each coherence transaction generates *O(N)* bus traffic, limiting scalability.
 
-| State | Meaning |
-|---|---|
-| **M**odified | Dirty; this cache holds the only valid copy. Memory is stale. |
-| **E**xclusive | Clean; this cache holds the only copy. Memory is current. |
-| **S**hared | Clean; other caches may also hold this line. |
-| **I**nvalid | This cache line is unusable and must be fetched before use. |
+* **Directory‑Based** – A *directory* (often distributed in hardware) records, for each memory block, the set of cores that may hold a copy (a *sharer vector*). On a write, the requesting core sends a message to the directory; the directory then sends point‑to‑point invalidations only to the current sharers.  
+  *Why it works*: The directory knows **exactly** who might have a stale copy, so it can target invalidations without broadcasting to uninterested cores.  
+  *Cost*: Storage grows as *O(M·S)* where *M* is the number of memory blocks and *S* is the directory entry size (typically a few bits per core). The protocol incurs extra latency for the directory round‑trip but scales to hundreds of cores.
 
-Each cache **snoops** the interconnect — it monitors all transactions from all other caches. When core 0 issues a write, it broadcasts an invalidation. Every other cache holding that line transitions to Invalid. The next read from any of those caches misses and fetches the updated value from core 0 (or from memory after core 0 writes back). The invalidation happens *before* the write is considered globally visible on strongly-ordered architectures; this is what makes the protocol correct rather than merely eventually consistent.
+### NUMA: Quantifying the Non‑Uniformity
+Let *Lₗ* be the latency to access local memory and *Lᵣ* the latency to remote memory ( *Lᵣ* > *Lₗ* ). If a fraction *p* of a program’s memory references go to remote nodes, the **average memory‑access time** is:
+\[
+\text{AMAT}_{\text{NUMA}} = (1-p)\,L_{L} + p\,L_{R}.
+\]
+Because *Lᵣ* can be 2–3× *Lₗ* on modern Xeon/EPYC sockets, even a modest *p* = 0.2 can increase AMAT by 20‑40 %. Moreover, remote traffic consumes inter‑socket link bandwidth, which can become saturated before local bandwidth is exhausted.
 
-The E state exists as an optimization: a line in E can be promoted to M on a write without a bus transaction, because no invalidations are needed — no other cache holds a copy. Without E, every write to a freshly loaded private line would require a broadcast.
+### Inter‑Socket Behavior: Beyond Simple Latency
+When a core modifies a cache line that is shared across sockets, the coherence protocol triggers **cross‑socket traffic**:
 
-### Migration and Replication
+* **Read‑Ownership (BusRdX)** – transfers the line in Modified state to the requester, invalidating all other copies.
+* **Read‑Shared (BusRd)** – supplies data if the line is clean in another socket; otherwise triggers a memory read.
+* **Write‑Back** – occurs when a Modified line is evicted; the data must be sent to the home node (or directly to a requester).
 
-MESI gives coherent caches two useful behaviors automatically:
-
-- **Migration**: A thread moved to a different core still accesses its data correctly. The first access on the new core misses and pulls the line to the new cache; subsequent accesses are local. The hardware handles relocation transparently.
-- **Replication**: Multiple cores reading the same read-only data each hold a local copy in state S. Read bandwidth scales linearly with the number of readers; no core needs to wait for another.
-
-Both properties depend entirely on the coherence protocol being correct. If the protocol drops an invalidation, migration silently returns stale data. This is why hardware vendors invest enormous verification effort in coherence implementations.
-
-### NUMA: Non-Uniform Memory Access
-
-On a single-socket machine, every DRAM access travels the same path: core → L3 → memory controller → DRAM. On a multi-socket machine, each socket has its own memory controller and its own directly attached DRAM. Accessing local DRAM might cost $L_{\text{local}} \approx 80\text{ ns}$. Accessing memory on a remote socket requires crossing the inter-socket fabric — Intel Ultra Path Interconnect (UPI), AMD Infinity Fabric — adding another 40–80 ns. The system presents a single flat virtual address space, but access time depends on which socket owns the physical page.
-
-The NUMA topology is not hidden from software. The kernel, the allocator, and the scheduler can all observe and exploit it — but only if they are configured to do so.
+These transfers consume **inter‑socket link bandwidth** (*Bₗₐₙₖ*). If many cores repeatedly invalidate the same line (false sharing), the effective bandwidth per core can drop dramatically, turning a compute‑bound problem into a **coherence‑bound** one.
 
 ---
 
 ## How It Works
+### MESI Snooping Protocol – Step‑by‑Step
+The MESI (Modified, Exclusive, Shared, Invalid) protocol uses four states per cache line. Below is the state‑transition table for a write‑invalidate snooping bus (signals in **bold**):
 
-### MESI State Transitions in Detail
+| Current State | CPU Action | Bus Signal | New State | Action Taken |
+|---------------|------------|------------|-----------|--------------|
+| **M** (Modified) | Local write | — | M | Write locally; no bus traffic |
+| **E** (Exclusive) | Local write | — | M | Write locally; line becomes Modified |
+| **S** (Shared) | Local write | **BusRdX** | M | Invalidate all other caches (they see BusRdX and go to I); acquire ownership |
+| **I** (Invalid) | Local read miss | **BusRd** | S/E | If another cache has line in E/S, it supplies data (S); else memory supplies (E). |
+| **I** (Invalid) | Local write miss | **BusRdX** | M | Invalidate all others; acquire line from memory or another cache (if any has it in E/S). |
 
-Consider two cores sharing an interconnect, both starting with a cache line at address `X` in state Invalid.
+**Why the BusRdX is necessary**: A write requires exclusive ownership because any other cached copy would become stale. The BusRdX signal tells every snooper: “I intend to write; if you have this line, either give me the latest data (if you are in E/S) or invalidate your copy.” The bus guarantees that *all* cores observe the signal, thus satisfying write propagation.
 
-```
-1. Core 0 reads X:
-   Transaction: BusRd(X)
-   Memory responds with data.
-   Core 0: I → E   (no other cache has it; exclusive ownership)
+### Directory‑Based Protocol – Step‑by‑Step (Hierarchical Directory)
+Assume a *sparse directory* where each memory block has a *home node* (the node where the memory physically resides) and a sharer bit‑vector.
 
-2. Core 1 reads X:
-   Transaction: BusRd(X)
-   Core 0 snoops the transaction: E → S   (must downgrade; now shared)
-   Memory (or core 0) supplies data.
-   Core 1: I → S
+1. **Read Miss (CPU i)** → sends *ReadReq* to home node *H*.  
+2. **Directory at H** checks sharer vector:  
+   - If vector = 0 (no sharers): returns data from memory, sets bit *i*.  
+   - If vector ≠ 0: forwards data from the owner (if any) or memory, adds *i* to vector, returns data.  
+3. **Write Miss (CPU i)** → sends *ReadExReq* to *H*.  
+4. **Directory** sends *Invalidate* to each current sharer *j* (from vector).  
+5. Each sharer *j* replies with *InvAck* after invalidating its cache line (state → I).  
+6. After all *InvAcks* received, directory grants *ReadExResp* (data if needed) to *i*, sets vector = {i}, marks line as *Modified* in the directory state.  
+7. CPU *i* performs the write locally.
 
-3. Core 0 writes X:
-   Transaction: BusRdX(X)   (read-exclusive upgrade)
-   Core 1 snoops: S → I     (invalidated before write completes)
-   Core 0: S → M
-   Core 1's next read will miss; it fetches core 0's modified value.
-```
+**Why point‑to‑point invalidations scale**: The number of messages per write is *2·|S| + 2* (request + response per sharer + request/response to directory). If the average sharer count |S| ≪ *N*, the protocol avoids the *O(N)* broadcast cost of snooping.
 
-Step 3 is the critical one. The BusRdX is a **read-for-ownership** transaction: it simultaneously fetches the line (if needed) and invalidates all other copies. The invalidation acknowledgment from core 1 must arrive before core 0's write is considered globally visible. This sequencing is what makes the protocol linearizable.
+### Quantitative Comparison
+For a system with *N* cores and average sharer count *s*:
 
-If many cores hold a line in S and one wants to write, it must collect invalidation acknowledgments from all of them. This is the **invalidation storm** that can occur with high-fan-out sharing, and it is why lock implementations try to minimize the number of cores spinning on the same cache line.
+| Protocol | Messages per Write | Bandwidth per Write (flits) | Storage Overhead |
+|----------|-------------------|----------------------------|------------------|
+| Snooping (bus) | 1 broadcast + up to *N‑1* invalidations (implicit) | ≈ *C* (where *C* = cache line size) + arbitration overhead | None (states per line) |
+| Directory | 2 (sReq + sResp) + 2·*s* (inval + ack) + 2 (grant + data) | ≈ (2 + 4·*s*)·*C* | *S* bits per line (sharer vector) + state bits |
 
-### False Sharing: When Coherence Hurts Performance
+When *s* ≪ *N/2*, directory wins; when *s* ≈ *N* (e.g., widely shared read‑only data), snooping may be cheaper because the directory must still send many invalidations.
 
-MESI operates at **cache line granularity** — 64 bytes on x86. Two logically independent variables that happen to occupy the same cache line will trigger coherence traffic on every write to either variable, even though no actual data sharing occurs.
+---
+
+## Worked Examples
+### Example 1: MESI Snooping with Two Cores (P0, P1)
+Assume cache line size = 64 B, initial address 0x1000 contains value 0. Both cores have the line in **Exclusive** (E) state after a private read.
+
+| Step | Action (CPU) | Bus Signal | P0 State | P1 State | Memory Value | Comments |
+|------|--------------|------------|----------|----------|--------------|----------|
+| 0 | – | – | E | E | 0 | Both have clean exclusive copies. |
+| 1 | P0 writes 0x1000 ← 5 | **BusRdX** | M | I | 0 (stale) | P1 sees BusRdX, invalidates (I). P0 becomes Modified. |
+| 2 | P1 reads 0x1000 | **BusRd** | M | S | 5 | P0 intervenes, supplies data (5) and drops to Shared. |
+| 3 | P1 writes 0x1000 ← 9 | **BusRdX** | I | M | 5 (stale) | P0 sees BusRdX, invalidates (I). P1 becomes Modified. |
+| 4 | P0 reads 0x1000 | **BusRd** | S | M | 9 | P1 supplies data (9), drops to Shared. |
+
+*Timing*: Assume each bus transaction occupies 1 bus cycle and the bus can transfer one 64‑B line per cycle. The sequence took **4 cycles**; note that each write induced a bus transaction, even though the core could have completed the write locally after acquiring ownership.
+
+### Example 2: Directory‑Based Protocol with Four Nodes (N0–N3)
+Memory block 0x2000 resides in node N0 (home). Directory entry: *sharer_vec* = 0b0000, *state* = *Uncached*. All cores start with the line invalid.
+
+| Step | Action (CPU) | Message | Directory Update | Sharer Vec | Owner Node | Comments |
+|------|--------------|---------|------------------|------------|------------|----------|
+| 0 | N2 read miss | ReadReq → N0 | state←Shared, vec←0010 (bit 2 set) | 0010 | N0 (memory) | N0 supplies data from memory. |
+| 1 | N3 read miss | ReadReq → N0 | vec←1010 (bits 2 & 3) | 1010 | N0 | N0 supplies data; N2 & N3 now Shared. |
+| 2 | N1 write miss | ReadExReq → N0 | Send Inv to N2,N3; wait for Ack | — | — | N0 awaits invalidations. |
+| 3 | N2 invalidate | Inv from N0 | N2 sends InvAck | — | — | N2 state→I. |
+| 4 | N3 invalidate | Inv from N0 | N3 sends InvAck | — | — | N3 state→I. |
+| 5 | N0 receives both Ack | — | state←Modified, vec←0100 (bit 1) | 0100 | N1 (owner) | N0 forwards latest data (if any) to N1. |
+| 6 | N1 writes locally | — | — | 0100 | N1 | N1 now holds Modified copy. |
+| 7 | N0 read miss | ReadReq → N0 | Owner N1 supplies data; state←Shared, vec←0011 (bits 0 & 1) | 0011 | N0 (memory) | N0 now Shared; N1 remains Shared. |
+
+*Latency*: Assume each hop (core→local controller→interconnect→remote controller) adds 50 ns, and the interconnect latency per hop is 100 ns. A read miss that goes to home node and returns costs roughly 2 × (50 + 100 + 50) = 400 ns. A write miss adds invalidation rounds: two invokes (N0→N2, N0→N3) + two acks = 4 × (50 + 100 + 50) = 800 ns, plus the data forward (another 400 ns) → ~1.2 µs total. This demonstrates why directory protocols trade latency for scalability.
+
+---
+
+## Common Mistakes
+| # | Mistake | Why It’s Wrong | Correct Understanding |
+|---|---------|----------------|-----------------------|
+| 1 | **“Cache coherence is free; hardware handles it automatically.”** | Coherence consumes bandwidth and latency; excessive invalidations can saturate interconnects and stall cores. | Quantify coherence traffic (messages per write) and measure with hardware counters (e.g., `OFFCORE_RESPONSE`). |
+| 2 | **“False sharing only matters if the same variable is written.”** | Even read‑only sharing can cause unnecessary invalidations when a core evicts a line due to capacity pressure, forcing a refetch. | Align data to cache‑line boundaries and pad structures; use `pthread_getspecific` or per‑thread buffers to avoid shared lines. |
+| 3 | **“Directory protocols eliminate all broadcast traffic.”** | They still need broadcast for *directory misses* (e.g., when a block has never been cached) and for *eviction‑writebacks* that may need to update the home node. | Recognize that directory traffic scales with sharer count, not core count, but is not zero. |
+| 4 | **“NUMA performance penalty is only about latency; bandwidth is irrelevant.”** | Remote accesses also consume limited inter‑socket bandwidth; saturating this bandwidth hurts all remote traffic, increasing effective latency. | Use `numastat` and `perf stat -e offcore_response.all_data_rd.l3_miss.remote_dram` to detect bandwidth saturation. |
+| 5 | **“All cores see the same cache line size, so padding to 64 B is enough.”** | Some architectures have non‑power‑of‑two line sizes (e.g., 128 B on certain IBM Power chips) or split‑line L1 caches. | Query `cpuid` or `lscpu --caches` to obtain actual line size per cache level. |
+| 6 | **“Increasing the number of cores always improves parallel speed‑up.”** | Beyond a point, coherence overhead (invalidations, directory lookups) grows faster than useful work, leading to negative scaling. | Apply the universal scalability law: \(S(N) = \frac{N}{1 + \alpha(N-1) + \beta N(N-1)}\) where α is contention and β is coherency delay. |
+
+---
+
+## Exercises
+### 1. Easy – Detect False Sharing
+**Goal**: Observe performance degradation when two threads increment adjacent counters that share a cache line.
 
 ```c
-/* Pathological false sharing: both counters fit in one 64-byte line */
-struct {
-    long counter_a;  /* written only by core 0 */
-    long counter_b;  /* written only by core 1 */
-} counters;
+/* false_sharing.c */
+#include <pthread.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <unistd.h>
+
+#define NITER 100000000L
+#define PAD 64   /* cache line size */
+
+struct counter {
+    volatile uint64_t value;
+    uint8_t pad[PAD - sizeof(uint64_t)];
+};
+
+struct counter c1, c2;   /* placed adjacently by compiler */
+
+void *inc(void *arg) {
+    struct counter *c = arg;
+    for (uint64_t i = 0; i < NITER; ++i)
+        c->value++;       /* non‑atomic for simplicity */
+    return NULL;
+}
+
+int main(void) {
+    pthread_t t1, t2;
+    pthread_create(&t1, NULL, inc, &c1);
+    pthread_create(&t2, NULL, inc, &c2);
+    pthread_join(t1, NULL);
+    pthread_join(t2, NULL);
+    printf("c1=%lu c2=%lu\n", c1.value, c2.value);
+    return 0;
+}
 ```
+*Compile*: `gcc -O2 -march=native -pthread false_sharing.c -o false_sharing`  
+*Run*: `./false_sharing` and time with `time`.  
+*Experiment*: Change `PAD` to 0 (no padding) and observe the slowdown due to false sharing. Verify with `perf stat -e cache-misses,cache-references ./false_sharing`.
 
-Core 0 writes `counter_a` → line: Modified on core 0, Invalid on core 1.  
-Core 1 writes `counter_b` → must fetch the line from core 0 first, then: Modified on core 1, Invalid on core 0.  
-Every write by either core forces a cross-core cache line transfer, even though the cores are writing to disjoint bytes within that line.
+### 2. Medium – Simulate a Snooping Bus in Software
+Implement a simple lock‑step simulator where each core maintains a cache line state (M/E/S/I) and communicates via a shared message queue representing the bus.
 
-The cost is not just an invalidation message; it is a full cache line transfer (64 bytes) across the interconnect for each write, plus the latency of the round trip. Under contention, this can serialize what should be independent operations.
+*Requirements*:
+- Use POSIX message queues (`mq_open`, `mq_send`, `mq_receive`).
+- Each core thread issues random reads/writes to a shared address space.
+- On a write, the core sends a `BUS_RDX` message; all other threads, upon receiving it, check their local state and invalidate if needed.
+- Track and print the total number of bus transactions per operation.
+- Verify that after any sequence, all cores that hold the line report the same value (or Invalid).
 
-The fix is to place the variables on separate cache lines:
+*Hint*: Use a struct `{enum {RD,RDX,DATA} type; uint64_t addr; uint64_t data;}` for messages.
 
-```c
-#include <stddef.h>
+### 3. Hard – Build a User‑Level Directory Coordination Library
+Create a library that mimics a sparse directory using `mmap`ed shared memory and Linux futexes for synchronization.
 
-/* Manual padding */
-struct {
-    long counter_a;
-    char _pad[64 - sizeof(long)];
-    long counter_b;
-} counters;
+*Steps*:
+1. Allocate a shared memory region (`shmget`/`mmap`) containing an array of directory entries: each entry holds a 64‑bit sharer bitmap (supports up to 64 cores) and a 2‑bit state field.
+2. Provide functions:
+   - `dir_read(core_id, addr)` → returns value, updates sharer bitmap, handles state transitions.
+   - `dir_write(core_id, addr, value)` → sends invalidation futex calls to all cores indicated in the bitmap, waits for acknowledgments via futex, then updates the line.
+3. Use `pthread_barrier` to synchronize start of a parallel workload (e.g., parallel matrix multiply) that accesses a shared buffer through the directory API.
+4. Compare performance against a baseline using plain `mmap` without coherence (i.e., each core gets a private copy) and against Linux’s native NUMA allocation (`numa_alloc_onnode`).  
+   Measure with `clock_gettime(CLOCK_MONOTONIC, ...)` and collect hardware counters via `perf`.
 
-/* Or use the kernel macro, which handles architecture differences */
-#include <linux/cache.h>
+*Deliverable*: A short report (<2 pages) showing scalability trends as core count increases from 2 to 64 (simulate by spawning that many threads) and discuss where the directory overhead overtakes the gains.
 
-struct {
-    long counter_a ____cacheline_aligned_in_smp;
-    long counter_b ____cacheline_aligned_in_smp;
-} counters;
-```
+---
 
-`____cacheline_aligned_in_smp` expands to `__attribute__((aligned(64)))` on SMP builds and to nothing on UP builds, keeping the structure compact when coherence is not an issue.
+## Linux Connection
+### Subsystems and Files Relevant to Multiprocessor Behavior
+| Subsystem | Path / Interface | What It Exposes | Typical Use |
+|-----------|------------------|-----------------|-------------|
+| CPU topology | `/sys/devices/system/cpu/cpu<N>/cache/index<*>/shared_cpu_map` | Bitmask of cores sharing each cache level (L1, L2, L3) | Determine false‑sharing risk |
+| NUMA nodes | `/sys/devices/system/node/node<N>/` | `meminfo`, `cpulist`, `distance` (latency matrix) | Identify local vs. remote memory |
+| Memory allocator | `libnuma` (`numa.h`) | `numa_alloc_onnode`, `numa_free`, `numa_move_page` | Allocate/free memory on a specific node |
+| Process NUMA placement | `/proc/<pid>/numa_maps` | Per‑vma page location (node) and hint | Verify where a program’s pages reside |
+| Kernel tracing | `/sys/kernel/debug/tracing` (trace events) | `mem_page_alloc`, `mm_page_pgret`, `x86_mce` | Observe page migration and memory errors |
+| Performance counters | `perf` | `OFFCORE_RESPONSE`, `LLC_LOAD_MISSES.REMOTE_HIT`, `CYCLE_ACTIVITY.STALLS_L3_MISS` | Measure coherence and remote‑access penalties |
 
-The address of `counter_b` after padding is:
+### Concrete Commands
+```bash
+# 1. Show CPU cache topology (shared L3 across sockets)
+lscpu --caches
 
-$$\text{addr}(\texttt{counter\_b}) = \text{addr}(\texttt{counter\_a}) + 64$$
+# 2. List NUMA nodes and their memory
+numactl --hardware
 
-which guarantees they occupy different cache lines since $64 \equiv 0 \pmod{64}$.
+# 3. View distance matrix (latency in cycles) between nodes
+cat /sys/devices/system/node/node0/distance   # row for node0
+# Example output:
+# 0  10  20
+# 10 0   15
+# 20 15 0
 
-### NUMA Access Cost Model
-
-Let $L_{\text{local}}$ be the latency to local memory and $L_{\text{remote}}$ be the latency across the inter-socket interconnect. The **NUMA factor** is:
-
-$$r = \frac{L_{\text{remote}}}{L_{\text{local}}}$$
-
-On a two-socket Intel Xeon system, typical values are $L_{\text{local}} \approx 80\text{ ns}$, $L_{\text{remote}} \approx 140\text{ ns}$, giving $r \approx 1.75$.
-
-For a workload where fraction $f$ of memory accesses are remote:
-
-$$L_{\text{avg}} = (1 - f) \cdot L_{\text{local}} + f \cdot L_{\text{remote}} = L_{\text{local}}\bigl(1 + f(r - 1)\bigr)$$
-
-At $f = 0.5$, $r = 1.75$:
-
-$$L_{\text{avg}} = L_{\text{local}} \cdot (1 + 0.5 \times 0.75) = 1.375 \cdot L_{\text{local}}$$
-
-A 37.5% latency increase with no code changes, no error messages, and no indication in strace or top. For a work
+# 4. Allocate a 1 GiB buffer on node 1 and touch it
+numactl --membind=1 -- cpulist=0-3 \
+    dd if=/dev/zero of=/tmp/numa_test bs=1M count=1

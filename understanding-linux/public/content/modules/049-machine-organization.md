@@ -10,108 +10,268 @@ resources:
     title: "Computer Architecture A Quantitative Approach (Hennessy)"
 ---
 
-## Why This Matters
-
-Every instruction the Linux kernel executes — a system call entry via `syscall`, a `memcpy` inside `copy_to_user`, a scheduler `cmpxchg` on the run queue — is ultimately a sequence of control signals routed through physical hardware. The datapath determines what transformations are *possible* on any given cycle; the control unit determines which transformation *actually happens*. If you don't understand this layer, you can't reason about why `add` costs one cycle while `lw` costs more, why out-of-order CPUs need hazard detection, or why the Linux ABI mandates that function arguments live in specific registers. These aren't arbitrary conventions — they're direct consequences of datapath geometry.
-
----
-
 ## Core Concepts
+### Machine Organization Fundamentals
+A computer’s machine organization is the concrete realization of the von Neumann model: a **datapath** that moves and transforms data, a **control unit** that decides what the datapath does each clock cycle, a **register file** for fast temporary storage, an **ALU** for arithmetic/logic, and **buses** that interconnect them. Each block exists because of a specific physical limitation or performance goal:
 
-### The Datapath
+- **Datapath** – needed because raw memory is slow (≈100 ns) while registers are fast (≈1 ns). Moving data through a dedicated path lets us overlap fetch, decode, and execute.
+- **Control** – the datapath cannot self‑schedule; control signals derive from the instruction opcode and pipeline state, turning a static circuit into a programmable one.
+- **Register File** – provides multiple simultaneous read/write ports (typically 2 read, 1 write) so the datapath can fetch two operands and store a result in one cycle without structural hazards.
+- **ALU** – implements the primitive operations that compose higher‑level instructions (add, sub, and, or, shift, compare). Its combinational logic depth determines the minimum clock period.
+- **Buses** – separate address, data, and control lines reduce wiring complexity and allow concurrent operations (e.g., address sent while previous data transaction finishes).
 
-The datapath is the set of hardware elements that hold and transform data: instruction memory, data memory, register file, ALU, dedicated adders, and the buses connecting them. The PC is a register inside the datapath holding the address of the instruction currently being fetched.
+### Datapath and Control in Detail
+The classic five‑stage RISC pipeline (IF, ID, EX, MEM, WB) partitions the datapath to balance stage delays:
 
-On each rising clock edge, the datapath reads the instruction at `PC`, routes operands through functional units, and writes results back. The PC increments by 4 because each 32-bit instruction occupies exactly 4 bytes — incrementing by 1 would point into the middle of the current instruction:
+1. **Instruction Fetch (IF)** – PC → instruction memory → IR.  
+   Control: `PCWrite`, `IFIDWrite`.
+2. **Instruction Decode (ID)** – Register file read (two operands), sign‑extend immediate, generate control signals from opcode.  
+   Control: `RegDst`, `ALUSrc`, `MemToReg`, `RegWrite`, `MemRead`, `MemWrite`, `Branch`, `ALUOp`.
+3. **Execute (EX)** – ALU computes either `ALUresult = A op B` (R‑type) or `ALUresult = A + sign_extend(imm16)` (I‑type load/store/branch).  
+   For branches: `BranchTarget = PC + 4 + (sign_extend(imm16) << 2)`.
+4. **Memory (MEM)** – If `MemRead`: `LMD = DataMem[ALUresult]`; if `MemWrite`: `DataMem[ALUresult] = B`.
+5. **Write‑Back (WB)** – If `RegWrite`: `RF[rd] = (MemToReg ? LMD : ALUresult)`.
 
-$$\text{PC}_{\text{next}} = \text{PC} + 4$$
+The **control unit** can be implemented as a finite‑state machine (FSM) that asserts the above signals based on the current pipeline register contents. Because each signal is a Boolean function of a few bits, the control logic is small and fast—typically a few gate delays.
 
-For a taken branch, the 16-bit offset encoded in the instruction is sign-extended to 32 bits and shifted left by 2 (converting a *word* offset to a *byte* offset), then added to $\text{PC} + 4$ — not to `PC` itself, because the PC has already advanced during fetch:
+### Register File
+A register file with *R* registers, *Rₚ* read ports, and *R_w* write ports is built from an array of flip‑flops plus decoders. For a 32‑register MIPS file:
 
-$$\text{PC}_{\text{branch}} = (\text{PC} + 4) + (\text{SignExt}(\text{offset}) \ll 2)$$
+- **Read ports**: two 5‑bit decoders select registers; each port outputs a 32‑bit bus.  
+- **Write port**: one 5‑bit decoder enables a write‑enable line; data is latched on the rising edge of the clock if `RegWrite=1`.
 
-The shift-left-by-2 is not an arbitrary encoding decision. It encodes $4\times$ the word offset in only 16 bits, giving a branch range of $\pm 2^{15} \times 4 = \pm 131072$ bytes from the instruction following the branch. Exceeding that range requires a jump instruction or a trampoline.
+Why multiple ports? To avoid structural hazards: an instruction needing two source registers and a destination register must read two and write one in the same cycle. The read‑after‑write (RAW) hazard is handled by forwarding, not by stalling the register file.
 
-### The Register File
+### ALU
+The ALU is a combinational block built from:
 
-The register file is a synchronous-read, synchronous-write array of 32 × 32-bit storage cells (on MIPS). It exposes **two read ports** and **one write port**, so it can deliver both source operands and absorb one result within a single clock cycle.
+- **Adder/subtractor** (ripple‑carry or carry‑look‑ahead) for ADD/SUB.
+- **Logic units** (AND, OR, XOR) for bitwise ops.
+- **Shifter** (logical/arithmetic left/right, rotate).
+- **Comparator** (set‑on‑less‑than) for SLT/SLTU.
 
-Read is combinational: supply a 5-bit register index, and the value propagates to the output within the same half-cycle, before the clock edge that latches the ALU result. Write is clocked: the value is latched on the rising edge only when **RegWrite** is asserted. This asymmetry is intentional — if writes were also combinational, a write and a read to the same register in the same cycle would produce a race condition with undefined behavior.
-
-Why exactly two read ports? Because every ALU R-type instruction (`add`, `sub`, `and`, `slt`, …) has two source registers. A single read port would require two sequential read cycles per instruction, doubling the cycle count for the most common instruction class. Adding a third read port would benefit almost no instruction (stores need two registers, but one is an address, handled separately) at the cost of increased silicon area and wiring complexity.
-
-The cost of a register access versus a cache access is architectural, not incidental:
-
-- Register read latency: $\sim 0.2\,\text{ns}$ (on-die, direct index)
-- L1 cache hit latency: $\sim 1\text{–}4\,\text{ns}$ (on-die, but requires tag comparison and set indexing)
-- L2 cache hit latency: $\sim 10\text{–}20\,\text{ns}$
-
-This is why the compiler works hard to keep hot variables in registers rather than spilling them to the stack.
-
-### The ALU
-
-The ALU takes two 32-bit inputs $A$ and $B$ and produces a 32-bit result $R$ plus status bits. The critical status bit for control flow is **Zero**: if $R = 0$, Zero is asserted. For `beq`, the ALU computes $A - B$; if $A = B$, the difference is zero and the branch is taken. The branch decision costs no extra cycles — the subtraction and Zero detection happen in parallel with the rest of the execute stage.
-
-The ALU does not decide its own operation. A 3-bit **ALUcontrol** input selects from the supported operations:
-
-| ALUcontrol | Operation |
-|---|---|
-| `000` | AND |
-| `001` | OR |
-| `010` | Add |
-| `110` | Subtract |
-| `111` | Set-less-than |
-
-Those 3 bits are produced by a two-level decoding scheme to avoid making the main control unit aware of every funct-field variant:
-
-1. The **main control unit** reads the 6-bit opcode (bits 31:26) and emits a 2-bit **ALUOp**: `00` = add (for `lw`/`sw`), `01` = subtract (for `beq`), `10` = look at funct (for R-type).
-2. The **ALU control unit** combines ALUOp with the 6-bit funct field (bits 5:0) to produce the final 3-bit ALUcontrol.
-
-The two-level scheme exists because R-type instructions encode their specific operation in funct, not opcode. The opcode for every R-type instruction is `000000`; without the funct field, `add` and `sub` and `slt` would be indistinguishable. The main control unit handles the coarse categorization; the ALU control unit handles the fine discrimination within R-type.
-
-For `lw`, the funct field is irrelevant — ALUOp `00` forces add regardless, because `lw` always computes `base + offset`. This is why the "don't care" entries exist in the truth table.
-
-### Control Signals
-
-The control unit is a combinational circuit: it maps a 6-bit opcode to 7 asserted/deasserted 1-bit output signals, with no state. There is no feedback loop — the opcode goes in, the signals come out within the same clock phase, before the rising edge that locks in results.
-
-| Signal | = 0 | = 1 |
-|---|---|---|
-| **RegDst** | Write register ← `rt` (bits 20:16) | Write register ← `rd` (bits 15:11) |
-| **RegWrite** | No register written | Latch result into write register |
-| **ALUSrc** | ALU input B ← Read data 2 (register) | ALU input B ← sign-extended immediate |
-| **PCSrc** | PC ← PC + 4 | PC ← branch target |
-| **MemRead** | No memory read | Read data memory at ALU result address |
-| **MemWrite** | No memory write | Write data memory at ALU result address |
-| **MemtoReg** | Write data ← ALU result | Write data ← memory read data |
-
-**RegDst** exposes a fundamental asymmetry in the MIPS instruction encoding: R-type instructions encode the destination in `rd` (bits 15:11), but I-type instructions (including `lw`) encode it in `rt` (bits 20:16). The same bit field means "second source" for R-type and "destination" for I-type. A single multiplexer controlled by RegDst resolves this without the register file needing to know which format is in flight.
-
-**MemtoReg** is similarly critical: after a `lw`, the value to write back comes from data memory, not the ALU. After an `add`, it comes from the ALU, not memory. These two values are routed to a mux; MemtoReg selects which one reaches the register file's write data input. They cannot both be written simultaneously — the register file has one write port.
+The **critical path** is usually the carry‑propagation of the adder; a 32‑bit CLA adds ≈4 gate delays, setting the minimum clock period $T_{clk} \ge t_{ALU}+t_{reg}+t_{mux}$.
 
 ### Buses
+- **Address Bus**: unidirectional from CPU to memory/I/O; width = address size (e.g., 64 bits on x86‑64).  
+- **Data Bus**: bidirectional; width = word size (typically 64 bits).  
+- **Control Bus**: carries signals like `MemRead`, `MemWrite`, `IRQ`, `Reset`.
 
-In a single-cycle datapath, "bus" usually means a point-to-point bundle of wires carrying a multi-bit value from one functional unit to another. The term "shared bus" (multiple masters contending for the same wires) applies more to memory interconnects and peripheral buses (PCIe, AHB) than to the CPU datapath itself.
-
-The 32-bit **Write data** path into the register file is the datapath's most consequential mux output: the MemtoReg mux sits here, selecting between the ALU result and the memory read data. Getting MemtoReg wrong doesn't raise an exception — it silently writes the wrong value into a register, corrupting program state. The control unit must assert it correctly for every instruction, every cycle.
+Bus arbitration (e.g., daisy‑chain or round‑robin) decides which device drives the data bus when multiple masters exist (CPU, DMA). The **bus cycle time** limits memory bandwidth: $BW = \frac{DataWidth}{BusCycleTime}$.
 
 ---
 
 ## How It Works
+### Instruction Execution Pipeline
+When a program runs, the CPU repeatedly performs the five stages. The pipeline allows a new instruction to start each clock cycle after the pipeline is filled, giving an ideal **CPI = 1** (cycles per instruction). Real CPI rises due to:
 
-### Single-Cycle Execution: R-Type (`add $t1, $t2, $t3`)
+- **Data hazards** (RAW, WAR, WAW) – resolved by forwarding or stalls.
+- **Control hazards** (branches) – resolved by branch prediction, delay slots, or flushing.
+- **Structural hazards** – avoided by duplicating resources (e.g., separate instruction and data memories).
 
+#### Stage‑by‑Stage Signal Derivation
+Consider an I‑type load `LW rt, offset(rs)`. The control signals are:
+
+| Signal       | Value | Reason |
+|--------------|-------|--------|
+| `RegDst`     | 0     | rt field determines destination register |
+| `ALUSrc`     | 1     | second ALU operand is immediate |
+| `MemToReg`   | 1     | WB selects memory data |
+| `RegWrite`   | 1     | write result to register file |
+| `MemRead`    | 1     | read from data memory |
+| `MemWrite`   | 0     | no store |
+| `Branch`     | 0     | not a branch |
+| `ALUOp`      | 00    | ALU performs addition (for address) |
+
+The **effective address** is computed in EX:
+$$
+EA = R[rs] + \text{sign\_extend}(offset_{16})
+$$
+In MEM, the CPU reads `DataMem[EA]` into the `LMD` pipeline register. In WB, `RF[rt] ← LMD`.
+
+#### Timing Example
+Assume gate delays: register‑file read $t_{rf}=150$ ps, ALU $t_{alu}=200$ ps, data‑memory access $t_{dm}=300$ ps, mux $t_{mux}=50$ ps. The longest stage is MEM (300 ps + mux 50 ps = 350 ps). Therefore the clock period must satisfy:
+$$
+T_{clk} \ge 350\text{ ps} \;\; \Rightarrow \;\; f_{max} \approx 2.86\text{ GHz}
+$$
+If the actual clock is 2 GHz ($T_{clk}=500$ ps), each stage has slack, allowing timing margins.
+
+### Control Unit Implementation (Hardwired)
+A simple hardwired control unit uses a PLA or sum‑of‑products logic. For the `ALUOp` field (2 bits) we generate three internal signals:
+
+- `ALUAdd = ALUOp[1]´·ALUOp[0]´` (00 → add)
+- `ALUSub = ALUOp[1]´·ALUOp[0]`   (01 → subtract)
+- `ALUAnd = ALUOp[1]·ALUOp[0]´`   (10 → and)
+
+The ALU then selects the operation via a 4‑to‑1 mux controlled by these signals.
+
+---
+
+## Worked Examples
+### Example 1: `ADD $t1, $t2, $t3`
+Assume initial state:
+- `$t2 = 0x00000010`
+- `$t3 = 0x00000020`
+- PC = 0x00400000 (instruction at this address)
+
+| Cycle | Stage | Action | Register/Memory Values |
+|-------|-------|--------|------------------------|
+| 1 | IF | Fetch instruction `0x01234020` (opcode=0, rs=$t2, rt=$t3, rd=$t1, funct=0x20) | IF/IR = 0x01234020 |
+| 2 | ID | Read `$t2`, `$t3` from RF; set control: `ALUSrc=0`, `RegDst=1`, `RegWrite=1`, `ALUOp=10` (funct → add) | ID/A = 0x10, ID/B = 0x20 |
+| 3 | EX | ALU computes `0x10 + 0x20 = 0x30` | EX/ALUout = 0x30 |
+| 4 | MEM | No memory access; pass-through | MEM/ALUout = 0x30 |
+| 5 | WB | Write 0x30 to `$t1` | RF[$t1] = 0x30 |
+
+Result: `$t1 = 0x30`. No stalls; CPI = 1.
+
+### Example 2: `LW $t1, 8($t2)`
+Assume:
+- `$t2 = 0x00001000`
+- Memory[0x1008] = 0xdeadbeef
+- PC = 0x00400004
+
+| Cycle | Stage | Action | Values |
+|-------|-------|--------|--------|
+| 1 | IF | Fetch `0x8c290008` (opcode=0x23, rt=$t1, rs=$t2, imm=8) | IR = 0x8c290008 |
+| 2 | ID | Read `$t2`; sign‑extend imm → 0x00000008; controls: `ALUSrc=1`, `MemRead=1`, `MemToReg=1`, `RegWrite=1` | A = 0x1000, B = 0x00000008 |
+| 3 | EX | ALU: `EA = 0x1000 + 0x00000008 = 0x1008` | ALUout = 0x1008 |
+| 4 | MEM | Read DataMem[0x1008] = 0xdeadbeef → LMD | LMD = 0xdeadbeef |
+| 5 | WB | Write LMD to `$t1` | RF[$t1] = 0xdeadbeef |
+
+If the previous instruction wrote to `$t2`, a RAW hazard would appear; forwarding from EX/MEM or MEM/WB to the ID stage’s A input eliminates the stall.
+
+### Example 3: `SW $t1, 8($t2)`
+Assume:
+- `$t2 = 0x00001000`
+- `$t1 = 0x11223344`
+- PC = 0x00400008
+
+| Cycle | Stage | Action |
+|-------|-------|--------|
+| 1 | IF | Fetch `0xac290008` (opcode=0x2b) |
+| 2 | ID | Read `$t1` (data) and `$t2` (base); imm=8 → controls: `ALUSrc=1`, `MemWrite=1` |
+| 3 | EX | ALU: EA = `$t2` + 8 = 0x1008 |
+| 4 | MEM | Write `$t1` to DataMem[0x1008] |
+| 5 | WB | No register write (RegWrite=0) |
+
+Result: Memory[0x1008] now holds 0x11223344.
+
+---
+
+## Common Mistakes
+| Mistake | Why It’s Wrong | Correct Understanding |
+|---------|----------------|-----------------------|
+| **“The datapath executes instructions on its own.”** | The datapath is purely combinational/sequential hardware; without control signals it cannot select which operation to perform or when to latch results. | Control unit asserts signals (e.g., `ALUSrc`, `RegWrite`) that steer data through the datapath each cycle. |
+| **“The register file is just a small cache.”** | A cache is transparent, stores copies of memory, and uses tags; the register file is architecturally visible, has a fixed set of names, and is accessed directly by instructions. | Registers are explicit operands; they provide the fastest possible storage because they are built from flip‑flops with multi‑port access, not from SRAM arrays with tag checks. |
+| **“The ALU also performs memory accesses.”** | Memory access requires address generation and a separate memory array; the ALU only computes arithmetic/logic results. | The ALU computes the effective address; the MEM stage uses that address to read/write the data memory. |
+| **“Buses are just wires; more wires always mean faster transfer.”** | Adding wires increases capacitance and propagation delay; bus width trades off pin count vs. bandwidth, and bus protocols introduce overhead. | Effective bandwidth = (data width × transfer rate) / (overhead + latency). Wider buses help only if the controller can sustain the rate. |
+| **“Pipelining always yields CPI = 1.”** | Hazards (data, control, structural) cause stalls or flushes, raising CPI. Branch mispredictions can cost several cycles. | Real CPI = ideal CPI + stall cycles per instruction due to hazards; minimizing stalls requires forwarding, good branch prediction, and balanced pipeline design. |
+
+---
+
+## Exercises
+### Easy
+1. **Address Calculation** – For `LW $t5, 16($t6)`, if `$t6 = 0x000007F0`, what is the effective address? Show the sign‑extension step.
+2. **Control Signal Identification** – List the control signals (`RegDst`, `ALUSrc`, `MemRead`, `MemWrite`, `MemToReg`, `RegWrite`, `Branch`) for the instruction `OR $t7, $t8, $t9`.
+
+### Medium
+3. **Pipeline Diagram with Forwarding** – Given the instruction sequence:
+   ```
+   ADD $t1, $t2, $t3
+   SUB $t4, $t1, $t5
+   AND $t6, $t4, $t7
+   ```
+   Draw a five‑stage pipeline timing diagram (clock cycles 1‑6) indicating where forwarding paths are needed to avoid stalls. Label each pipeline register (IF/ID, ID/EX, EX/MEM, MEM/WB) and the forwarded values.
+4. **Branch Penalty Calculation** – Assume a 5‑stage pipeline with a branch resolved in the EX stage. If the branch predictor is 90 % accurate and the misprediction penalty is 3 cycles, compute the effective CPI for a program where 20 % of instructions are branches.
+
+### Hard
+5. **Control Unit Truth Table** – Derive the Boolean expressions for the control signals `MemRead` and `MemWrite` as functions of the 6‑bit opcode field (assuming the MIPS opcode map). Show the Karnaugh map simplification for `MemRead`.
+6. **Performance Experiment** – Write a C program that executes a tight loop of 10⁸ integer additions. Compile with `gcc -O0 -o add0 add.c` and `gcc -O3 -o add3 add.c`. Use `perf stat -e cycles,instructions,cache-references,cache-misses ./add0` and `perf stat … ./add3` to measure CPI and cache behavior. Explain the differences in terms of pipeline stalls and memory hierarchy usage.
+
+---
+
+## Linux Connection
+The Linux kernel and user‑space programs run on the same machine organization described above. Concrete manifestations include:
+
+### System‑Call Entry
+On x86‑64, a system call is invoked via the `syscall` instruction (opcode `0x0f 0x05`). The kernel entry point (`entry_SYSCALL_64`) saves user registers, switches to kernel stack, and dispatches via the syscall table.
+
+```bash
+# View the syscall entry in the kernel (requires kernel source)
+grep -n "entry_SYSCALL_64" arch/x86/entry/entry_64.S
 ```
-  Encoding: opcode=000000, rs=$t2(25:21), rt=$t3(20:16), rd=$t1(15:11), funct=100000
+
+### Context Switch & Register File
+During a context switch, the kernel executes `switch_to(prev, next)`. In assembly (`arch/x86/entry/entry_64.S`), it saves the caller‑saved registers (`rax, rcx, rdx, rsi, rdi, r8‑r11`) and the callee‑saved registers (`rbx, rbp, r12‑r15`) onto the kernel stack, then loads the new task’s register state. This is a direct save/restore of the register file.
+
+```bash
+# Show the switch_to macro (simplified)
+grep -A20 "switch_to" arch/x86/include/asm/thread_info.h
 ```
 
-1. **Fetch**: PC is sent to instruction memory. The memory returns the 32-bit instruction word. Simultaneously, a dedicated adder computes PC+4 and feeds it back to PC (PCSrc=0 selects this path).
-2. **Decode/Read**: Bits 25:21 and 20:16 index the register file's two read ports. `$t2` and `$t3` appear on Read data 1 and Read data 2 combinationally.
-3. **Execute**: ALUSrc=0 routes Read data 2 (not an immediate) to ALU input B. ALUOp=10 combined with funct=`100000` (add) produces ALUcontrol=`010`. The ALU computes `$t2 + $t3`.
-4. **Write back**: RegDst=1 routes bits 15:11 (`$t1`) to the write register index. MemtoReg=0 routes the ALU result to Write data. RegWrite=1 latches the result into `$t1` on the rising clock edge.
+### Translation Lookaside Buffer (TLB)
+The MMU uses a TLB to cache virtual‑to‑physical address translations. A TLB miss triggers a page‑walk that reads the page table from RAM (via the data bus). Linux exposes TLB statistics:
 
-MemRead=0, MemWrite=0: data memory is not touched.
+```bash
+cat /proc/kpagecount | wc -l   # rough count of pages
+perf stat -e dtlb_load_misses.refill:u ./a.out
+```
 
-### Single-Cycle Execution: Load (`lw $t1, 100($t2)`)
+### Observing Machine Instructions
+You can inspect the exact machine code generated for a C program and see how it maps to datapath operations:
 
-Encoding: opcode=`100011`, rs=
+```c
+// add.c
+int main() {
+    volatile int a = 5, b = 10, c;
+    c = a + b;
+    return 0;
+}
+```
+
+```bash
+gcc -O0 -march=native -S add.c -o add.s   # produce AT&T syntax asm
+cat add.s
+# Look for the add instruction:    addl    %esi, %edi   (example)
+objdump -d -M intel a.out | grep -A2 "<main>:"   # see machine code
+```
+
+### Measuring CPI with `perf`
+The retired‑instruction count and cycle count give actual CPI:
+
+```bash
+perf stat -e instructions,cycles ./a.out
+# CPI = cycles / instructions
+```
+
+### Controlling Branch Prediction
+The Linux `perf` tool can show branch misses:
+
+```bash
+perf stat -e branch-misses,branches ./a.out
+```
+
+A high miss rate indicates control‑hazard stalls that the pipeline must flush.
+
+### DMA and Bus Utilization
+A simple DMA test (using `hdparm` on a disk) shows how the CPU can offload data movement, freeing the datapath for computation:
+
+```bash
+hdparm -tT /dev/sda   # timings of cached vs buffered reads
+```
+
+These examples illustrate that the same principles of datapath, control, register file, ALU, and buses govern both user programs and the Linux kernel itself.
+
+---
+
+## Why This Matters
+Understanding machine organization lets you reason about **where time is spent** in a program and how to change it:
+
+- **Pipeline awareness** explains why tight loops of independent integer ops achieve near‑1 CPI, while dependency chains stall the EX stage.
+- **Branch prediction** knowledge guides you to write predictable loops (`for (i=0; i<N; ++i)`) or use `__builtin_expect` to hint the CPU.
+- **Memory‑access patterns** dictate whether the prefetcher can hide latency; strided accesses cause more bus traffic and lower effective bandwidth.
+- **Register pressure** informs compiler optimization: spilling to memory adds MEM‑stage traffic and raises CPI.
+- **System‑call overhead** is visible as a pipeline flush and register‑file save/restore; batching syscalls (e.g., `readv`/`writev`) reduces this cost.
+- **Performance tools** (`perf`, `vtune`, `likwid`) ultimately measure quantities that stem from the datapath and control signals (cycle counts, stall reasons, cache miss rates).
+
+By connecting abstract hardware blocks to concrete Linux interfaces—syscall entry, context switches, TLB misses, `perf` counters—you gain the ability to **diagnose** bottlenecks, **tune** kernels and applications, and **design** software that works *with* the underlying machine organization rather than against it. This depth transforms you from a coder who merely writes instructions into an engineer who orchestrates the flow of data through silicon.

@@ -10,121 +10,330 @@ resources:
     title: "Introduction to Solid State Physics (Kittel)"
 ---
 
-## Why This Matters
-
-Every hardware subsystem you interact with through the Linux kernel is operating inside a thermal noise floor. That floor is not an engineering limitation to be overcome — it is a direct consequence of thermodynamics, and it sets hard bounds on what software can observe, measure, or control. The scheduler makes probabilistic decisions because cache miss latency is a distribution, not a constant. `/dev/random` harvests entropy from interrupt timing jitter because that jitter is thermally driven. DRAM refresh intervals exist because thermal fluctuations spontaneously flip stored charge. If your mental model of a CPU core is a deterministic state machine, you will misread `perf` output, misattribute thermal throttling, and have no framework for why a system behaves differently at 90°C than at 40°C.
-
----
-
 ## Core Concepts
+Statistical mechanics connects the microscopic dynamics of many‑particle systems to observable macroscopic quantities by treating the microstates as equally likely (for an isolated system) or weighted by the Boltzmann factor (for a system in thermal contact with a reservoir).  
 
-### Microscopic Randomness vs. Macroscopic Regularity
+* **Microstate** – a complete specification of every particle’s position and momentum.  
+* **Macrostate** – defined by a few coarse‑grained variables (energy \(E\), volume \(V\), particle number \(N\)).  
+* **Postulate of equal a priori probabilities** – for an isolated system with fixed \((E,V,N)\) each accessible microstate has the same probability. This follows from Liouville’s theorem (phase‑space volume is conserved under Hamiltonian flow) and the ergodic hypothesis (time averages equal ensemble averages).  
 
-Each conduction electron in a copper trace is undergoing roughly $10^{13}$ collisions per second, each in a random direction. No individual collision is predictable. Yet the bulk resistivity of copper is stable to parts per million. This is the operational content of statistical mechanics: the law of large numbers converts microscopic randomness into macroscopic reproducibility. Hardware specifications are possible precisely because $N \sim 10^{22}$ particles average out. When that averaging breaks down — at nanometer feature sizes, at cryogenic temperatures, in single-electron transistors — deterministic hardware specs stop working and you need the full distribution.
+When the system can exchange energy with a large reservoir at temperature \(T\), the probability of finding the system in a microstate of energy \(E_i\) is proportional to the number of reservoir microstates compatible with that energy. If the reservoir’s density of states \(\Omega_R(E)\) varies slowly, expanding \(\ln\Omega_R(E_{\text{tot}}-E_i)\) to first order gives  
 
-### Temperature as Mean Kinetic Energy
+\[
+P_i \propto e^{-\beta E_i},\qquad \beta\equiv\frac{1}{k_B T}.
+\]
 
-Temperature is a derived quantity, not a primitive one. It parameterizes the average kinetic energy per quadratic degree of freedom in a system at thermal equilibrium:
+The **partition function**  
 
-$$\langle E_k \rangle = \frac{1}{2} k_B T$$
+\[
+Z(\beta,V,N)=\sum_i e^{-\beta E_i}
+\]
 
-where $k_B = 1.380 \times 10^{-23}\ \text{J/K}$. At 300 K:
+normalizes the probabilities and encodes all thermodynamic information. From \(Z\) we obtain the Helmholtz free energy  
 
-$$k_B T = (1.380 \times 10^{-23})(300) \approx 4.14 \times 10^{-21}\ \text{J} \approx 26\ \text{meV}$$
+\[
+F=-k_BT\ln Z,
+\]
 
-This $26\ \text{meV}$ is the natural energy unit for every room-temperature semiconductor calculation. Every time you see an exponential in device physics, the exponent is measured in units of $k_B T$.
-
-### The Boltzmann Distribution
-
-For a system at thermal equilibrium at temperature $T$, the probability of occupying a state with energy $E$ is:
-
-$$P(E) \propto e^{-E / k_B T}$$
-
-The ratio between occupation probabilities of two states separated by $\Delta E$ is:
-
-$$\frac{P(E + \Delta E)}{P(E)} = e^{-\Delta E / k_B T}$$
-
-This is not an approximation for large systems. It follows from a single axiom: at equilibrium, the total system (your subsystem plus the thermal reservoir) maximizes entropy. The exponential form is the unique solution to that constraint. Everything downstream — reaction rates, leakage currents, DRAM retention, flash endurance — is a specific application of this ratio.
-
-### The Fermi-Dirac Distribution
-
-Electrons are fermions: the Pauli exclusion principle forbids two electrons from occupying the same quantum state. Boltzmann statistics, which assume states can be multiply occupied, are wrong for electrons. The correct occupation probability is:
-
-$$f(E) = \frac{1}{e^{(E - E_F)/k_B T} + 1}$$
-
-$E_F$ is the **Fermi energy** — the energy at which occupation probability is exactly $\frac{1}{2}$, at any temperature. At $T = 0$, $f(E)$ is a perfect step function: every state below $E_F$ is filled, every state above is empty. At 300 K, the step blurs over an energy width of roughly $k_B T \approx 26\ \text{meV}$.
-
-Why does this matter for silicon? The Fermi energy sits near the middle of the 1.1 eV bandgap. The number of electrons thermally excited into the conduction band depends on how far the band edge is from $E_F$ relative to $k_B T$. Doping a semiconductor moves $E_F$ closer to one band edge — that is the entire mechanism by which you engineer conductivity.
-
-### Entropy and Irreversibility
-
-The entropy of a macrostate is:
-
-$$S = k_B \ln \Omega$$
-
-where $\Omega$ is the number of distinct microstates consistent with that macrostate. The second law — entropy increases spontaneously — is a counting argument: disordered states have vastly larger $\Omega$ than ordered ones, so a randomly evolving system will almost certainly move toward higher $\Omega$. This is why heat flows from hot to cold (more microstates available), why diffusion is irreversible, and why erasing a bit in DRAM (a logically irreversible operation) must dissipate at least $k_B T \ln 2$ of energy — the **Landauer limit**.
-
----
+and derivatives of \(\ln Z\) yield averages, fluctuations, and response functions.
 
 ## How It Works
+### Derivation of the Canonical (Boltzmann) Distribution
+Consider a small system \(S\) plus a reservoir \(R\) with total energy \(E_{\text{tot}}\). The number of joint microstates with \(S\) in state \(i\) (energy \(E_i\)) is  
 
-### The Boltzmann Factor: Rates Across Energy Barriers
+\[
+\Omega_{\text{tot}}(E_{\text{tot}})=\sum_i \Omega_S(E_i)\,\Omega_R(E_{\text{tot}}-E_i).
+\]
 
-Any process that requires crossing an energy barrier $\Delta E$ — a transistor switching, a charge leaking from a DRAM cell, a defect migrating in a dielectric — has a rate that scales as:
+Assuming \(\Omega_S(E_i)=1\) (non‑degenerate microstate) and that the reservoir is huge, expand  
 
-$$r \propto \nu_0\, e^{-\Delta E / k_B T}$$
+\[
+\ln\Omega_R(E_{\text{tot}}-E_i)=\ln\Omega_R(E_{\text{tot}})-\beta E_i+O\!\left(\frac{E_i^2}{E_{\text{tot}}^2}\right),
+\]
 
-where $\nu_0$ is an attempt frequency (typically $\sim 10^{12}\ \text{Hz}$ for atomic vibrations). At 300 K:
+where \(\beta = \partial\ln\Omega_R/\partial E\big|_{E_{\text{tot}}}=1/(k_BT)\). Hence  
 
-| $\Delta E$ | $\Delta E / k_B T$ | $e^{-\Delta E/k_B T}$ | Meaning |
-|---|---|---|---|
-| $26\ \text{meV}$ | 1 | $0.37$ | Barrier crossed freely |
-| $260\ \text{meV}$ | 10 | $4.5 \times 10^{-5}$ | Rare but finite rate |
-| $1.0\ \text{eV}$ | 38 | $3 \times 10^{-17}$ | Negligible at room temp |
-| $0.6\ \text{eV}$ | 23 | $10^{-10}$ | Flash storage retention scale |
+\[
+P_i=\frac{\Omega_R(E_{\text{tot}}-E_i)}{\sum_j\Omega_R(E_{\text{tot}}-E_j)}
+   \propto e^{-\beta E_i}.
+\]
 
-DRAM retention time is finite because the charge barrier is intentionally thin (for write speed); the retention time $\tau \propto e^{+\Delta E / k_B T}$ shrinks exponentially as temperature rises. Flash storage uses a thicker oxide barrier ($\sim 0.6$–$0.9\ \text{eV}$) for long retention, but that same barrier is what limits erase speed and causes endurance degradation when oxide traps accumulate.
+Normalization gives  
 
-### The Fermi-Dirac Step and Leakage Current
+\[
+\boxed{P_i=\frac{e^{-\beta E_i}}{Z}},\qquad Z=\sum_i e^{-\beta E_i}.
+\]
 
-In intrinsic silicon at $T = 0$, the valence band is full, the conduction band is empty, and conductivity is exactly zero. At finite temperature, the fraction of electrons excited across the bandgap $E_g = 1.1\ \text{eV}$ is:
+### From Partition Function to Thermodynamics
+*Average energy*  
 
-$$n_i \propto T^{3/2}\, e^{-E_g / 2k_B T}$$
+\[
+\langle E\rangle = -\frac{\partial\ln Z}{\partial\beta}.
+\]
 
-The $T^{3/2}$ prefactor comes from the density of available states; the exponential dominates. At 300 K:
+*Energy fluctuations*  
 
-$$e^{-E_g/2k_BT} = e^{-1.1/(2 \times 0.026)} = e^{-21.2} \approx 6 \times 10^{-10}$$
+\[
+\langle(\Delta E)^2\rangle =\frac{\partial^2\ln Z}{\partial\beta^2}
+                         = k_B T^2 C_V,
+\]
+where \(C_V=\partial\langle E\rangle/\partial T\) is the heat capacity at constant volume.
 
-At 360 K (just 60°C hotter):
+*Pressure* (for a system with volume‑dependent energies)  
 
-$$e^{-1.1/(2 \times 0.031)} = e^{-17.7} \approx 2 \times 10^{-8}$$
+\[
+p = k_BT\frac{\partial\ln Z}{\partial V}.
+\]
 
-That is a factor of ~33 increase in intrinsic carrier density from a 60 K temperature rise. Transistor leakage current tracks this exponential. This is why the power envelope of a CPU at high temperature is dominated by leakage rather than switching: leakage scales as $e^{-E_g/2k_BT}$ while dynamic power scales only linearly with frequency. Past roughly 80–90°C, leakage can exceed 30% of total power in high-density CMOS.
+*Entropy*  
 
-### Diffusion and the Einstein Relation
+\[
+S = -\left(\frac{\partial F}{\partial T}\right)_{V,N}
+  = k_B(\ln Z + \beta\langle E\rangle).
+\]
 
-A particle subject to a force $F$ drifts with velocity $v = \mu F$, where $\mu$ is the mobility. The same particle undergoes random thermal motion characterized by diffusion coefficient $D$. These are not independent — at thermal equilibrium, drift and diffusion must exactly cancel under any conservative potential. The condition for self-consistency yields the **Einstein relation**:
+These relations show why knowing \(Z\) is sufficient: every macroscopic observable follows from derivatives of \(\ln Z\).
 
-$$D = \mu k_B T$$
+## Worked Examples
+### Example 1: Two‑Level System
+Let \(E_1=0\), \(E_2=\epsilon\).  
 
-This is exact, not empirical. It connects:
+\[
+Z = e^{-\beta\cdot0}+e^{-\beta\epsilon}=1+e^{-\beta\epsilon}.
+\]
 
-- **Dopant diffusion during chip fabrication**: higher $T$ raises $D$, so anneal time and temperature are controlled to nm-precision
-- **Minority carrier diffusion in a PN junction**: sets the ideality factor and junction capacitance
-- **Johnson-Nyquist noise in resistors**: the same electron mobility that determines resistance also determines how much noise power the resistor emits
+Probabilities  
 
-### Johnson-Nyquist Noise
+\[
+P_1=\frac{1}{Z},\qquad P_2=\frac{e^{-\beta\epsilon}}{Z}.
+\]
 
-A resistor $R$ at temperature $T$ generates voltage noise with power spectral density:
+Average energy  
 
-$$S_V(f) = 4 k_B T R \quad [\text{V}^2/\text{Hz}]$$
+\[
+\langle E\rangle =0\cdot P_1+\epsilon\cdot P_2
+                =\epsilon\frac{e^{-\beta\epsilon}}{1+e^{-\beta\epsilon}}
+                =\frac{\epsilon}{1+e^{\beta\epsilon}}.
+\]
 
-This is flat (white) up to frequencies where $h f \ll k_B T$ — true for all practical electronics below terahertz. The RMS noise over bandwidth $B$ is:
+*Numerical check*: \(\epsilon=0.1\;\text{eV}\), \(T=300\;\text{K}\) → \(\beta\epsilon = \frac{0.1\;\text{eV}}{k_B T}\approx\frac{0.1}{0.02585}\approx3.87\).  
+\(P_2 = e^{-3.87}/(1+e^{-3.87})\approx0.020\), \(\langle E\rangle\approx0.002\;\text{eV}\) (≈0.3 meV), showing the high‑energy state is sparsely populated.
 
-$$V_{\text{rms}} = \sqrt{4 k_B T R B}$$
+### Example 2: Monatomic Ideal Gas (Translational Partition Function)
+For a single particle in a box of volume \(V\),
 
-For a $1\ \text{k}\Omega$ resistor at 300 K over a 1 MHz bandwidth:
+\[
+Z_1 = \frac{V}{h^3}\int d^3p\,e^{-\beta p^2/(2m)}
+    = V\left(\frac{2\pi m k_B T}{h^2}\right)^{3/2}.
+\]
 
-$$V_{\text{rms}} = \sqrt{4 \times (1.38 \times 10^{-23}) \times 300 \times 10^3 \times 10^6} = \sqrt{1.66 \times 10^{-11}} \approx 4.1\ \mu\text{V}$$
+For \(N\) indistinguishable particles, the canonical partition function includes the Gibbs factor \(1/N!\):
 
-This is not reducible by better circuit design — it is a thermal
+\[
+Z_N = \frac{Z_1^{\,N}}{N!}.
+\]
+
+*Average energy*  
+
+\[
+\langle E\rangle = -\frac{\partial\ln Z_N}{\partial\beta}
+                 = \frac{3}{2}Nk_BT.
+\]
+
+*Pressure*  
+
+\[
+p = k_BT\frac{\partial\ln Z_N}{\partial V}
+   = \frac{Nk_BT}{V},
+\]
+recovering the ideal‑gas law.
+
+*Numerical example*: \(N=1\) mol, \(T=300\) K, \(V=24.5\) L (≈1 atm).  
+
+\[
+\langle E\rangle = \frac{3}{2}RT = \frac{3}{2}\times8.314\times300\;\text{J/mol}
+                 \approx 3.74\;\text{kJ/mol}.
+\]
+
+### Example 3: Quantum Harmonic Oscillator
+Energy levels \(E_n = \hbar\omega\left(n+\tfrac12\right)\).  
+
+\[
+Z = \sum_{n=0}^\infty e^{-\beta\hbar\omega(n+1/2)}
+  = \frac{e^{-\beta\hbar\omega/2}}{1-e^{-\beta\hbar\omega}}.
+\]
+
+Average energy  
+
+\[
+\langle E\rangle = -\frac{\partial\ln Z}{\partial\beta}
+                 = \frac{\hbar\omega}{2}
+                   +\frac{\hbar\omega}{e^{\beta\hbar\omega}-1},
+\]
+the familiar zero‑point plus Planck term. At high \(T\) (\(\beta\hbar\omega\ll1\)), \(\langle E\rangle\approx k_BT\) (equipartition); at low \(T\) it approaches the zero‑point energy \(\hbar\omega/2\).
+
+## Common Mistakes
+| Mistake | Why It’s Wrong | Correct Perspective |
+|---|---|---|
+| **Treating the Boltzmann factor as \(e^{-E/T}\) (omitting \(k_B\))** | \(\beta\) must have dimensions of inverse energy; dropping \(k_B\) gives a nonsensical exponent and leads to wrong temperature scaling. | Always write \(\beta = 1/(k_B T)\); keep \(k_B\) explicit or use natural units where \(k_B=1\). |
+| **Ignoring particle indistinguishability and using \(Z = Z_1^N\)** | Leads to the Gibbs paradox: entropy becomes non‑extensive (depends on how you label particles). | Include the \(1/N!\) factor for classical indistinguishable particles; for quantum gases use the appropriate symmetric/antisymmetric sum (Bose‑Einstein or Fermi‑Dirac). |
+| **Assuming the Maxwell distribution applies to any gas** | The Maxwell speed distribution derives from the Boltzmann factor *and* the quadratic kinetic energy; it fails for quantum degenerate gases (e.g., electrons in a metal) where Fermi‑Dirac statistics dominate. | Use the appropriate quantum statistics; recover Maxwell‑Boltzmann only when \(n\lambda_T^3\ll1\) (low phase‑space density). |
+| **Confusing average energy \(\langle E\rangle\) with total energy \(E_{\text{tot}}\)** | \(\langle E\rangle\) is per‑particle (or per‑mode) average; multiplying by \(N\) gives the total only if particles are non‑interacting and identical. | For interacting systems, compute \(\langle E\rangle = -\partial\ln Z/\partial\beta\) from the full \(Z\); do not assume simple scaling. |
+| **Neglecting degeneracy of energy levels** | If multiple microstates share the same \(E_i\), the Boltzmann weight must be multiplied by the degeneracy \(g_i\); otherwise probabilities don’t sum to one. | Use \(Z=\sum_i g_i e^{-\beta E_i}\) and \(P_i=g_i e^{-\beta E_i}/Z\). |
+
+## Exercises
+### Easy
+1. A system has three non‑degenerate levels: \(E_0=0\), \(E_1=\Delta\), \(E_2=2\Delta\).  
+   (a) Write the partition function \(Z(\beta)\).  
+   (b) Find the probability of occupying the middle level at \(T\) such that \(\beta\Delta=1\).  
+
+### Medium
+2. Consider a set of \(N\) quantum harmonic oscillators with frequency \(\omega\).  
+   (a) Derive the total partition function \(Z_N\).  
+   (b) Obtain the heat capacity \(C_V(T)\) and show its limits: \(C_V\to Nk_B\) for \(T\gg\hbar\omega/k_B\) and \(C_V\to0\) for \(T\ll\hbar\omega/k_B\).  
+
+### Hard
+3. Derive the Sackur‑Tetrode equation for the entropy of a monatomic ideal gas starting from the translational partition function, explicitly keeping the \(1/N!\) factor and using Stirling’s approximation.  
+   (a) Show that  
+
+\[
+S = Nk_B\Bigl[\ln\!\Bigl(\frac{V}{N}\Bigl(\frac{4\pi mU}{3Nh^2}\Bigr)^{3/2}\Bigr)+\frac{5}{2}\Bigr],
+\]
+
+   where \(U=\langle E\rangle\) is the internal energy.  
+   (b) Evaluate \(S\) for 1 mol of argon at \(T=300\) K, \(p=1\) atm, and compare with the experimental value (~154 J mol⁻¹ K⁻¹).  
+
+## Linux Connection
+Statistical‑mechanics ideas appear throughout Linux kernel power‑ and thermal‑management subsystems. Below are concrete locations, tools, and runnable commands that illustrate the link.
+
+### 1. CPU Frequency Scaling (`cpufreq`)
+The scheduler treats the recent CPU load as a stochastic variable and updates an **exponential weighted moving average (EWMA)**:
+
+\[
+\ell_{t+1} = \alpha \ell_t + (1-\alpha) \, \text{util}_t,
+\]
+
+where \(\alpha = e^{-\Delta t/\tau}\) plays the role of a Boltzmann factor with relaxation time \(\tau\). This is mathematically identical to the canonical ensemble’s weighting of states by \(e^{-\beta E}\); the “energy” here is the instantaneous load, and \(\tau\) sets the temperature scale.
+
+*Relevant files*  
+
+```
+/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor
+/sys/devices/system/cpu/cpu0/cpufreq/scaling_available_frequencies
+```
+
+*Example: read the current governor and available frequencies*  
+
+```bash
+# Show governor for CPU0
+cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor
+
+# List available frequencies (kHz)
+cat /sys/devices/system/cpu/cpu0/cpufreq/scaling_available_frequencies
+```
+
+*Example: switch to performance governor (requires root)*  
+
+```bash
+echo performance | sudo tee /sys/devices/system/cpu/cpu0/cpufreq/scaling_governor
+```
+
+### 2. Thermal Daemon (`thermald`)
+`thermald` implements a simple **thermal RC model** analogous to the heat‑capacity equation  
+
+\[
+C \frac{dT}{dt} = P - \frac{T - T_{\text{amb}}}{R},
+\]
+
+where \(C\) is the thermal capacitance (J/K), \(R\) the thermal resistance (K/W), and \(P\) the instantaneous power. Solving this discrete‑time Langevin‑like equation yields a prediction of future temperature, allowing the daemon to pre‑emptively engage cooling mechanisms.
+
+*Configuration* (XML) – typical path  
+
+```
+/etc/thermald/thermal-conf.xml
+```
+
+*Example: query current sensor temperatures*  
+
+```bash
+# Install lm-sensors if needed: sudo apt install lm-sensors
+sudo sensors
+```
+
+*Example: view thermald state*  
+
+```bash
+systemctl status thermald
+journalctl -u thermald -f   # follow logs in real time
+```
+
+### 3. PowerTOP – Estimating Energy per Wakeup
+PowerTOP uses the relation  
+
+\[
+\langle E_{\text{wakeup}}\rangle = \sum_i p_i \, E_i,
+\]
+
+where \(p_i\) is the probability of a particular wakeup source (derived from interrupt statistics) and \(E_i\) the energy cost of handling that interrupt. This is a direct application of the Boltzmann‑weighted average over a discrete set of “wakeup states”.
+
+*Run PowerTOP*  
+
+```bash
+sudo powertop
+```
+
+Inside the interactive view, the “Wakeups/s” column shows the probability distribution; the “Power consumption” column shows the corresponding average energy.
+
+### 4. Cgroup v2 Memory Pressure
+The kernel’s **pressure stall information (PSI)** for memory computes the fraction of time tasks are stalled due to lack of memory. The underlying model treats memory reclamation as a Poisson process with rate \(\lambda\); the probability of a stall lasting longer than \(t\) is \(e^{-\lambda t}\), again a Boltzmann‑type tail.
+
+*Check PSI*  
+
+```bash
+cat /proc/pressure/memory
+```
+
+### 5. Example: Computing a Simple Partition Function in C
+The following program evaluates the translational partition function for a single particle in a box and prints the average energy.
+
+```c
+/* partition.c – compute Z1 and <E> for an ideal gas particle */
+#include <stdio.h>
+#include <math.h>
+
+int main(void) {
+    const double h   = 6.62607015e-34;   /* J·s */
+    const double kB  = 1.380649e-23;    /* J/K */
+    const double m   = 6.6335209e-26;   /* mass of N2 molecule (kg) */
+    const double V   = 24.5e-3;         /* 24.5 L -> m^3 (1 atm, 300 K) */
+    const double T   = 300.0;           /* K */
+
+    double beta = 1.0/(kB*T);
+    double Z1   = V * pow(2.0*M_PI*m*kB*T, 1.5) / (h*h*h);
+    double Eavg = 1.5 * kB * T;         /* analytic result */
+
+    printf("Z1 = %.3e\n", Z1);
+    printf("<E> = %.3e J (%.3f eV)\n", Eavg, Eavg/1.602176634e-19);
+    return 0;
+}
+```
+
+*Compile and run*  
+
+```bash
+gcc -O2 -std=c11 partition.c -o partition -lm
+./partition
+```
+
+The output should match the analytic \(\langle E\rangle = \frac{3}{2}k_B T\) within floating‑point error, demonstrating how the partition function encodes macroscopic thermodynamics.
+
+## Why This Matters
+Statistical mechanics is not an abstract curiosity; it provides the **calculus of probabilities** that underlies every modern Linux subsystem that manages limited resources—energy, cycles, memory, or bandwidth. By grasping how a partition function summarizes microscopic possibilities and how its derivatives yield observable averages and fluctuations, you can:
+
+* **Tune governors intelligently** – understand why the scheduler’s EWMA decay constant \(\tau\) behaves like a temperature, allowing you to predict frequency scaling under varying workloads.
+* **Diagnose thermal throttling** – interpret `thermald` logs through the lens of the RC model, estimate thermal capacitance from sensor data, and adjust cooling policies before overheating occurs.
+* **Optimize power usage** – apply the Boltzmann‑weighted average to wake‑up statistics in PowerTOP, identifying which interrupt sources dominate energy waste.
+* **Capacity‑plan memory** – use the exponential stall distribution from PSI to set realistic low‑memory thresholds in cgroup v2, avoiding out‑of‑memory kills while maintaining latency targets.
+* **Extend to new domains** – the same formalism applies to network traffic modeling (packet arrival as a Poisson process), GPU shader core utilization, or even container scheduling, where energy‑like cost functions replace physical energy.
+
+In short, mastering the statistical‑mechanics toolkit lets you move from trial‑and‑error tweaking to **first‑principles reasoning** about Linux performance, power, and thermal behavior—turning observables into predictable, controllable outcomes.

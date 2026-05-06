@@ -10,134 +10,271 @@ resources:
     title: "The Linux Programming Interface (Kerrisk)"
 ---
 
-## Why This Matters
-
-A NIC sits at the boundary between DMA hardware and the kernel's socket layer. It writes packet data directly into kernel memory without CPU involvement, signals completion via interrupts, and expects the driver to replenish descriptors fast enough to keep pace with wire speed. At 10 Gbps, a 1500-byte frame arrives every $\approx 1.2\,\mu\text{s}$. If the driver takes $2\,\mu\text{s}$ per frame to refill the RX ring, the NIC runs out of descriptors and drops packets — silently, with no error returned to any application. The failures caused by a broken network driver are not clean: DMA into freed memory causes data corruption with no stack trace; an unacknowledged interrupt causes an IRQ storm that pegs a CPU at 100%; a missing memory barrier causes the NIC to read a descriptor before the CPU finishes writing it, transmitting garbage.
-
----
-
 ## Core Concepts
+### Network Driver Fundamentals
+A network driver is the kernel‑mediated interface between the **network interface controller (NIC)** hardware and the rest of the operating system. Its primary responsibilities are:
+* **Descriptor management** – allocating and maintaining transmit (TX) and receive (RX) descriptor rings that the NIC reads/writes via DMA.
+* **Lifecycle control** – bringing the NIC up/down, resetting hardware, and configuring operational modes (speed, duplex, offloads).
+* **Packet steering** – deciding whether a packet is processed in interrupt context or via NAPI polling based on load.
+* **Offload coordination** – telling the NIC which checksum, segmentation, or tunneling tasks it may perform.
 
-### DMA Descriptor Rings
+### NIC Initialization – From First Principles
+When the driver’s probe routine runs, it must transform a raw PCI(e) device into a usable `struct net_device`. The steps are forced by hardware constraints:
 
-The NIC does not request buffers one at a time. Both TX and RX operate on **descriptor rings**: arrays of fixed-size descriptors in physically contiguous memory that the CPU and the NIC's DMA engine access simultaneously via different address spaces. The CPU sees a virtual address; the NIC sees a `dma_addr_t` (a bus address, which on x86 with no IOMMU is the physical address, but may be translated on other architectures).
+1. **Resource acquisition** – request I/O/MMIO spaces (`pci_iomap`) and IRQ (`request_irq`).  
+   *Why*: The NIC’s registers are only accessible after mapping; the IRQ line must be reserved before the NIC can assert it.
+2. **Reset and self‑test** – write to the NIC’s reset register, poll until the status indicates completion.  
+   *Why*: Guarantees a known state; residual configurations from prior drivers or firmware can cause undefined behavior.
+3. **MAC address retrieval** – read the station address from the NIC’s EEPROM or registers and store it in `dev->dev_addr`.  
+   *Why*: The MAC is the link‑layer identifier; without it, Ethernet frames cannot be correctly sourced or filtered.
+4. **Offload feature discovery** – query the NIC’s capabilities (e.g., `ETHTOOL_GSG`, `ETHTOOL_GGSO`) and set `dev->features` accordingly.  
+   *Why*: Mis‑matching advertised vs. actual capabilities leads to dropped packets or kernel warnings.
+5. **Memory allocation for descriptor rings** – allocate DMA‑coherent memory for TX and RX rings (`dma_alloc_coherent`).  
+   *Why*: The NIC accesses these structures via DMA; using non‑coherent memory would require explicit cache flushing, adding latency and complexity.
 
-Each descriptor is typically 16–32 bytes and contains:
+The initialization can be expressed as a series of causal constraints:
+\[
+\text{usable NIC} \iff
+\bigl(\text{resources acquired}\bigr) \land
+\bigl(\text{hardware reset}\bigr) \land
+\bigl(\text{MAC set}\bigr) \land
+\bigl(\text{features negotiated}\bigr) \land
+\bigl(\text{rings allocated}\bigr)
+\]
 
-- A bus address pointing to the packet buffer
-- A length field
-- An ownership bit: `0` = CPU owns, `1` = NIC owns
+### RX/TX Rings – Circular Buffer Mechanics
+Both rings are arrays of descriptors. A descriptor typically contains:
+* **buf_addr** – DMA address of the data buffer.
+* **buf_len** – length of the buffer.
+* **cmd/status bits** – ownership (NIC vs. driver), completion flags, offload hints.
 
-The NIC scans the ring looking for hardware-owned descriptors. When it fills one with an incoming packet it flips the ownership bit and raises an interrupt. The CPU must check the ownership bit — not the interrupt — to determine whether a descriptor is ready, because the NIC may fill multiple descriptors between two interrupt deliveries.
+Because the NIC and driver concurrently update indices, the rings are implemented as **power‑of‑two** buffers to allow wrap‑around via a simple mask:
+\[
+\text{idx} = (\text{base} + \text{offset}) \ \& \ (N-1)
+\]
+where \(N = 2^k\).  
+*Derivation*: If \(N\) is a power of two, \(N-1\) has all low \(k\) bits set; addition modulo \(N\) is equivalent to bitwise AND with \(N-1\). This avoids costly division.
 
-Ring size $N$ is always a power of two so that index wrapping uses a bitmask rather than a division:
+**Memory overhead**: For a ring with \(N\) descriptors each of size \(S\) bytes,
+\[
+\text{total} = N \times S
+\]
+Alignment to cache lines (typically 64 B) is required to prevent false sharing:
+\[
+S' = \lceil S / 64 \rceil \times 64
+\]
+Thus the driver often rounds each descriptor up to a cache‑line boundary before allocation.
 
-$$\text{next}(i) = (i + 1) \mathbin{\&} (N - 1)$$
+### NAPI – Polling vs. Interrupt Trade‑off
+Interrupt‑driven RX works well at low packet rates but scales poorly:
+* Each packet triggers an interrupt → context switch → kernel entry/exit → cache pollution.
+* At 10 Gbps with minimum‑size Ethernet frames (84 B on wire), the packet rate is:
+\[
+\lambda = \frac{10 \times 10^9}{84 \times 8} \approx 14.88 \text{ Mpps}
+\]
+Handling ~15 M interrupts/s would saturate a CPU.
 
-The ring is full (from the NIC's perspective — no place to write) when the NIC's write pointer catches up to the CPU's read pointer. This is not backpressure; the NIC simply discards the frame. Specifically, if the CPU is $N$ descriptors behind, **every arriving frame is dropped** until at least one descriptor is refilled. This makes ring drain latency a hard real-time constraint, not a soft performance goal.
+NAPI replaces the per‑packet interrupt with a **budgeted poll**:
+1. NIC asserts an interrupt → driver disables further IRQs (`disable_irq_nosync`) and schedules a NAPI poll.
+2. The poll routine (`napi_poll`) processes up to `weight` packets (default 64) from the RX ring.
+3. If more work remains, it returns a value ≥ weight, keeping the poll scheduled; otherwise it re‑enables IRQs and exits.
 
-The total memory for a coherent RX ring of $N$ descriptors of size $S$ bytes is:
+The **effective interrupt rate** becomes:
+\[
+\lambda_{\text{IRQ}} = \frac{\lambda}{\text{weight}} \times P_{\text{rearm}}
+\]
+where \(P_{\text{rearm}}\) is the probability that the NIC still has pending packets after a poll. For heavy load, \(P_{\text{rearm}} \approx 1\), giving a reduction by roughly the weight factor.
 
-$$M_{\text{ring}} = N \cdot S$$
+### Interrupts – Signalling Mechanism
+The NIC asserts an interrupt line when:
+* **TX completion** – a descriptor’s `DD` (done) bit is set.
+* **RX packet available** – one or more RX descriptors have transitioned from owned by NIC to owned by driver.
 
-Plus $N$ separately allocated `sk_buff` payload buffers, each at least MTU + headroom bytes. A typical configuration: $N = 256$, $S = 16\,\text{B}$, payload $= 2048\,\text{B}$, giving $M_{\text{ring}} = 4\,\text{KB}$ for the ring itself and $512\,\text{KB}$ for the buffers.
+The driver’s ISR must:
+1. **Acknowledge** the interrupt (write to the NIC’s interrupt‑clear register).  
+   *Why*: Prevents the NIC from re‑asserting the same IRQ, which would cause a storm.
+2. **Schedule** further processing:
+   * For TX: if the ring is low on free descriptors, wake the TX queue (`netif_wake_subqueue`).
+   * For RX: if NAPI is enabled, `__napi_schedule`; otherwise, process packets directly and re‑enable IRQs.
 
-### `sk_buff`: The Kernel's Packet Container
+Incorrect acknowledgement leads to **interrupt storms**, where the CPU spends > 90 % of time in the ISR, starving other tasks.
 
-Every in-flight packet is represented by an `sk_buff`. The driver allocates one per RX slot at initialization. The `sk_buff`'s `data` pointer is DMA-mapped using `dma_map_single()`, which pins the page and returns the bus address written into the descriptor. The CPU **must not read the buffer data** between the moment it hands the descriptor to the NIC (sets `DESC_HW_OWNED`) and the moment it calls `dma_unmap_single()` after the interrupt fires. This is not a convention — it is a cache coherency contract enforced differently on different architectures (on non-coherent architectures, the map/unmap calls issue explicit cache flushes).
+### Offloads – Shifting Work to Hardware
+Offloads are NIC capabilities that let the driver delegate costly per‑packet processing:
 
-After the NIC fills the buffer, the driver calls `dma_unmap_single()`, sets `skb->protocol` by parsing the Ethernet header, and calls `netif_receive_skb()` to hand the packet to the network stack. It then allocates a fresh `sk_buff` for that descriptor slot and re-hands ownership to the NIC.
+| Offload | What the NIC does | Driver responsibility |
+|---------|-------------------|------------------------|
+| **Checksum offload (TX)** | Computes IPv4/TCP/UDP checksum on data in the buffer. | Set `skb->ip_summed = CHECKSUM_PARTIAL` and describe where the checksum should be inserted. |
+| **TCP Segmentation Offload (TSO)** | Splits a large TCP socket buffer into MTU‑sized frames, adding sequence numbers. | Provide a single large `skb` (`skb->len > MTU`) and set `skb->shinfo->gso_type = SKB_GSO_TCPV4`. |
+| **Scatter‑Gather (SG)** | Reads multiple fragments from a single `skb`’s `frags[]` array. | Ensure `skb_shinfo(skb)->nr_frags` is valid and each fragment page is DMA‑mapped. |
+| **Receive Side Scaling (RSS)** | Distributes incoming flows across multiple RX queues based on a hash of header fields. | Allocate multiple RX queues, set indirection table, and enable `dev->features |= NETIF_F_RXRSS`. |
 
-### Interrupt Handling
-
-The driver registers an IRQ handler with `request_irq()`. When the NIC asserts its interrupt line, the CPU invokes the handler with local interrupts disabled (for `IRQF_DISABLED`, now deprecated) or with the specific IRQ masked. The handler runs in hardirq context: it cannot sleep, cannot block on a mutex, and should do the absolute minimum work.
-
-The canonical pattern:
-
-```c
-static irqreturn_t my_nic_interrupt(int irq, void *dev_id)
-{
-    struct my_nic *nic = dev_id;
-    u32 status;
-
-    status = ioread32(nic->bar0 + REG_IRQ_STATUS);
-    if (!(status & IRQ_SOURCES_MASK))
-        return IRQ_NONE;  /* shared IRQ line, not ours */
-
-    iowrite32(status, nic->bar0 + REG_IRQ_ACK);  /* clear before scheduling */
-    napi_schedule(&nic->napi);                    /* schedule poll */
-    return IRQ_HANDLED;
-}
-```
-
-The interrupt is cleared **before** scheduling deferred work, not after. If you clear it after, a packet arriving in the window between scheduling and clearing causes the interrupt to be lost, and that descriptor slot is never processed until the next packet arrives.
-
-### NAPI: Why Pure Interrupts Fail at Line Rate
-
-At 10 Gbps with 64-byte frames, the NIC delivers $\approx 14.8 \times 10^6$ packets per second. Each interrupt has a fixed overhead — save/restore registers, switch context, run the handler, return. If that overhead is $1\,\mu\text{s}$, interrupt-driven reception consumes:
-
-$$14.8 \times 10^6 \text{ interrupts/s} \times 1\,\mu\text{s/interrupt} = 14.8\,\text{s of CPU per second}$$
-
-which is physically impossible on one core. The system enters **interrupt liveness collapse**: it spends all its time entering and leaving interrupt context and makes zero forward progress on processing packets or running user processes.
-
-NAPI solves this with a state machine per receive queue:
-
-1. First frame arrives → interrupt fires → driver calls `napi_schedule()` → **interrupt disabled for this queue**
-2. `net_rx_action` softirq runs `napi_poll()` with a budget (default 64 packets)
-3. Driver's `poll()` drains descriptors up to the budget, calling `netif_receive_skb()` for each
-4. If the ring empties before budget exhaustion → call `napi_complete_done()` → re-enable interrupt
-5. If budget exhausted → return the budget value → softirq yields and reschedules; interrupt stays off
-
-Step 5 is the key: the interrupt remains disabled as long as frames are arriving faster than the budget can drain them. The CPU stops paying interrupt overhead and instead amortizes it over a batch of up to 64 packets. At low load (step 4), you still get one interrupt per first-packet, preserving latency.
-
-The NAPI poll function skeleton:
-
-```c
-static int my_nic_poll(struct napi_struct *napi, int budget)
-{
-    struct my_nic *nic = container_of(napi, struct my_nic, napi);
-    int work_done = 0;
-
-    while (work_done < budget) {
-        struct my_rx_desc *desc = &nic->rx_ring[nic->rx_head];
-
-        if (desc->flags & DESC_HW_OWNED)
-            break;  /* NIC hasn't filled this one yet */
-
-        dma_unmap_single(&nic->pdev->dev, desc->addr,
-                         RX_BUF_SIZE, DMA_FROM_DEVICE);
-
-        netif_receive_skb(nic->rx_skbs[nic->rx_head]);
-        my_nic_refill_rx(nic, nic->rx_head);  /* allocate new skb, re-arm */
-
-        nic->rx_head = (nic->rx_head + 1) & (RX_RING_SIZE - 1);
-        work_done++;
-    }
-
-    if (work_done < budget)
-        napi_complete_done(napi, work_done);  /* re-enables interrupt */
-
-    return work_done;
-}
-```
-
-### Hardware Offloads
-
-Offloads shift computation from the kernel's protocol stack to the NIC's dedicated logic. This matters because checksum computation and TCP segmentation are $O(n)$ in packet size — at 10 Gbps they consume measurable CPU cycles that compound across millions of packets.
-
-| Offload | Mechanism |
-|---|---|
-| TX checksum offload | Driver sets `skb->ip_summed = CHECKSUM_PARTIAL`; NIC fills in the checksum field before transmit |
-| RX checksum offload | NIC validates checksum; driver sets `skb->ip_summed = CHECKSUM_UNNECESSARY`; stack skips verification |
-| TSO (TCP Segmentation Offload) | Kernel hands NIC a single buffer up to 64 KB; NIC segments into MTU-sized frames. The kernel avoids $\lfloor\text{len}/\text{MTU}\rfloor$ copy operations |
-| GRO (Generic Receive Offload) | Kernel (not NIC) coalesces matching TCP segments into a single large `sk_buff` before delivering to the socket; reduces per-packet overhead in the stack |
-
-The driver advertises capability by setting bits in `netdev->hw_features` and enabling them in `netdev->features`. The stack checks `skb->ip_summed` before computing checksums, and checks `NETIF_F_TSO` in `dev->features` before segmenting.
+By moving checksum calculation or segmentation to the NIC, the driver reduces CPU cycles per packet from O(L) (where L is packet length) to O(1) for the offloaded portion.
 
 ---
 
 ## How It Works
+### End‑to‑End Packet Transmission (TX)
+1. **User‑space request** – Application calls `sendto(fd, buf, len, …)`.  
+   *Kernel path*: `sock_sendmsg → __sock_sendmsg → dev_queue_xmit(skb)`.
+2. **Queue discipline** – `dev_queue_xmit` applies the selected qdisc (default `pfifo_fast`). If the qdisc is congested, it returns `-EBUSY`; otherwise it passes the `skb` to the driver’s `ndo_start_xmit`.
+3. **Driver TX entry** – `ndo_start_xmit(struct sk_buff *skb, struct net_device *dev)`:
+   * Acquire TX lock (`spin_lock_irqsave(&tx_lock, flags)`).
+   * Compute next free descriptor index: `tx_next = READ_ONCE(dev->tx_ring->next_to_use)`.
+   * If `tx_next == dev->tx_ring->next_to_clean` → ring full → return `NETDEV_TX_BUSY` (qdisc will retry later).
+   * Map the skb’s data buffer for DMA: `dma_addr = dma_map_single(dev, skb->data, skb->len, DMA_TO_DEVICE)`.
+   * Fill descriptor:
+     ```c
+     struct tx_desc *txd = &tx_ring[tx_next];
+     txd->buf_addr = cpu_to_le64(dma_addr);
+     txd->buf_len  = cpu_to_le32(skb->len);
+     txd->cmd      = TX_DESC_CMD_EOP | TX_DESC_CMD_RS; // end of packet, report status
+     txd->status   = 0;
+     ```
+   * Increment `next_to_use` (with wrap using mask).
+   * **Kick the NIC**: write the descriptor index to the NIC’s TX doorbell register (`writel(tx_next, NIC_TX_TAIL)`).
+   * Release lock and return `NETDEV_TX_OK`.
+4. **NIC DMA** – The NIC reads the descriptor, copies the packet from host memory onto the wire, and when finished sets the `DD` bit in the descriptor and asserts TX‑complete interrupt.
+5. **Interrupt handling** – ISR:
+   * `disable_irq_nosync(irq)`.
+   * Scan TX ring for descriptors with `DD` set, `dma_unmap_single`, free the associated `skb`.
+   * Update `next_to_clean`.
+   * If free descriptors ≥ wake threshold → `netif_wake_subqueue(dev, queue)`.
+   * Re‑enable IRQ (`enable_irq(irq)`) or schedule NAPI if Rx work also pending.
+6. **Completion** – The socket layer eventually returns to user space after the `skb` is freed.
 
-### Initialization: `probe()` to `register_netdev()`
+### End‑to‑End Packet Reception (RX)
+1. **NIC DMA** – Incoming packet passes the NIC’s filters, is written via DMA into an RX buffer pointed to by the current RX descriptor, and the descriptor’s `DD` bit is set.
+2. **Interrupt or NAPI** – NIC asserts RX interrupt.
+   *If NAPI disabled*: ISR processes each packet directly:
+   * `dma_sync_single_for_cpu` (if needed), `skb = netdev_alloc_skb(ip_align, dev->mtu + NET_IP_ALIGN)`, copy data, `netif_receive_skb(skb)`, then `dma_unmap_single`.
+   *If NAPI enabled*: ISR disables IRQ, calls `__napi_schedule(&dev->napi)`.
+3. **NAPI poll** – `napi_poll(struct napi_struct *napi, int budget)`:
+   * Loop up to `budget` times:
+     * Read descriptor status; if not owned by driver, break.
+     * Extract DMA address, `dma_sync_single_for_cpu`.
+     * Build `skb` (`skb = netdev_alloc_skb(ip_align, len)`), `skb_put_data`, `skb->protocol = eth_type_trans(skb, dev)`.
+     * `netif_receive_skb(skb)`.
+     * `dma_unmap_single`, mark descriptor as clean, advance `next_to_rx`.
+   * If processed < `budget` → re‑enable IRQ (`enable_irq`), return `budget - work_done`.
+   * Else → return `budget` (keep poll scheduled).
+4. **Upper stack** – `netif_receive_skb` passes the packet to the appropriate protocol handler (IPv4, ARP, etc.) based on `skb->protocol`.
 
-The PCI subsystem calls `probe()` after matching the device's vendor/device ID against the driver's `pci_device_id` table. The driver must
+**Timing example**: 1 Gbps link, average packet 600 B (wire).  
+Transmission time per packet:
+\[
+T_{\text{tx}} = \frac{600 \times 8}{1 \times 10^9} = 4.8 \,\mu\text{s}
+\]
+If the driver can process a descriptor in 0.2 µs (typical), the NIC can keep the pipe full as long as the interrupt/NAPI overhead per packet stays below ~4.6 µs. With NAPI weight = 64, the interrupt overhead is amortized, yielding effective per‑packet overhead ≈ 0.07 µs, well within the budget.
+
+---
+
+## Worked Examples
+### Example 1: Transmitting a 1500‑Byte Ethernet Frame
+*Assumptions*: MTU = 1500, Ethernet header = 14 B, no VLAN, IPv4 + UDP (20 + 8 = 28 B). Payload = 1500 − (14 + 28) = 1458 B.
+
+**Step‑by‑step with real numbers** (driver code omitted for brevity, only key values shown):
+
+1. **Socket creation & sendto**  
+   ```c
+   int sock = socket(AF_INET, SOCK_DGRAM, 0);
+   struct sockaddr_in dst = {
+       .sin_family = AF_INET,
+       .sin_port   = htons(5000),
+       .sin_addr.s_addr = inet_addr("10.0.0.2")
+   };
+   char *msg = "Hello network driver!";
+   sendto(sock, msg, strlen(msg), 0,
+          (struct sockaddr *)&dst, sizeof(dst));
+   ```
+
+2. **Kernel path** – `dev_queue_xmit` creates an `skb`:
+   * `skb->len = 142` (14 ETH + 20 IP + 8 UDP + 100 B payload example).  
+   * `skb->data` points to linear buffer containing the packet.
+
+3. **Driver TX** (`ixgbe_xmit_frame` in Intel 10G driver):
+   * `tx_next = 57` (current tail).  
+   * `dma_map_single` returns `0x7f8a12345000`.  
+   * Descriptor fields (little‑endian):
+     ```
+     buf_addr = 0x7f8a12345000
+     buf_len  = 0x0000008e   // 142 decimal
+     cmd      = 0x01 | 0x02  // EOP | RS
+     status   = 0x00
+     ```
+   * Doorbell write: `writel(58, IXGBE_TDT);` (tail = next_to_use).
+
+4. **NIC processing** – Reads descriptor, DMA reads 142 bytes, sends on wire:
+   * Wire time = (142 × 8) / 10⁹ ≈ 1.136 µs (at 10 Gbps).  
+   * After transmission, NIC sets `DD` bit in descriptor status.
+
+5. **Interrupt** – ISR sees `DD`, `dma_unmap_single(0x7f8a12345000, 142, DMA_TO_DEVICE)`, frees `skb`, updates `next_to_clean = 58`.  
+   *If TX ring now has > 32 free descriptors*, `netif_wake_subqueue` is called.
+
+**Result**: The user‑space `sendto` returns after the kernel has queued the packet; actual wire latency ≈ 1.1 µs plus driver overhead (~0.3 µs).
+
+### Example 2: Receiving a UDP Packet via NAPI
+*Assumptions*: 10 Gbps NIC, RX ring size = 256 descriptors, weight = 64, packet size = 200 B (including Ethernet header).
+
+1. **NIC writes packet** to descriptor index = 112, sets `DD`.
+2. **Interrupt fires** – ISR disables IRQ, calls `__napi_schedule(&dev->napi)`.
+3. **NAPI poll** (`ixgbe_poll`):
+   * Loop:
+     * Desc[112] status shows `DD` and `OWNER = DMA`.  
+     * `dma_addr = le64_to_cpu(desc[112].buf_addr) = 0x7f8b20001000`.
+     * `dma_sync_single_for_cpu(..., 200, DMA_FROM_DEVICE)`.
+     * Allocate `skb = netdev_alloc_skb(ip_align, 200)`; `skb_put(skb, 200)`.
+     * Copy: `skb_put_data(skb, dma_addr, 200)`.
+     * `skb->protocol = eth_type_trans(skb, dev)` → `0x0800` (IPv4).
+     * `netif_receive_skb(skb)`.
+     * `dma_unmap_single(..., 200, DMA_FROM_DEVICE)`.
+     * Mark descriptor clean (`desc[112].status = 0`), advance `next_to_rx`.
+   * After processing 64 packets, poll returns `budget` → NAPI stays scheduled.
+4. **When RX ring empties**, poll returns `< budget`, IRQs re‑enabled.
+
+**Math**: Interrupt rate reduction:
+\[
+\lambda_{\text{IRQ}} = \frac{\lambda}{\text{weight}} = \frac{10\text{Gbps}/(200\times8)}{64}
+   \approx \frac{6.25\text{Mpps}}{64} \approx 97.6\text{kIRQ/s}
+\]
+A single core can easily handle ~100 kIRQ/s, leaving ample CPU for application processing.
+
+---
+
+## Common Mistakes
+| Mistake | Why it’s Wrong | Consequence |
+|---------|----------------|-------------|
+| **Using `GFP_KERNEL` in ISR or NAPI poll** | `GFP_KERNEL` may sleep; ISR/NAPI run in atomic context where sleeping is forbidden. | Kernel oops (`BUG: sleeping function called from invalid context`) or system hang. |
+| **Failing to set `dev->features` after offload negotiation** | The driver may advertise capabilities the NIC lacks (or vice‑versa). | Kernel drops packets with `NETDEV_TX_OK` but NIC actually didn’t perform offload → corrupted checksums, segmentation faults in upper stack. |
+| **Not checking return of `dma_map_single`** | Mapping can fail (`DMA_MAPPING_ERROR`) if the address exceeds the NIC’s DMA mask. | Silent data corruption; NIC reads garbage or crashes on bus error. |
+| **Using a non‑power‑of‑two ring size with modulo instead of mask** | Wrap‑around logic becomes expensive and error‑prone. | Mis‑indexed descriptors lead to overwritten buffers, NIC hangs, or duplicated packets. |
+| **Neglecting to clear the interrupt status register before re‑enabling IRQs** | Some NICs latch the interrupt until cleared. | Immediate re‑assertion → interrupt storm, 100 % CPU usage in ISR. |
+| **Not calling `netif_napi_add` before registering the netdev** | NAPI struct won’t be linked to the device. | Polling never scheduled; driver falls back to interrupt mode, losing NAPI benefits. |
+| **Leaving TX queue stopped after a transient error** | Forgetting to `netif_wake_subqueue` when descriptors become free. | Upper layers see `NETDEV_TX_BUSY` forever → application stalls on `send`. |
+| **Misaligning DMA buffers (not cache‑line aligned)** | Causes false sharing or extra cache line fills during NIC reads/writes. | Increased latency, especially noticeable at high packet rates. |
+
+Each mistake stems from violating a **kernel contract** (atomic context, DMA correctness, resource accounting) rather than from ignorance of a high‑level concept.
+
+---
+
+## Exercises
+### Easy
+1. **Minimal netdev skeleton** – Write a module that allocates a `struct net_device`, assigns a static MAC (`02:00:00:00:00:01`), registers it with `register_netdev`, and implements only `ndo_open`/`ndo_close` that printk a message. Load with `insmod` and verify with `ip link show`.  
+   *Goal*: Understand device lifecycle and sysfs representation (`/sys/class/net/<name>/`).
+
+2. **Offload query** – Using `ethtool -k eth0`, list all offload features. Then disable TSO (`ethtool -K eth0 tso off`) and observe the change in `ethtool -i eth0`.  
+   *Goal*: Connect driver-reported features to user‑visible tool.
+
+### Medium
+3. **TX ring implementation** – Extend the skeleton driver to allocate a power‑of‑two TX ring (`N = 64`) of `struct tx_desc` (define your own descriptor with `buf_addr`, `buf_len`, `cmd`, `status`). Implement `ndo_start_xmit` to fill descriptors, kick the NIC via a mock doorbell (`writel` to a dummy I/O port), and clean completed descriptors in a timer (`mod_timer`). No real hardware needed; simulate NIC completion by setting the `DD` bit after a short delay in a workqueue.  
+   *Goal*: Practice DMA mapping, descriptor ownership, and ring arithmetic.
+
+4. **NAPI poll with budget** – Add a NAPI struct, implement `napi_poll` that pretends to receive packets by generating dummy `skb`s (using `alloc_skb`) up to the weight, and returns appropriate values. Use `netif_rx` to feed the stack. Verify with `ping -c 5 127.0.0.1` that packets are processed without interrupt storms (check `/proc/interrupts`).  
+   *Goal*: Experience the interrupt‑amortization effect.
+
+### Hard
+5. **True hardware offload (TSO)** – On a real NIC that supports TSO (e.g., Intel ixgbe), implement a driver fragment that, when `skb_shinfo(skb)->gso_type & SKB_GSO_TCPV4` is set, sets the appropriate TX descriptor CMD bits (`IXGBE_TXD_CMD_TSE`). Ensure the NIC’s `MAX_TXD` limit is respected and that the driver correctly calculates the MSS (`skb_shinfo(skb)->gso_size`). Test with `iperf3 -c <server> -w 64K -M 1460` and confirm CPU usage drops compared to TSO‑off.  
+   *Goal*: Bridge driver logic to real NIC register programming and validate performance gain.
+
+6. **Interrupt storm detection & recovery** – Modify the ISR to detect if more than 1000 interrupts have been seen in the last 10 ms (using a timestamp ring buffer). If detected, temporarily disable NAPI (`napi_disable`) and schedule a workqueue to re‑enable after a cool‑down period. Log the event with `pr_err`.  
+   *Goal*: Practice defensive programming and

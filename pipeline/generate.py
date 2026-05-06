@@ -23,8 +23,9 @@ from tqdm import tqdm
 
 from config import (
     API_KEY, BASE_URL, DRAFT_MODEL, REFINE_MODEL,
-    CHUNKS_DB, MODULE_MAP, OUTPUT_DIR, BOOK_ALIASES
+    CHUNKS_DB, MODULE_MAP, OUTPUT_DIR,
 )
+from retrieve import retrieve
 
 client = OpenAI(api_key=API_KEY, base_url=BASE_URL)
 
@@ -44,43 +45,8 @@ def load_prompt(name: str, **kwargs) -> str:
     return template
 
 
-def retrieve_chunks(book_key: str, topics: list[str], conn: sqlite3.Connection, n: int = 8) -> str:
-    """Simple keyword retrieval: score chunks by how many topic words they contain."""
-    if not conn:
-        return "(no source chunks available — run ingest.py first)"
 
-    # Resolve short key to actual filename stem
-    resolved_key = BOOK_ALIASES.get(book_key, book_key)
-
-    keywords = set()
-    for t in topics:
-        keywords.update(t.lower().split())
-    keywords = {w for w in keywords if len(w) > 3}  # skip short words
-
-    rows = conn.execute(
-        "SELECT page, section, text FROM chunks WHERE book=?", (resolved_key,)
-    ).fetchall()
-
-    if not rows:
-        return f"(no chunks found for book '{book_key}')"
-
-    scored = []
-    for page, section, text in rows:
-        score = sum(text.lower().count(kw) for kw in keywords)
-        scored.append((score, page, section, text))
-
-    scored.sort(key=lambda x: (x[0], x[1], x[2] or ""), reverse=True)
-    top = scored[:n]
-
-    parts = []
-    for score, page, section, text in top:
-        header = f"[p.{page}" + (f", {section}" if section else "") + "]"
-        parts.append(f"{header}\n{text[:1200]}")  # cap each chunk
-
-    return "\n\n---\n\n".join(parts)
-
-
-def call_model(model: str, prompt: str, max_tokens: int = 2000, retries: int = 3) -> str:
+def call_model(model: str, prompt: str, max_tokens: int = 2000, retries: int = 5) -> str:
     for attempt in range(retries):
         try:
             resp = client.chat.completions.create(
@@ -88,11 +54,12 @@ def call_model(model: str, prompt: str, max_tokens: int = 2000, retries: int = 3
                 messages=[{"role": "user", "content": prompt}],
                 max_tokens=max_tokens,
             )
-            return resp.choices[0].message.content.strip()
+            content = resp.choices[0].message.content or ""
+            return content.strip()
         except Exception as e:
             if attempt == retries - 1:
                 raise
-            wait = 2 ** attempt * 5  # 5s, 10s, 20s
+            wait = min(60 * (attempt + 1), 120)
             tqdm.write(f"  API error (attempt {attempt+1}/{retries}): {e} — retrying in {wait}s")
             time.sleep(wait)
 
@@ -138,23 +105,26 @@ def generate_module(module_id: int, mod: dict, conn, draft_only=False, refine_on
 
     if refine_only and out_path.exists():
         existing = out_path.read_text()
-        # strip frontmatter to get draft body
         body = re.sub(r"^---[\s\S]*?---\n", "", existing).strip()
         draft = body
     else:
-        # retrieve source chunks
-        book_key = mod.get("primary_book", "")
-        chunks = retrieve_chunks(book_key, mod.get("topics", []), conn)
+        topics = mod.get("topics", [])
+        primary_book = mod.get("primary_book", "")
+        secondary_book = mod.get("secondary_book", "")
+
+        chunks = retrieve(mod["title"], topics, primary_book, conn, n=12) if primary_book else "(no primary book)"
+        secondary_chunks = retrieve(mod["title"], topics, secondary_book, conn, n=6) if secondary_book else "(no secondary book)"
 
         prompt = load_prompt(
             "draft",
             module_id=module_id,
             module_title=mod["title"],
-            topics=", ".join(mod.get("topics", [])),
-            primary_book=mod.get("primary_book", ""),
+            topics=", ".join(topics),
+            primary_book=primary_book,
             chunks=chunks,
+            secondary_chunks=secondary_chunks,
         )
-        draft = call_model(DRAFT_MODEL, prompt, max_tokens=2000)
+        draft = call_model(DRAFT_MODEL, prompt, max_tokens=4000)
 
     if draft_only:
         body = draft
@@ -165,7 +135,7 @@ def generate_module(module_id: int, mod: dict, conn, draft_only=False, refine_on
             module_title=mod["title"],
             draft=draft,
         )
-        body = call_model(REFINE_MODEL, prompt, max_tokens=2500)
+        body = call_model(REFINE_MODEL, prompt, max_tokens=6000)
 
     frontmatter = build_frontmatter(mod, module_id)
     full = frontmatter + "\n\n" + body + "\n"

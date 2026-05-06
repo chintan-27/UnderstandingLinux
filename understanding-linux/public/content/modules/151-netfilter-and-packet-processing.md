@@ -10,151 +10,317 @@ resources:
     title: "Unix Network Programming (Stevens)"
 ---
 
-## Why This Matters
-
-Every packet touching a Linux system forces a kernel decision: deliver it locally, forward it, rewrite it, or discard it. Without a structured interception framework, none of the following are possible: stateful firewalling, NAT-based internet sharing, Docker's per-container network isolation, or Kubernetes's `kube-proxy` service load balancing. Netfilter provides that framework by embedding five callback points directly into the IPv4/IPv6 forwarding path. The overhead when no hooks are registered is a single null-pointer check per packet — essentially zero. That design choice is why Netfilter became the universal substrate rather than a niche add-on.
-
 ## Core Concepts
+### Netfilter as a Kernel Hooking Framework
+Netfilter is not a monolithic firewall; it is a set of **well‑defined points (hooks)** in the Linux networking stack where kernel modules can register callbacks to inspect or alter `struct sk_buff` (socket buffer) objects.  
+Each hook corresponds to a precise moment in packet processing:
 
-### Stateless vs. Stateful Filtering
+| Hook          | When it runs (relative to the stack)                                 |
+|---------------|-----------------------------------------------------------------------|
+| `NF_INET_PRE_ROUTING`   | Immediately after the NIC DMA, before any routing decision.          |
+| `NF_INET_LOCAL_IN`      | After routing, if the packet is destined for a local socket.          |
+| `NF_INET_FORWARD`       | After routing, if the packet is to be forwarded to another interface. |
+| `NF_INET_LOCAL_OUT`     | Just before a locally generated packet leaves the stack.              |
+| `NF_INET_POST_ROUTING`  | After routing, just before the packet is handed back to the NIC.      |
 
-A stateless firewall matches on header fields only: source IP, destination IP, protocol, ports, TCP flags. It treats each packet as independent, which forces symmetric rules. To allow an outbound TCP connection, a stateless ruleset needs one rule permitting the outbound SYN and a separate rule permitting inbound packets with `ACK` set — and that second rule also permits unsolicited inbound `ACK` packets, which is a security hole.
+**Why hooks?**  
+The networking stack is layered and performance‑critical. By exposing only five invariant points, Netfilter lets extensions (e.g., `iptables`, `nft`, `ebpf`) intercept packets **without** having to rewrite the core stack or sacrifice cache locality. The hook mechanism is implemented via `nf_hook_ops` structures; the kernel walks a per‑hook list of callbacks, invoking each until a verdict (`NF_ACCEPT`, `NF_DROP`, `NF_STOLEN`, `NF_QUEUE`, `NF_REPEAT`) is returned.
 
-A stateful firewall solves this by tracking connection state through the *connection tracking* subsystem (`conntrack`, implemented in `net/netfilter/nf_conntrack_core.c`). The ruleset needs only one rule: allow `ESTABLISHED,RELATED` traffic. The kernel's conntrack table records the 5-tuple $(src_{ip}, dst_{ip}, proto, src_{port}, dst_{port})$ for every active connection, so the return traffic is recognized without opening broad holes.
+### Tables, Chains, and Rules
+A **table** groups related functionality. The kernel provides three main tables for IPv4 (and analogous ones for IPv6):
 
-The memory cost of stateful tracking is proportional to the number of concurrent connections. Each conntrack entry consumes roughly 300–400 bytes. With the default table size:
+| Table   | Primary purpose                               | Built‑in chains (hook → chain)                               |
+|---------|-----------------------------------------------|--------------------------------------------------------------|
+| `filter`| Packet filtering (accept/drop)               | `INPUT` → `NF_INET_LOCAL_IN`, `FORWARD` → `NF_INET_FORWARD`, `OUTPUT` → `NF_INET_LOCAL_OUT` |
+| `nat`   | Network Address Translation (src/dst)        | `PREROUTING` → `NF_INET_PRE_ROUTING`, `POSTROUTING` → `NF_INET_POST_ROUTING`, `OUTPUT` → `NF_INET_LOCAL_OUT` |
+| `mangle`| Specialized packet alteration (TTL, MARK, etc.)| All five hooks have a corresponding chain (`PREROUTING`, `INPUT`, `FORWARD`, `OUTPUT`, `POSTROUTING`) |
+| `raw`   | Exemption from connection tracking            | `PREROUTING`, `OUTPUT`                                        |
+| `security`| MAC/Policy labeling (SELinux)              | `INPUT`, `OUTPUT`, `FORWARD`                                 |
 
-$$N_{max} = \left\lfloor \frac{RAM_{bytes} / 8}{352} \right\rfloor$$
+A **chain** is an ordered list of **rules** attached to a hook. When a packet reaches a hook, Netfilter walks the chain **sequentially** until a rule matches; the rule’s *target* then decides the next step.
 
-which on a 1 GB machine yields approximately 375,000 entries. You can inspect and tune this:
+A **rule** consists of:
+1. **Match criteria** (source/dest IP, ports, protocol, connection state, etc.) – expressed via *match extensions* (`-m`).
+2. **Target** (`-j`) – what to do if all matches succeed (`ACCEPT`, `DROP`, `RETURN`, another chain, or an extended target like `SNAT`, `DNAT`, `TTL`).
 
-```bash
-# Current table size limit
-sysctl net.netfilter.nf_conntrack_max
+**Causal explanation:**  
+The linear walk guarantees deterministic policy evaluation: the first matching rule wins. This design avoids the need for complex conflict‑resolution algorithms and makes it easy to reason about rule ordering—a cornerstone of firewall administration.
 
-# Current number of tracked connections
-sysctl net.netfilter.nf_conntrack_count
+### Packet Traversal Intuition (with Queuing Model)
+Consider a packet arriving on interface `eth0`. Its journey can be modeled as a series of service stations (the hooks). If we denote the average processing time at hook *h* as $τ_h$ and the average number of rule evaluations per hook as $E_h$, the expected latency $L$ is:
 
-# Raise the limit (survives until reboot)
-sysctl -w net.netfilter.nf_conntrack_max=524288
+$$
+L = \sum_{h \in \{PRE,IN,FWD,OUT,POST\}} \bigl( τ_h + E_h·t_{match} \bigr)
+$$
 
-# Make it persistent
-echo "net.netfilter.nf_conntrack_max = 524288" >> /etc/sysctl.d/99-conntrack.conf
-```
+where $t_{match}$ is the average time to evaluate a single match (often $O(1)$ for simple IP/mask checks, $O(\log M)$ for trie‑based matches like `-m string`).  
+This formula shows why adding many complex matches (e.g., deep packet inspection) can dominate latency, while simple ACLs add only a constant overhead.
 
-Exceeding `nf_conntrack_max` causes new connections to be dropped with the kernel message `nf_conntrack: table full, dropping packet`. On high-traffic systems this is a real failure mode, not a theoretical one.
-
-### Hooks: Where the Code Runs
-
-Netfilter hooks are not poll points or copy-to-userspace mechanisms. They are direct function-pointer calls inserted into the kernel's packet processing path. When a packet reaches a hook point, the kernel walks a sorted list of registered `nf_hook_ops` structures (sorted by `.priority`) and calls each handler in order, passing a pointer to the `sk_buff`. Each handler returns a verdict; a `NF_DROP` verdict terminates the walk immediately and frees the buffer.
-
-The five IPv4 hooks (defined in `include/uapi/linux/netfilter_ipv4.h`):
-
-| Hook Constant | Position in Path | Typical Use |
-|---|---|---|
-| `NF_INET_PRE_ROUTING` | After checksum validation, before routing decision | DNAT, conntrack lookup |
-| `NF_INET_LOCAL_IN` | After routing confirms local delivery | Inbound filtering |
-| `NF_INET_FORWARD` | After routing confirms forwarding | Forward filtering |
-| `NF_INET_LOCAL_OUT` | Locally generated packet, before routing | Outbound filtering, DNAT |
-| `NF_INET_POST_ROUTING` | After routing, before driver transmission | SNAT, MASQUERADE |
-
-DNAT must happen at `PRE_ROUTING` (or `LOCAL_OUT` for locally generated traffic) because it rewrites the destination address, which changes the routing decision. If DNAT ran after the routing decision, the kernel would have already committed to the wrong path. This ordering constraint is not configurable — it is baked into which chains each table registers.
-
-### NAT: Rewriting Addresses in Transit
-
-SNAT rewrites the source address/port of outgoing packets so that many private hosts share one public IP. DNAT rewrites the destination address/port of incoming packets to redirect them to an internal host. Both operations break the IP end-to-end invariant, which is why they require conntrack: the kernel must remember the original tuple to reverse the translation when the reply arrives.
-
-The nat table processes only the *first* packet of a connection. The translation decision is stored in the conntrack entry and applied automatically to all subsequent packets of that connection by the conntrack fast-path, without re-evaluating nat table rules. This is why changing a nat rule does not affect existing connections — the rule was only consulted once.
-
-Port collision is a real constraint for SNAT. If two internal hosts both have an outbound connection from source port $p$, the kernel must remap one of them to a different external port $p'$ chosen from the ephemeral range $[1024, 65535]$. The number of simultaneous SNAT connections through a single public IP is bounded by:
-
-$$|C_{max}| = (65535 - 1024) \times |dst_{unique}|$$
-
-since the kernel tracks translations per $(external\_port, destination)$ pair, not just per port.
-
-### Tables, Chains, and Evaluation Order
-
-`iptables` organizes rules by *function* (table) and *hook point* (chain). The four main tables and their registered chains:
-
-| Table | Chains | Purpose |
-|---|---|---|
-| `raw` | PREROUTING, OUTPUT | Bypass conntrack with `NOTRACK` |
-| `mangle` | All five | Modify headers: TTL, DSCP, fwmark |
-| `nat` | PREROUTING, INPUT, OUTPUT, POSTROUTING | Address/port rewriting |
-| `filter` | INPUT, FORWARD, OUTPUT | Accept/drop decisions |
-
-At each hook, tables are evaluated in a fixed order: `raw` → `mangle` → `nat` → `filter`. Within a chain, rules are evaluated top-to-bottom; the first matching rule's target is applied and evaluation stops. A chain with no matching rule falls through to the chain's default policy (`ACCEPT` or `DROP`).
-
-`nftables` (the successor, in `net/netfilter/nf_tables_core.c`) replaces this with a single unified table-and-chain model where you declare which hook and priority each chain sits at. There are no hardcoded table names:
-
-```bash
-# nftables equivalent of a basic filter table
-nft add table inet my_filter
-nft add chain inet my_filter input { type filter hook input priority 0 \; policy drop \; }
-nft add rule inet my_filter input ct state established,related accept
-nft add rule inet my_filter input tcp dport 22 accept
-```
+---
 
 ## How It Works
+### Table‑Specific Chain Traversal
+When a packet hits a hook, Netfilter does **not** examine all tables at once. Instead, it processes tables in a fixed order defined by the hook:
 
-### Packet Traversal Path
+| Hook                | Table order (first → last) |
+|---------------------|----------------------------|
+| `NF_INET_PRE_ROUTING`   | `raw`, `mangle`, `nat` |
+| `NF_INET_LOCAL_IN`      | `mangle`, `filter` |
+| `NF_INET_FORWARD`       | `mangle`, `filter` |
+| `NF_INET_LOCAL_OUT`     | `raw`, `mangle`, `nat`, `filter` |
+| `NF_INET_POST_ROUTING`  | `mangle`, `nat` |
 
-The routing decision (`ip_route_input()` for ingress, `ip_route_output()` for egress, in `net/ipv4/route.c`) is not a Netfilter hook. It is the kernel's FIB lookup. Netfilter wraps around it.
+Within each table, the corresponding chain is walked. This ordering explains why, for example, a `RAW` rule can **prevent** connection tracking from ever seeing a packet, while a `MANGLE` rule in `POSTROUTING` can alter a packet after NAT has already been applied.
 
-**Packet destined for the local host:**
+### Rule Evaluation Mechanics
+Internally, each rule is compiled into a **bytecode‑like** structure (`struct xt_target_param` + match structs). The kernel executes:
 
+```c
+for (each rule r in chain) {
+    if (xt_match_all(r->matches, skb)) {
+        int verdict = xt_target(r->target, skb);
+        if (verdict != XT_CONTINUE) return verdict;
+    }
+}
+return chain->policy;   /* ACCEPT/DROP/RETURN */
 ```
-NIC → PRE_ROUTING (raw→mangle→nat:DNAT) → ip_route_input()
-    → LOCAL_IN (mangle→filter) → socket receive queue
+
+*Why this matters:*  
+- **Short‑circuit evaluation** saves CPU: once a match fails, the rest of the rule is skipped.  
+- **Policy fallback** ensures a deterministic default (set via `-P`).
+
+### Match Extensions and Complexity
+Simple matches (`-s`, `-d`, `-p`, `--sport`, `--dport`) are implemented as bitmask checks – $O(1)$.  
+More complex matches use data structures:
+- **`hashlimit`** – a hash table with per‑bucket counters; lookup $O(1)$ average, worst‑case $O(B)$ where $B$ is bucket length.
+- **`string`** – Boyer‑Moore or Wu‑Manber search; average $O(n)$ where $n$ is payload length.
+- **`connbytes`** – consults the connection tracking cache; $O(1)$ hash lookup.
+
+Understanding these helps predict performance impact.
+
+### Verdict Flowchart (textual)
 ```
-
-**Forwarded packet:**
-
+HOOK ENTER
+   │
+   ▼
+[Table 1 Chain] ──► (rule match?) ──► Yes ──► [Target]
+   │                         │
+   │ No                      │
+   ▼                         ▼
+[Next Table] …               │
+   │                         ▼
+   ▼                ACCEPT/DROP/RETURN/QUEUE/etc.
+[HOOK EXIT] ◄───────────────────────
 ```
-NIC → PRE_ROUTING (raw→mangle→nat:DNAT) → ip_route_input()
-    → FORWARD (mangle→filter) → POST_ROUTING (mangle→nat:SNAT) → NIC
-```
+If the target is `RETURN`, control returns to the invoking chain; if it is another chain (user‑defined), a **jump** occurs and evaluation continues there.
 
-**Locally generated packet:**
+---
 
-```
-socket → LOCAL_OUT (raw→mangle→nat:DNAT→filter) → ip_route_output()
-       → POST_ROUTING (mangle→nat:SNAT) → NIC
-```
+## Worked Examples
+### Example 1: Drop Incoming SSH from a Specific Subnet
+**Goal:** Block any TCP SYN packet destined for port 22 from `10.0.0.0/24`.
 
-A critical consequence: a packet that is DNAT'd at `PRE_ROUTING` to a local address will follow the "destined for local host" path through `LOCAL_IN`, not the `FORWARD` path. If you port-forward to an external host, you must enable `net.ipv4.ip_forward=1` so the routing decision sends it through `FORWARD`.
+**Step‑by‑step reasoning**
+1. Packet arrives → `PRE_ROUTING` (raw/mangle/nat) – no alteration needed.
+2. Routing decides packet is for local host → `LOCAL_IN` hook.
+3. At `LOCAL_IN` the `filter` table’s `INPUT` chain is traversed.
+4. We insert a rule that matches:
+   - `-p tcp` (protocol TCP)
+   - `--dport 22` (destination port)
+   - `-s 10.0.0.0/24` (source subnet)
+   - `--syn` (TCP SYN flag, using `-m tcp --tcp-flags SYN,FIN,RST,ACK SYN`)
+5. Target `-j DROP` tells Netfilter to `NF_DROP` the packet; no further chains are consulted.
 
-### Connection Tracking State Machine
-
-Conntrack assigns each packet a state used by filtering rules:
-
-- `NEW` — first packet of a connection; conntrack entry created
-- `ESTABLISHED` — packet belongs to a bidirectional flow (reply seen)
-- `RELATED` — new connection associated with an existing one (e.g., FTP data channel opened after the control channel parses a `PORT` command; handled by helper modules like `nf_conntrack_ftp`)
-- `INVALID` — no matching conntrack entry and does not qualify as NEW; indicates spoofed, out-of-window, or mangled packets
-
-TCP state transitions in conntrack are more granular internally (`SYN_SENT`, `SYN_RECV`, `FIN_WAIT`, etc.) but these four states are what filtering rules see via `-m conntrack --ctstate`.
-
-Inspect the live conntrack table:
-
+**Command:**
 ```bash
-# Requires conntrack-tools
-conntrack -L
-
-# Watch connection events in real time
-conntrack -E
-
-# Show only ESTABLISHED TCP connections
-conntrack -L -p tcp --state ESTABLISHED
-
-# Manually delete a stuck entry (forces re-handshake)
-conntrack -D -s 192.168.1.5 -d 93.184.216.34
+# Insert at top of INPUT so it is evaluated before any ACCEPT rules
+sudo iptables -I INPUT -p tcp -s 10.0.0.0/24 --dport 22 -m tcp \
+    --tcp-flags SYN,FIN,RST,ACK SYN -j DROP
+```
+**Verification:**
+```bash
+sudo iptables -L INPUT -v -n | grep '^DROP'
+# Output shows packet and byte counters incrementing for matching traffic
 ```
 
-The conntrack table is stored in `net/netfilter/nf_conntrack_core.c` as a hash table. The hash function takes the 5-tuple; bucket count is set at module load time based on `nf_conntrack_max`.
+### Example 2: Source NAT (MASQUERADE) for Outbound Traffic
+**Goal:** Translate the source address of all packets leaving via `eth0` to the interface’s IP, preserving original source ports.
 
-### SNAT Example: Masquerade
+**Why MASQUERADE?**  
+Unlike static `SNAT --to <IP>`, MASQUERADE automatically uses the primary address of the outgoing interface, which is essential when the IP is obtained via DHCP or PPP and may change.
 
-A host at `10.0.0.5` opens a connection to `93.184.216.34:80`. The router's public interface is `203.0.113.1`.
+**Chain selection:**  
+Outbound locally generated packets traverse `LOCAL_OUT` → `POSTROUTING`. The `nat` table’s `POSTROUTING` chain is the last chance to alter the source address before the NIC transmits.
 
-1. Outbound packet: `src=10.0.0.5:
+**Rule:**
+```bash
+sudo iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE
+```
+**Explanation of each flag:**
+- `-t nat` – select the nat table.
+- `-A POSTROUTING` – append to the POSTROUTING chain.
+- `-o eth0` – match only packets exiting via eth0 (avoids double‑NAT on other interfaces).
+- `-j MASQUERADE` – target that rewrites the source IP to the interface’s primary address and adjusts the IPv4 checksum and, if needed, the pseudo‑header for TCP/UDP.
+
+**Effect on checksum:**  
+When the source IP changes, the IP header checksum must be recomputed. Netfilter updates it in place; for TCP/UDP, it also adjusts the checksum using the one’s‑difference property:
+```
+Δ = ~(old_ip) + ~(new_ip)   (one’s complement)
+new_csum = old_csum + Δ
+```
+This avoids a full pseudo‑header re‑calculation, keeping the operation $O(1)$.
+
+**Verification:**
+```bash
+# Before MASQUERADE, source = 192.168.1.50
+# After MASQUERADE, source = 203.0.113.10 (eth0 address)
+sudo iptables -t nat -L POSTROUTING -v -n
+```
+
+### Example 3: TTL Mangling to Prevent TTL‑Based OS Fingerprinting
+**Goal:** Set the TTL of all outgoing TCP packets to a constant 64, regardless of the original value.
+
+**Why TTL matters:**  
+Some OS fingerprinting tools infer the initial TTL (e.g., 64 for Linux, 128 for Windows). By normalizing TTL we reduce information leakage.
+
+**Chain:**  
+Locally generated TCP packets hit `LOCAL_OUT` → `POSTROUTING`. The `mangle` table’s `POSTROUTING` chain is appropriate because we want to alter the packet after routing but before transmission, ensuring the change is seen on the wire.
+
+**Rule:**
+```bash
+sudo iptables -t mangle -A POSTROUTING -p tcp -j TTL --ttl-set 64
+```
+**What the target does:**  
+The `TTL` target modifies the `ttl` field in the IPv4 header (`skb->nh.iph->ttl = 64`) and then updates the IPv4 header checksum:
+```
+new_checksum = old_checksum - old_ttl + new_ttl   (one’s complement arithmetic)
+```
+Because only one byte changes, the update is constant‑time.
+
+**Verification:**
+```bash
+# Generate a TCP SYN packet with scroot or hping3
+sudo hping3 -S -c 1 -p 80 93.184.216.34   # example.com
+# Capture with tcpdump and inspect TTL
+sudo tcpdump -i any -c 1 -nn 'tcp[tcpflags] == tcp-syn' -vv
+# Look for ttl 64 in the IP header
+```
+
+---
+
+## Common Mistakes
+| # | Mistake | What’s Wrong | Why It Breaks |
+|---|---------|--------------|---------------|
+| 1 | **Using `-i eth0` in the `OUTPUT` chain** | `-i` matches the *incoming* interface; `OUTPUT` sees locally generated packets, which have no incoming interface yet. | The rule never matches, so traffic is unintentionally allowed or blocked depending on the default policy. |
+| 2 | **Applying `SNAT` in the `PREROUTING` chain** | `PREROUTING` occurs before routing; the packet’s destination may still be altered by NAT (DNAT) later, causing the source translation to be applied to the wrong flow. | Results in asymmetric routing or packets being dropped because the source address no longer matches the routing table’s expectations. |
+| 3 | **Forgetting to load `nf_nat_ftp` when FTP control connection is NATed** | FTP uses dynamic data ports; without the helper, NAT cannot rewrite the PORT/PASV commands inside the payload. | Data connections fail, appearing as “ftp: connect: Connection timed out”. |
+| 4 | **Mixing IPv4 and IPv6 tables (`iptables` vs `ip6tables`)** | Adding a rule to block `fd00::/64` with `iptables` has no effect on IPv6 traffic. | The administrator believes the firewall is active, while IPv6 traffic flows unfiltered. |
+| 5 | **Setting a default policy of `ACCEPT` on the `FORWARD` chain while intending a whitelist** | With `ACCEPT` as default, any packet not explicitly dropped passes; a missing rule unintentionally opens a path. | Leads to accidental exposure of internal services to the internet. |
+| 6 | **Using `-j LOG` without a preceding `-j ACCEPT` or `-j DROP`** | `LOG` is a non‑terminating target; after logging, traversal continues to the next rule. | If the next rule is `DROP`, logging works; if it’s `ACCEPT`, the packet is both logged and allowed, which may be intended, but if the admin expects LOG to stop processing, they miss subsequent rules. |
+| 7 | **Assuming `-m state --state ESTABLISHED,RELATED` works without `nf_conntrack` loaded** | The match relies on the connection tracking subsystem; if the module is absent, the match always fails. | Intended “allow return traffic” rule never matches, breaking established connections. |
+| 8 | **Overlooking the need for `net.ipv4.ip_forward=1` when using FORWARD or NAT** | The kernel drops forwarded packets by default unless forwarding is enabled. | NAT or routing appears to fail silently; packets are dropped before reaching the POSTROUTING hook. |
+
+Each mistake stems from a misunderstanding of **where** in the packet walk a condition is evaluated or **which** subsystem must be active for a match to succeed.
+
+---
+
+## Exercises
+### Easy
+1. **Block all inbound ICMP echo‑requests (ping) from any source.**  
+   ```bash
+   sudo iptables -A INPUT -p icmp --icmp-type echo-request -j DROP
+   ```
+2. **Log and drop outgoing traffic to port 25 (SMTP) from the host.**  
+   ```bash
+   sudo iptables -A OUTPUT -p tcp --dport 25 -j LOG --log-prefix "SMTP_OUT: "
+   sudo iptables -A OUTPUT -p tcp --dport 25 -j DROP
+   ```
+
+### Medium
+3. **Redirect HTTP (port 80) requests arriving on `eth0` to a local transparent proxy listening on `127.0.0.1:3128`.**  
+   *DNAT in PREROUTING, then allow forwarding to the proxy.*  
+   ```bash
+   sudo iptables -t nat -A PREROUTING -i eth0 -p tcp --dport 80 -j DNAT --to-destination 127.0.0.1:3128
+   sudo iptables -A FORWARD -d 127.0.0.1 -p tcp --dport 3128 -j ACCEPT
+   sudo iptables -t nat -A POSTROUTING -s 127.0.0.1 -o eth0 -j MASQUERADE
+   ```
+4. **Limit new TCP connections to port 22 to 4 per minute per source IP, using the `hashlimit` module.**  
+   ```bash
+   sudo iptables -A INPUT -p tcp --dport 22 -m state --state NEW \
+       -m hashlimit --hashlimit 4/min --hashlimit-mode srcip \
+       --hashlimit-name ssh_limit -j ACCEPT
+   sudo iptables -A INPUT -p tcp --dport 22 -j DROP
+   ```
+
+### Hard
+5. **Implement a simple QoS policy: mark (`MARK`) outgoing TCP packets with DSCP EF (0x2e) for ports 80 and 443, and AF11 (0x1a) for all other traffic.**  
+   ```bash
+   # EF for web traffic
+   sudo iptables -t mangle -A OUTPUT -p tcp -m multiport --dports 80,443 \
+       -j MARK --set-mark 0x2e
+   # AF11 for everything else
+   sudo iptables -t mangle -A OUTPUT -j MARK --set-mark 0x1a
+   # Then configure tc to use these marks (outside scope of Netfilter)
+   ```
+6. **Create a user‑defined chain `BLACKLIST` that drops packets from a set of IP ranges loaded from a file `/etc/blacklist.txt` (one CIDR per line). Use `-m set` with an `ipset` for efficient lookup.**  
+   ```bash
+   sudo ipset create blacklist hash:net
+   while read cidr; do sudo ipset add blacklist "$cidr"; done < /etc/blacklist.txt
+   sudo iptables -N BLACKLIST
+   sudo iptables -A BLACKLIST -m set --match-set blacklist src -j DROP
+   sudo iptables -I INPUT -j BLACKLIST
+   sudo iptables -I FORWARD -j BLACKLIST
+   ```
+
+---
+
+## Linux Connection
+### Subsystem Locations
+| Component | Path (kernel source) | Description |
+|-----------|----------------------|-------------|
+| Netfilter core | `net/netfilter/` | `nf_hook_ops`, `nf_hook_thunk`, verdict handling |
+| IPv4 hooks | `net/ipv4/netfilter/` | IPv4‑specific implementations of the five hooks |
+| IPv6 hooks | `net/ipv6/netfilter/` | Analogous IPv6 hooks |
+| Tables (filter, nat, mangle) | `net/ipv4/netfilter/ipt_*.c` | e.g., `iptable_filter.c`, `iptable_nat.c`, `iptable_mangle.c` |
+| Match extensions | `net/netfilter/` (e.g., `xt_limit.c`, `xt_conntrack.c`) | Shared across IPv4/IPv6 |
+| Target extensions | `net/netfilter/` (e.g., `xt_MASQUERADE.c`, `xt_TTL.c`) | NAT, TTL, MARK, etc. |
+| Userspace tools | `/usr/sbin/iptables`, `/usr/sbin/ip6tables`, `/usr/sbin/nft` | Front‑ends to add/delete/list rules |
+| Library modules | `/lib/x86_64-linux-gnu/xtables/` (`.so` files) | Dynamically loaded matches/targets (e.g., `libxt_conntrack.so`) |
+| Procfs info | `/proc/net/ip_tables_names`, `/proc/net/ip_tables_match`, `/proc/net/ip_tables_target` | Lists registered tables/matches/targets |
+| Sysctl knobs | `/proc/sys/net/ipv4/conf/*/rp_filter`, `/proc/sys/net/ipv4/ip_forward` | Controls that affect Netfilter behavior |
+| Debugfs (if configured) | `/sys/kernel/debug/netfilter/` | Trace hooks, show packet counters per rule |
+
+### Runnable Commands (illustrating the concepts)
+```bash
+# 1. Show current filter table rules with packet/byte counters
+sudo iptables -L -v -n
+
+# 2. Display the nat table (useful for verifying MASQUERADE/SNAT)
+sudo iptables -t nat -L -v -n
+
+# 3. List all loaded Netfilter modules
+lsmod | grep '^nf_' | awk '{print $1}'
+
+# 4. Verify connection tracking is active
+sudo cat /proc/sys/net/ipv4/netfilter/ip_conntrack_count
+sudo cat /proc/sys/net/ipv4/netfilter/ip_conntrack_max
+
+# 5. Flush all rules (use with caution on production)
+sudo iptables -F
+sudo iptables -t nat -F
+sudo iptables -t mangle -F
+
+# 6. Save current IPv4 rules to a file (Debian/Ubuntu)
+sudo iptables-save > /etc/iptables/rules.v4
+
+# 7. Load rules from a file
+sudo iptables-restore < /etc/iptables/rules.v4
+
+# 8. Using nft (the newer framework) to list the equivalent ruleset
+sudo nft list ruleset
+
+# 9. Insert a raw rule to drop all traffic from a bogon prefix before connection tracking
+sudo iptables -t raw -A PREROUTING -s 224.0.0.0/3 -j DROP
+
+#10. Enable IP forwarding (required for NAT/forwarding)
+sudo sysctl -

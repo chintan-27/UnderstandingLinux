@@ -10,185 +10,220 @@ resources:
     title: "The Linux Command Line (Shotts)"
 ---
 
-## Why This Matters
-
-Every system automation task — rotating logs, deploying configs, monitoring processes — requires coordinating processes, file descriptors, signals, and environment variables. Scripts break not because the language failed, but because the author misunderstood what the kernel does when they write `|` or `&` or `$(...)`. Understanding scripting from first principles means understanding which kernel primitives the interpreter is invoking, what those primitives cost, and what guarantees they do and do not provide.
-
----
-
 ## Core Concepts
+### Shell as a Language Processor
+A shell script is a program interpreted by a shell process. Unlike compiled languages, the shell performs **lexical analysis, parsing, and expansion** on each line before invoking any external program. The order of expansions is fixed (POSIX‑spec):
 
-### The Shell as a Process Orchestrator
+1. Brace expansion (`{a,b}` → `a b`)  
+2. Tilde expansion (`~/bin` → `/home/user/bin`)  
+3. Parameter and variable expansion (`$USER`, `${VAR:-default}`)  
+4. Arithmetic expansion (`$((5+3))`)  
+5. Command substitution (`$(date)` or backticks)  
+6. Word splitting (according to `$IFS`)  
+7. Pathname expansion (globbing)  
+8. Quote removal  
 
-The shell is a userspace process that parses text into commands and implements orchestration using five kernel primitives: `fork()`, `exec()`, `pipe()`, `dup2()`, and `wait()`. Every shell construct maps to some combination of these.
+Understanding this sequence explains why quoting matters and why certain constructs behave unexpectedly.
 
-When you write:
+### Variables, Scoping, and Types
+* **Shell variables** exist only in the current shell process.  
+* **Environment variables** are exported to child processes via the `execve` environment vector (`char *envp[]`).  
+* Assignment syntax: `VAR=value` (no spaces). Export: `export VAR` or `VAR=value command`.  
+* All shell values are **byte strings**; arithmetic contexts (`$((…))`, `let`, `[[$VAR -gt 0]]`) interpret the string as a signed long using C integer arithmetic.  
+* The kernel limits the total size of the argument and environment vectors passed to `execve` by `ARG_MAX` (typically 2 MiB). If the combined length of `argv`+`envp` exceeds this limit, `execve` fails with `E2BIG`.  
+  $$
+  \text{MAX\_VARS} \approx \frac{\text{ARG\_MAX}}{\overline{\text{len}(VAR)} + \overline{\text{len}(value)} + 1}
+  $$  
+  where the “+1” accounts for the terminating NUL byte per string.
 
-```bash
-cat /etc/passwd | grep root
-```
+### Control Structures
+Control flow relies on the **exit status** of a command (0‑255).  
+* `if`, `while`, `until` test the exit status of the *last* command in their condition.  
+* `[` is a shell builtin (or `/usr/bin/[`) that evaluates its arguments and returns 0/1.  
+* `[[ … ]]` is a Bash keyword that performs pattern matching, regex matching (`=~`), and logical operators without word splitting or globbing.  
+* `for name in list; do … done` iterates over the *result of word splitting and pathname expansion* on `list` unless the list is quoted.  
+* `select` generates a simple menu from a list, printing to stderr and reading input from stdin.
 
-The shell calls `pipe()` to create an `(r, w)` fd pair, `fork()`s twice, uses `dup2(w, STDOUT_FILENO)` in the `cat` child and `dup2(r, STDIN_FILENO)` in the `grep` child, closes the original pipe fds in both children, then calls `exec()` in each. The shell itself calls `waitpid()` on both children. There is no other mechanism — the shell is not doing anything the kernel does not expose to every other process.
-
-The cost matters: each `fork()` copies the parent's page table (copy-on-write, but still $O(v)$ in the number of virtual memory areas $v$), and each `exec()` loads a new ELF image. A loop like:
-
-```bash
-for i in $(seq 1 1000); do
-    result=$(date +%s%N)
-done
-```
-
-creates approximately $2000$ processes — one `fork`/`exec` for the command substitution subshell and one for `date` — plus the initial `fork`/`exec` for `seq`. At even $1\,\text{ms}$ per fork-exec pair, that loop takes $\geq 2\,\text{s}$ just in process creation overhead, before `date` does any work.
-
-### The Shebang Line
-
-When `execve()` is called on a file, the kernel reads the first two bytes. If they are `0x23 0x21` (`#!`), the kernel's `binfmt_script` handler in `fs/binfmt_script.c` extracts the interpreter path and reconstructs the argument vector before re-entering `exec`:
-
-```
-execve("./script.sh", ["./script.sh"], envp)
-  → kernel rewrites to:
-execve("/bin/bash", ["/bin/bash", "./script.sh"], envp)
-```
-
-This is a kernel feature, not a shell feature. The script never runs directly — the kernel hands it to the interpreter.
-
-Using `env` as the interpreter:
-
-```bash
-#!/usr/bin/env python3
-```
-
-causes the kernel to call `execve("/usr/bin/env", ["env", "python3", "./script.py"], envp)`. The `env` binary searches `PATH` and execs the first `python3` it finds. This is the correct idiom when Python may live in `/usr/bin`, `/usr/local/bin`, or a virtualenv — hardcoding `/usr/bin/python3` breaks on systems where the interpreter is elsewhere.
-
-One subtlety: on Linux, the entire text after the interpreter path is passed as a single argument — not word-split. `#!/usr/bin/awk -f` passes `"-f"` as one string to `awk`. This is intentional and defined by `binfmt_script`, but it means you cannot pass multiple arguments to the interpreter via the shebang line on Linux (unlike on some BSDs).
-
-### Environment Variables as Inherited Process State
-
-Every process has an environment: a contiguous block of `KEY=VALUE\0` strings, terminated by a null pointer, passed as the third argument to `execve()`. The shell exposes this as variables. When you `export MYVAR=hello`, the shell writes into its own environment block. Any subsequent child created with `fork()`+`exec()` inherits a copy of that block.
-
-```bash
-export DATABASE_URL=postgres://localhost/mydb
-./deploy.py    # receives DATABASE_URL in its environ
-```
-
-The critical constraint: environment inheritance is one-way. The child gets a copy; the parent's environment is unaffected by anything the child does. This is why `cd` must be a shell builtin — if `cd` were an external process, it would change its own working directory and exit, leaving the parent shell's cwd unchanged. The same logic applies to `export`, `set`, `umask`, and `ulimit`.
-
-If a script must communicate a computed value back to its invoking shell, the only options are: write a file, use a pipe, or encode the value in the exit status. There is no other mechanism.
-
-You can inspect what a process actually receives:
-
-```bash
-cat /proc/$$/environ | tr '\0' '\n' | grep PATH
-```
-
-The `/proc/<pid>/environ` file is the live environment block of the named process, with entries separated by null bytes.
-
-### Exit Status and Error Propagation
-
-Every process exits with a status in $[0, 255]$. The convention is $0$ for success, nonzero for failure — but the specific nonzero value carries meaning. `grep` exits $1$ when no lines match and $2$ on error. `diff` exits $1$ when files differ and $2$ on error. Scripts that ignore this distinction produce incorrect conditional logic.
-
-The shell stores the last exit status in `$?`. The naive pattern:
-
-```bash
-cp /src/file /dst/file
-if [ $? -ne 0 ]; then
-    echo "copy failed" >&2
-    exit 1
-fi
-```
-
-is fragile because any command between `cp` and the `if` — including a subshell or even a function call — will overwrite `$?`. The idiomatic form avoids this:
-
-```bash
-cp /src/file /dst/file || { echo "copy failed" >&2; exit 1; }
-```
-
-`set -e` instructs the shell to exit immediately when any simple command returns nonzero, preventing silent failure cascades. Combine it with `set -u` (treat unset variables as errors) and `set -o pipefail` (a pipeline fails if any stage fails, not just the last):
-
-```bash
-#!/bin/bash
-set -euo pipefail
-```
-
-Without `pipefail`, this silently succeeds even if `cat` fails:
-
-```bash
-cat /nonexistent/file | grep pattern
-echo "exit: $?"    # prints 0 — grep found nothing, exited 0
-```
-
-With `pipefail`, the pipeline exit status is the rightmost nonzero exit status among all stages — $\max_{\text{nonzero}}$ of the stage exit codes, where ties are broken by rightmost position.
-
-### Job Control, Process Groups, and Signals
-
-The terminal driver delivers signals to a *process group*, not to an individual process. When you press `Ctrl-C`, the kernel sends `SIGINT` to every process in the foreground process group. A pipeline runs in its own process group — all stages receive the signal simultaneously.
-
-Background jobs (`&`) are placed in a separate process group and do not receive `SIGHUP` when the controlling terminal closes. But the *shell* does receive `SIGHUP`, and by default many shells forward it to their child process groups before exiting. Whether your background job survives a terminal disconnect depends on which shell you are using and its configuration.
-
-`nohup` works by setting `SIGHUP` to `SIG_IGN` before calling `exec()`:
-
-```bash
-nohup ./long_running_job.sh > /var/log/job.log 2>&1 &
-```
-
-Because signal dispositions marked `SIG_IGN` are preserved across `exec()` (unlike caught signals, which are reset to `SIG_DFL`), the script starts with `SIGHUP` permanently ignored for its lifetime. You can verify:
-
-```bash
-# In another terminal, send SIGHUP manually:
-kill -HUP <pid>
-# Process ignores it.
-```
-
-The alternative — `setsid` — disconnects from the controlling terminal entirely by creating a new session:
-
-```bash
-setsid ./job.sh > /var/log/job.log 2>&1 &
-```
-
-With no controlling terminal, there is no source of `SIGHUP` from terminal disconnect at all.
+### Functions
+Declared as `name() { compound-command; }` or `function name { … }`.  
+* Functions create a **new execution context** for local variables (`local`) but share the same process as the caller.  
+* Return status: `return N` (0‑255) becomes the function’s exit status; the function can also emit data on stdout/stderr for the caller to capture.  
+* Because they run in the same process, functions can modify shell options (`set -e`), traps, and the working directory (`cd`)—something external commands cannot do.
 
 ---
 
 ## How It Works
+### From Shebang to Process Creation
+1. The kernel examines the first two bytes of the executable file. If they are `#!`, it runs the interpreter named after them, passing the script path as an argument (`argv[0]` = interpreter, `argv[1]` = script).  
+2. The interpreter (e.g., `/bin/bash`) then:
+   * Opens the script file for reading.  
+   * Performs the expansion sequence described above on each line.  
+   * For each **simple command**, it:
+     1. **Forks** a child process (`fork()` system call).  
+     2. In the child, applies redirections (`>`, `<`, `>>`, `2>&1`, etc.) via `dup2()`.  
+     3. If the command is a **builtin** (`cd`, `export`, `alias`, `break`, `continue`, `return`, `exit`, `source/.`), it executes it in the **parent** shell (no fork) to allow state changes.  
+     4. Otherwise, it calls `execve()` with the resolved command path and the current environment.  
+     5. The parent waits (`waitpid()`) unless the command is backgrounded (`&`).  
 
-### Script Execution Through the Kernel
+   This fork‑exec model preserves file descriptors, signal dispositions, and environment while allowing the child to overlay a new program image.
 
-Running `./myscript.sh` triggers this kernel path:
+### Variable Expansion Mechanics
+When the shell encounters `$VAR` or `${VAR}`:
+* It looks up `VAR` in the **shell variable table** (local) or, if not found, in the **environment** (exported variables).  
+* The retrieved string is substituted **in‑place** before any further expansions (word splitting, globbing).  
+* If the substitution occurs within double quotes (`"$VAR"`), the resulting string is treated as a single word; word splitting and globbing are suppressed.  
+* Within single quotes (`'$VAR'`), no expansion occurs at all—the characters are literal.
 
-1. `execve("./myscript.sh", ...)` enters the kernel
-2. `fs/binfmt_script.c:load_script()` reads the first line, extracts `/bin/bash`
-3. Kernel calls `execve("/bin/bash", ["/bin/bash", "./myscript.sh"], envp)` internally
-4. `fs/binfmt_elf.c` loads the bash ELF image, maps segments, sets up the stack
-5. Bash opens `myscript.sh`, reads it line by line with its own parser
+### Command Substitution and Arithmetic
+* `$(cmd)` runs `cmd` in a **subshell** (forked child), captures its **stdout**, strips trailing newline characters, and substitutes the result.  
+* Arithmetic expansion `$((expr))` is evaluated by the shell’s internal arithmetic parser (C‑like precedence, 64‑bit signed on Linux). Example:
+  ```bash
+  $(( 2 * (3 + 4) ))   # → 14
+  ```
 
-Builtin commands (`cd`, `export`, `read`, `echo`) execute directly inside the bash process — no fork. External commands (`grep`, `awk`, `curl`) always fork. You can check whether a command is builtin:
+### Exit Status Propagation
+* Every command returns an 8‑bit status via `waitpid`.  
+* Conventions:
+  * `0` – success.  
+  * `1‑125` – generic error.  
+  * `126` – command found but not executable (permission denied or not a regular file).  
+  * `127` – command not found in `$PATH`.  
+  * `128+N` – terminated by signal N (e.g., `130` = SIGINT).  
+* In a pipeline `cmd1 | cmd2 | cmd3`, the pipeline’s status is that of the **last** command unless `set -o pipefail` is enabled, in which case it is the **rightmost non‑zero** status. Bash provides the array `PIPESTATUS` to inspect each stage:
+  ```bash
+  false | true | false
+  echo "${PIPESTATUS[@]}"   # outputs "1 0 1"
+  ```
 
+---
+
+## Worked Examples
+### Example 1: Safe Greeting with Parameter Expansion
 ```bash
-type -a echo
-# echo is a shell builtin
-# echo is /usr/bin/echo
+#!/usr/bin/env bash
+# Print a greeting; if NAME is unset or empty, use "World".
+: "${NAME:=World}"
+printf 'Hello, %s!\n' "$NAME"
 ```
+**Step‑by‑step:**
+1. `: "${NAME:=World}"` is a **null command** (`:`) that performs expansion only.  
+   * Parameter expansion `${NAME:=World}` assigns `"World"` to `NAME` if `NAME` is unset or empty, then expands to the (possibly new) value.  
+2. The assignment persists for the rest of the script because `:` runs in the current shell.  
+3. `printf` receives two arguments: the format string and the value of `$NAME`.  
+   * Because `$NAME` is quoted, word splitting and globbing are prevented—critical if `NAME` contains spaces or `*`.  
+4. Output example with `unset NAME`:  
+   ```
+   Hello, World!
+   ```
 
-Calling `/usr/bin/echo` instead of the builtin forks a process to print a string. In a tight loop this is measurable:
-
+### Example 2: Summing Numeric Arguments with Validation
 ```bash
-time for i in $(seq 1 10000); do echo x > /dev/null; done        # builtin
-time for i in $(seq 1 10000); do /usr/bin/echo x > /dev/null; done  # external
+#!/usr/bin/env bash
+# Usage: sum.sh 1 2 3
+total=0
+for arg; do                     # short for "for arg in \"$@\""
+    if [[ ! $arg =~ ^-?[0-9]+$ ]]; then
+        printf 'Error: "%s" is not an integer\n' "$arg" >&2
+        exit 1
+    fi
+    (( total += arg ))
+done
+printf 'Sum: %d\n' "$total"
 ```
+**Reasoning:**
+* `for arg;` iterates over each positional parameter after word splitting (none occurs because `"$@"` is quoted implicitly).  
+* The regular expression `^-?[0-9]+$` matches optional leading minus followed by one or more digits—ensuring the argument is a valid base‑10 integer.  
+* Arithmetic assignment `(( total += arg ))` uses Bash’s arithmetic context; overflow wraps according to two’s‑complement 64‑bit arithmetic (the same as C `long long`).  
+* If any argument fails validation, the script prints to **stderr** (`>&2`) and exits with status `1`.  
+* Example run:
+  ```bash
+  $ ./sum.sh 10 20 -5
+  Sum: 25
+  $ ./sum.sh 10 abc
+  Error: "abc" is not an integer
+  ```
 
-The external version is typically $5\text{–}10\times$ slower due to fork-exec overhead.
-
-### Pipelines and File Descriptor Wiring
-
-A three-stage pipeline:
-
+### Example 3: Logging System Uptime Every Minute via a Background Loop
 ```bash
-ps aux | grep python | awk '{print $2}'
+#!/usr/bin/env bash
+# uptime-logger.sh – appends a timestamped uptime line to /var/log/uptime.log
+LOGFILE=/var/log/uptime.log
+INTERVAL=60   # seconds
+
+trap 'printf "Stopping uptime logger at %s\n" "$(date +%s)" >>"$LOGFILE"; exit' SIGTERM
+
+while :; do
+    ts=$(date +%s)                # epoch seconds
+    up=$(cut -d' ' -f1 /proc/uptime)   # seconds since boot as float
+    printf '%d %.2f\n' "$ts" "$up" >>"$LOGFILE"
+    sleep "$INTERVAL"
+done
 ```
+**Explanation:**
+* `/proc/uptime` contains two numbers: uptime in seconds and idle time; we extract the first field with `cut`.  
+* The loop runs indefinitely (`while :; do`) until a `SIGTERM` is received (e.g., when the service is stopped).  
+* `trap` installs a handler that writes a shutdown notice before exiting—demonstrating how scripts can clean up resources.  
+* Each iteration writes a line like `1730784000 12345.67` (epoch, uptime).  
+* To run as a system service, copy the script to `/usr/local/sbin/uptime-logger.sh`, make it executable, and create a systemd unit:
+  ```ini
+  # /etc/systemd/system/uptime-logger.service
+  [Unit]
+  Description=Periodic uptime logger
 
-requires two `pipe()` calls, producing fd pairs $(r_1, w_1)$ and $(r_2, w_2)$, and three forks:
+  [Service]
+  Type=simple
+  ExecStart=/usr/local/sbin/uptime-logger.sh
+  Restart=on-failure
 
-| Process | stdin  | stdout |
-|---------|--------|--------|
-| `ps`    | terminal | $w_1$ |
-|
+  [Install]
+  WantedBy=multi-user.target
+  ```
+  Then `systemctl enable --now uptime-logger.service`.  
+
+---
+
+## Common Mistakes
+| Mistake | Why It’s Wrong | Fix |
+|---------|----------------|-----|
+| **Unquoted variable expansion**<br>`rm $FILES` | After expansion, the shell performs **word splitting** and **globbing**. If `$FILES` contains `*` or spaces, unintended files may be removed. | Always quote: `rm -- "$FILES"` (or use an array). |
+| **Using `[` without quoting**<br>`if [ $VAR = value ]; then` | If `$VAR` is empty or contains spaces, `[` sees malformed arguments (`[ = value ]`) → syntax error. | Quote both sides: `if [ "$VAR" = "value" ]; then` or prefer `[[ $VAR == value ]]`. |
+| **Ignoring pipeline exit status**<br>`cmd1 | cmd2; if [ $? -eq 0 ]; then …` | `$?` reflects only the **last** command (`cmd2`). A failure in `cmd1` is hidden unless `pipefail` is set. | Use `set -o pipefail` or inspect `PIPESTATUS`: `if [[ ${PIPESTATUS[0]} -eq 0 && ${PIPESTATUS[1]} -eq 0 ]]; then`. |
+| **Assuming backticks nest easily**<br>`output=`cmd1 \`cmd2\` `` | Backticks require escaping with a backslash for nesting; readability suffers. | Use `$()`: `output=$(cmd1 $(cmd2))`. |
+| **Exporting to affect parent**<br>`export VAR=value; ./child.sh; echo $VAR` | `export` only affects **child processes**; the parent shell sees no change after the child exits. | Source the child (`source child.sh`) if you need to modify the parent, or redesign to avoid needing parent mutation. |
+
+---
+
+## Exercises
+### Easy
+1. **Date & Epoch** – Write a script `now.sh` that prints the current epoch time and an ISO‑8601 timestamp (`date -u +"%Y-%m-%dT%H:%M:%SZ"`).  
+2. **File existence checker** – `exists.sh <path>` returns `0` if the file exists, `1` otherwise, using `test -e`.  
+
+### Medium
+3. **Sum with validation** – Extend Example 2 to accept numbers in **hexadecimal** (`0xFF`) or **octal** (`0755`) by detecting prefixes and using `$(( 0x$num ))` or `$(( 0$num ))`.  
+4. **Passwd parser** – `userhomes.sh` reads `/etc/passwd`, splits each line on `:`, and prints `username → home-dir` pairs, one per line. Use `IFS=:` and `while read -r`.  
+
+### Hard
+5. **Log watcher with alert** – Create `watchlog.sh <logfile> <pattern> <email>` that:
+   * Uses `inotifywait -m -e close_write --format '%f' "$logfile"` to detect appends.  
+   * For each new line, if it matches `$pattern` (using `[[ $line =~ $pattern ]]`), sends an email via `mail -s "Alert" "$email" <<<"$line"`.  
+   * Handles log rotation by reopening the file when its inode changes (compare `stat -c %i "$logfile"`).  
+   * Cleans up the inotifywait process on `SIGTERM` via a trap.  
+6. **Self‑building C program** – `buildrun.sh <source.c>`:
+   * Creates a temporary directory with `mktemp -d`.  
+   * Copies the source there, compiles with `gcc -Wall -Wextra -O2 source.c -o prog`.  
+   * Runs `./prog`, captures its exit status, prints it, then removes the temporary directory on exit (`trap 'rm -rf "$tmpdir"' EXIT`).  
+
+---
+
+## Linux Connection
+### Real‑World Locations Where Shell Scripts Appear
+| Subsystem | Typical Path | Example Content |
+|-----------|--------------|-----------------|
+| **SysV init** | `/etc/init.d/` (scripts) <br> `/etc/rc*.d/` (S##name, K##name symlinks) | `/etc/init.d/cron` – starts/stops the cron daemon. |
+| **Systemd** | `/etc/systemd/system/` (admin units) <br> `/usr/lib/systemd/system/` (distro units) | `ExecStart=/usr/sbin/sshd -D` in `sshd.service`. |
+| **Cron** | User crontabs: `/var/spool/cron/crontabs/<user>` <br> System crontabs: `/etc/crontab`, `/etc/cron.d/*` | `0 2 * * * root /usr/local/sbin/cleanup.sh` – runs cleanup daily at 02:00. |
+| **Logrotate** | `/etc/logrotate.conf` (main) <br> `/etc/logrotate.d/` (per‑app configs) | `/etc/logrotate.d/apache2` – rotates `/var/log/apache2/*log`. |
+| **PAM** | `/etc/pam.d/` (service‑specific auth stacks) | `/etc/pam.d/sshd` – includes `auth required pam_unix.so`. |
+| **Shell startup** | `/etc/profile` (login, interactive) <br> `/etc/bash.bashrc` (interactive non‑login) <br> `~/.bashrc`, `~/.bash_profile` | `/etc/profile` sets `PATH`, `umask`, and loads `/etc/profile.d/*` scripts. |
+| **Environment** | `/etc/environment` (key=value pairs, no export) | `PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"` |
+| **Kernel interfaces** | `/proc/` (process & system info) <br> `/sys/` (device tree) | `cat /proc/meminfo` → memory stats; `echo 1 > /proc/sys/net

@@ -10,151 +10,249 @@ resources:
     title: "Computer Architecture A Quantitative Approach (Hennessy)"
 ---
 
-## Module 53: Pipelining — Hazards, Forwarding, Stalling, and Branch Prediction
-
-## Why This Matters
-
-A pipelined CPU overlaps instruction execution across five stages (IF → ID → EX → MEM → WB). The throughput gain is real — ideally one instruction completes per cycle instead of one per five — but it creates a precise timing problem: an instruction in EX may need a result from an instruction still in MEM or WB, and a branch instruction redirects the PC before the pipeline knows what to fetch next. Without hardware solutions, the processor either silently computes wrong values or must stall for every dependent pair, collapsing to near-sequential performance.
-
-Understanding these mechanisms explains observable performance phenomena: why a loop with a data-dependent branch runs measurably slower than a predictable one, why a `load` followed immediately by a dependent `add` costs an extra cycle, and why `perf stat` reports a non-zero `branch-misses` count even for trivial programs.
-
----
-
 ## Core Concepts
+Pipelining partitions the instruction execution process into **n** sequential stages, each completed in one clock cycle. The **clock period** \(T_{clk}\) is set by the slowest stage plus latch overhead:
+\[
+T_{clk}= \max\{t_{IF},t_{ID},t_{EX},t_{MEM},t_{WB}\}+t_{setup}+t_{clk\!-\!q}
+\]
+If every stage can accept a new operation each cycle, the **ideal throughput** is one instruction per cycle (IPC = 1). The **ideal speedup** over a single‑cycle datapath of latency \(L = n \cdot T_{clk}\) is:
+\[
+S_{ideal}= \frac{L}{T_{clk}} = n
+\]
+Real pipelines suffer stalls that increase the **average CPI** (cycles per instruction):
+\[
+\text{CPI}=1+\frac{\text{stall cycles}}{\text{inst}}
+\]
+Stalls arise from three hazard classes, each rooted in a resource or dependence conflict:
 
-### The Three Classes of Hazard
+* **Structural hazard** – two instructions require the same hardware resource in the same cycle (e.g., a single‑ported memory array needed simultaneously for IF and MEM). The conflict forces one instruction to wait until the resource becomes free.
+* **Data hazard** – an instruction needs a result that has not yet been written to the architectured register file. In a classic 5‑stage RISC pipeline the result becomes available after the **EX** stage for ALU ops, after **MEM** for loads, and after **WB** for the write‑back stage. If the consumer reads the register in **ID** before the producer has written it, a **RAW** (read‑after‑write) hazard occurs. Anti‑dependences (WAR) and output dependences (WAW) are avoided by register renaming in out‑of‑order cores but still matter for in‑order pipelines.
+* **Control hazard** – the fetch stage cannot determine the next PC until the branch condition is resolved. In the 5‑stage model the branch outcome is known at the end of **EX**, so the fetch of the next instruction must be delayed or speculated. A misprediction forces the pipeline to flush all instructions fetched after the branch, incurring a penalty equal to the number of stages between fetch and resolution.
 
-**Structural hazard**: Two in-flight instructions require the same hardware resource in the same cycle. The classic case is a unified memory: if instruction fetch and data load share one memory port, they collide in cycles where both are active. The fix is structural separation — L1 caches are *always* split into L1i and L1d precisely because the pipeline needs simultaneous, independent access to both. A unified L2 is fine; nothing fetches from L2 every cycle.
-
-**Data hazard**: An instruction needs a value before it's been written back. In a 5-stage pipeline, a result is committed to the register file at WB (stage 5), but the dependent instruction reads the register file at ID (stage 2). For back-to-back instructions, the producer is at EX (stage 3) when the consumer needs the value at ID (stage 2) — the value doesn't even exist yet, let alone sit in the register file. This is not a software scheduling problem that compilers can always hide; it's a hardware timing gap measured in cycles.
-
-**Control hazard**: The pipeline fetches instructions sequentially at PC+4, PC+8, etc. A branch instruction may change the PC, but the pipeline committed to fetching those subsequent instructions before it evaluated the branch. The question is how many instructions have been fetched speculatively by the time the branch outcome is known — that number is the **branch penalty**, and it depends entirely on which pipeline stage resolves the branch.
-
----
-
-### Forwarding (Bypassing)
-
-The result of an ALU operation is architecturally correct the moment EX completes — it sits in the EX/MEM pipeline register. It won't reach the register file until two cycles later (WB), but the value is already valid. Forwarding routes it directly from the pipeline register to the ALU input mux of the consuming instruction, bypassing the register file entirely.
-
-This requires:
-1. A forwarding unit that compares the destination register of instructions in EX/MEM and MEM/WB against the source registers of the instruction currently in EX.
-2. Multiplexers on each ALU input that can select from the register file (normal path), EX/MEM register, or MEM/WB register.
-
-The hardware doesn't stall or reorder — it reroutes the datapath for that one cycle. The mux selection signals (`ForwardA`, `ForwardB`) are computed fresh every cycle.
-
----
-
-### Stalling (Pipeline Bubbles)
-
-Forwarding eliminates most data hazards but cannot fix a **load-use hazard**. A `lw` instruction doesn't produce its value until the end of MEM (stage 4). The immediately following instruction needs that value at the *start* of EX (stage 3). Even forwarding from MEM/WB to EX input is one cycle too late: the consumer reaches EX before the producer reaches MEM.
-
-The only fix is to delay the consumer by one cycle. A stall:
-- Freezes the PC and IF/ID register (upstream holds its position).
-- Injects a NOP into the ID/EX register (a bubble propagates forward).
-- Allows the `lw` to advance to MEM, producing the value one cycle later.
-
-After the one-cycle stall, forwarding from MEM/WB → EX works correctly. The cost is exactly one wasted cycle per load-use pair — unavoidable in hardware, but reduceable by the compiler by reordering independent instructions between the load and its consumer (load scheduling).
-
----
-
-### Branch Prediction
-
-When a branch is fetched, the pipeline must decide what to fetch next *before* it knows whether the branch is taken. Two strategies:
-
-**Static prediction** commits to one guess unconditionally — either always predict not-taken (continue sequential fetch) or always predict taken. If wrong, the speculatively-fetched instructions are flushed before they write any state: the `IF.Flush` signal zeroes the IF/ID register, converting them to NOPs. Static prediction is deterministic but blind to runtime behavior.
-
-**Dynamic prediction** uses runtime history indexed by PC. A **branch history table (BHT)** — a small direct-mapped array indexed by the low bits of the branch PC — stores 1 or 2 bits per entry tracking recent outcomes.
-
-**1-bit predictor**: Stores the last outcome. A loop that executes $n$ iterations mispredicts on the first iteration (predictor says not-taken from last loop exit) and on the exit iteration, yielding:
-
-$$\text{accuracy}_{1\text{-bit}} = \frac{n-2}{n}$$
-
-For $n = 10$, accuracy is 80%.
-
-**2-bit saturating counter**: The predictor must be wrong *twice consecutively* to flip its prediction. The state machine has four states — Strongly Not Taken (SNT), Weakly Not Taken (WNT), Weakly Taken (WT), Strongly Taken (ST) — and only crosses the predict-taken/predict-not-taken boundary on two consecutive mispredictions. For the same loop:
-
-$$\text{accuracy}_{2\text{-bit}} = \frac{n-1}{n}$$
-
-For $n = 10$, accuracy is 90%, because after the first full invocation the predictor enters WT (not ST — it was decremented once by the exit branch), predicts taken correctly on the first iteration of the next invocation, and only mispredicts the final exit.
-
----
+Understanding these mechanisms from first principles lets us quantify performance loss:
+\[
+\text{Stall cycles per instruction}= f_{struct}\cdot p_{struct}+f_{data}\cdot p_{data}+f_{ctrl}\cdot p_{ctrl}
+\]
+where \(f\) is the frequency of the hazard‑causing pattern and \(p\) the average penalty when it occurs.
 
 ## How It Works
+### Five‑Stage RISC Pipeline
+| Stage | Function | Typical hardware | Output latch |
+|-------|----------|------------------|--------------|
+| IF    | Fetch instruction from I‑cache | Instruction cache, PC adder | IF/ID |
+| ID    | Decode, register read, immediate generation | Register file, decoder | ID/EX |
+| EX    | ALU operation or address calculation | ALU, shifter | EX/MEM |
+| MEM   | Data memory access (load/store) | D‑cache, byte lane logic | MEM/WB |
+| WB    | Write result back to register file | Register file write port | — |
 
-### Forwarding: Detection Logic
+Each latch holds the control signals and data needed by the downstream stage; the latch delay contributes to \(t_{setup}+t_{clk\!-\!q}\) in the clock period formula above.
 
-The forwarding unit computes mux select signals every cycle. The conditions for `ForwardA` (ALU first input):
+### Forwarding (Data Hazard Resolution)
+When a producer writes its result in **EX** (ALU) or **MEM** (load), the value can be forwarded directly to the **EX** stage of a consumer that needs it in the same cycle. The forwarding paths are:
+* **EX → EX** (ALU‑to‑ALU): from the EX/MEM latch to the ALU input mux.
+* **MEM → EX** (load‑to‑ALU): from the MEM/WB latch to the ALU input mux.
+* **MEM → MEM** (store‑data forwarding): from EX/MEM to the store data path (less common).
 
+A load-use hazard remains because the data is only available at the end of **MEM**; if the dependent instruction needs it in **EX**, a one‑cycle stall is unavoidable unless the pipeline implements a load‑forward path (some architectures do, but it adds complexity and may increase \(t_{clk}\)).
+
+### Branch Prediction and Control Hazard Mitigation
+The branch decision (comparison of two registers) is performed in **EX**. Without prediction, the pipeline would stall for two cycles (the IF and ID stages following the branch). Prediction allows the fetch unit to speculatively fetch the predicted target. A **2‑bit saturating counter** per branch address (stored in a Branch Target Buffer, BTB) updates as follows:
 ```
-// EX hazard: forward from EX/MEM (instruction two cycles back)
-if (EX/MEM.RegWrite
-    AND EX/MEM.RegisterRd ≠ $zero
-    AND EX/MEM.RegisterRd == ID/EX.RegisterRs)
-    → ForwardA = 2b'10
-
-// MEM hazard: forward from MEM/WB (instruction three cycles back)
-// Only if EX hazard doesn't already cover it (EX hazard takes priority)
-if (MEM/WB.RegWrite
-    AND MEM/WB.RegisterRd ≠ $zero
-    AND NOT (EX/MEM.RegWrite
-             AND EX/MEM.RegisterRd ≠ $zero
-             AND EX/MEM.RegisterRd == ID/EX.RegisterRs)
-    AND MEM/WB.RegisterRd == ID/EX.RegisterRs)
-    → ForwardA = 2b'01
+if taken   -> state = min(state+1, 3)
+if not taken -> state = max(state-1, 0)
 ```
+Predicted taken when state ∈ {2,3}. The **misprediction penalty** equals the number of stages after fetch that must be flushed:
+\[
+\text{Penalty}= \text{stage of resolution} - \text{fetch stage}= EX - IF = 2 \text{ cycles}
+\]
+More aggressive predictors (e.g., tournament, perceptron) reduce the misprediction rate \(m\) but increase area and access time, potentially raising \(t_{clk}\).
 
-The EX hazard takes priority because it carries the *more recent* value. Without the priority condition, a WAW (write-after-write) sequence could forward the wrong (older) value from MEM/WB when EX/MEM already holds the correct newer result.
+### Structural Hazard Avoidance
+A common structural conflict is the single‑ported data cache used by both IF (instruction fetch) and MEM (load/store). Solutions:
+* **Split caches** (Harvard architecture) – separate I‑cache and D‑cache eliminate the conflict.
+* **Stall** – if conflict occurs, stall the IF stage for one cycle; this adds to CPI proportionally to the conflict probability.
+* **Banked caches** – multiple banks allow parallel accesses if addresses map to different banks.
 
-| `ForwardA` | ALU Input Source |
-|---|---|
-| `00` | Register file output (ID/EX stage) |
-| `10` | EX/MEM pipeline register |
-| `01` | MEM/WB pipeline register |
+## Worked Examples
+Assume each stage takes exactly one clock cycle, branch resolved in **EX**, and a perfect predictor unless stated otherwise.
 
-`ForwardB` uses symmetric logic for `ID/EX.RegisterRt`.
-
----
-
-### Load-Use Hazard: Stall Condition
-
-```
-// Hazard detection unit (runs during ID stage)
-if (ID/EX.MemRead
-    AND (ID/EX.RegisterRt == IF/ID.RegisterRs
-         OR ID/EX.RegisterRt == IF/ID.RegisterRt))
-    → PCWrite = 0        // freeze program counter
-    → IF/IDWrite = 0     // freeze IF/ID register
-    → ID/EX ← NOP       // inject bubble
-```
-
-Cycle-by-cycle trace for:
-
+### Example 1: No Hazards
 ```asm
-lw   $t0, 0($s0)   # instruction I
-add  $t1, $t0, $s1 # instruction I+1
+ADD $t0, $t1, $t2
+SUB $t3, $t4, $t5
+MUL $t6, $t7, $t8
 ```
+Timeline (stage per cycle):
+```
+Cycle: 1 2 3 4 5 6 7
+IF:    ADD SUB MUL -  -  -  -
+ID:    - ADD SUB MUL -  -  -
+EX:    - - ADD SUB MUL -  -
+MEM:   - - - ADD SUB MUL -
+WB:    - - - - ADD SUB MUL
+```
+Total cycles = \(n + k -1 = 3 + 5 -1 = 7\).  
+CPI = \(7/3 ≈ 2.33\) **if** we count only the first three instructions; however, the steady‑state IPC after filling the pipeline is 1. The **average CPI** for a long stream of independent instructions tends to 1.
 
-| Cycle | I stage | I+1 stage | Note |
-|---|---|---|---|
-| 1 | IF | — | |
-| 2 | ID | IF | |
-| 3 | EX | ID | Stall detected: `ID/EX.MemRead` and `$t0` match |
-| 4 | MEM | ID (stalled) | Bubble in EX; PC frozen |
-| 5 | WB | EX | Forward MEM/WB → EX input |
-| 6 | — | MEM | |
+### Example 2: Data Hazard with Forwarding
+```asm
+ADD $t0, $t1, $t2   # t0 = t1 + t2
+SUB $t3, $t0, $t4   # t3 = t0 - t4
+MUL $t5, $t3, $t6   # t5 = t3 * t6
+```
+*Without forwarding*: SUB would need the result of ADD, which is only written back in WB (cycle 5), causing a 2‑cycle stall. MUL would similarly stall for SUB.
 
-The stall inserts exactly one dead cycle. After it, the timing aligns: `lw` is in WB when `add` enters EX, enabling MEM/WB → EX forwarding.
+*With forwarding*:
+* After ADD finishes EX (cycle 3), its result is available in the EX/MEM latch and can be forwarded to SUB’s EX input in cycle 4.
+* After SUB finishes EX (cycle 4), its result is forwarded to MUL’s EX input in cycle 5.
 
----
+Timeline:
+```
+Cycle: 1 2 3 4 5 6 7
+IF:    ADD SUB MUL -  -  -  -
+ID:    - ADD SUB MUL -  -  -
+EX:    - - ADD SUB MUL -  -
+MEM:   - - - ADD SUB MUL -
+WB:    - - - - ADD SUB MUL
+```
+No stalls; CPI = 1. Note that if the second instruction were a **LW** followed by an **ALU** that uses the loaded value, a load‑use hazard would still require a one‑cycle stall because the data is only ready after MEM.
 
-### Branch Penalty and ID-Stage Resolution
+### Example 3: Control Hazard – Branch Misprediction
+```asm
+BEQ $t0, $t1, Label   # branch if t0 == t1
+ADD $t2, $t3, $t4     # fall‑through path
+Label: MUL $t5, $t6, $t7
+```
+Assume $t0 ≠ $t1 (branch not taken) but the predictor **predicts taken** (state initially weak taken). The predictor will fetch from Label in the next cycle.
 
-In the unoptimized datapath, the branch comparator lives in the ALU (EX stage) and the PC update happens at MEM. By the time the branch is resolved, three instructions have been fetched speculatively:
+Pipeline evolution (stall cycles shown as bubbles):
+```
+Cycle: 1    2    3    4    5    6    7    8
+IF:    BEQ  Label ADD  -    -    MUL  -    -
+ID:    -    BEQ  Label ADD  -    -    MUL  -
+EX:    -    -    BEQ  Label ADD  -    -    MUL
+MEM:   -    -    -    BEQ  Label ADD  -    -
+WB:    -    -    -    -    BEQ  Label ADD  -
+```
+At cycle 3 the BEQ resolves in EX as **not taken**, but the pipeline has already fetched `Label` (MUL) and `ADD`. Those two instructions are flushed; the correct fall‑through `ADD` must be refetched.
 
-$$\text{branch penalty}_{\text{unoptimized}} = 3 \text{ cycles}$$
+*Penalty*: 2 cycles (the IF and ID slots after the branch are wasted).  
+If the predictor had correctly predicted **not taken**, the pipeline would have suffered no stall:
+```
+Cycle: 1 2 3 4 5 6
+IF:    BEQ ADD MUL - - -
+ID:    - BEQ ADD MUL - -
+EX:    - - BEQ ADD MUL -
+MEM:   - - - BEQ ADD MUL
+WB:    - - - - BEQ ADD MUL
+```
+Thus the average stall contribution from this branch is:
+\[
+\text{Stall} = m \times 2
+\]
+where \(m\) is the misprediction probability.
 
-By moving a dedicated equality comparator into **ID** and connecting an early branch-taken adder to the PC mux, the branch resolves one stage earlier:
+## Common Mistakes
+| Mistake | Why it’s Wrong | Correct Understanding |
+|---------|----------------|-----------------------|
+| **Assuming forwarding eliminates all data hazards** | Forwarding only works when the producer’s result is ready **before** the consumer needs it. Load‑use hazards (producer is a load, consumer needs the value in the next EX stage) still require a stall because data appears only after MEM. | Recognize the latency of each functional unit; insert a stall or schedule independent instructions between a load and its use. |
+| **Believing a deeper pipeline always yields higher performance** | Increasing pipeline depth raises clock frequency but also raises branch misprediction penalty and latch overhead; beyond a point, the CPI increase outweighs the frequency gain. | Optimize depth for the target workload: balance \(T_{clk}\) reduction against increased penalty \(p_{ctrl}\cdot m\) and structural conflict probability. |
+| **Ignoring structural hazards caused by shared functional units** | A single ALU cannot service both an EX operation and an address calculation for a load/store in the same cycle, leading to stalls that are often mistakenly attributed to “bad code”. | Duplicate critical units (e.g., separate ALU for address generation) or schedule memory‑independent ALU ops away from load/store cycles. |
+| **Thinking branch prediction is only about hardware** | Predictor warm‑up time, working set size, and branch correlation affect accuracy; a perfect static predictor still suffers on unpredictable branches (e.g., data‑dependent loops). | Use profile‑guided optimization (`gcc -fprofile-generate`) to expose hot branches, and consider compiler hints (`__builtin_expect`) or likely/unlikely macros. |
+| **Assuming CPI = 1 is attainable in real code** | Real instruction mixes contain loads, stores, branches, and dependencies that inevitably generate stalls; memory hierarchy misses add additional latency beyond pipeline stalls. | Measure actual CPI with performance counters (`perf stat -e cycles,instructions`) and target reductions in stall sources (e.g., improve locality to reduce cache miss‑related stalls). |
 
-$$\text{branch penalty}_{\text{ID-stage}} = 1 \text{ cycle}$$
+## Exercises
+### 1. Easy – CPI Calculation
+Given a workload with the following instruction mix and hazard rates:
+* 50% ALU ops (no hazard)
+* 25% Loads, of which 20% are followed by an instruction that uses the loaded value (load-use hazard, penalty = 1 cycle)
+* 25% Branches, misprediction rate = 10%, penalty = 2 cycles
 
-The tradeoff: the ID stage now depends on register values that EX might not have produced yet. If the instruction immediately before the branch writes a register the branch reads, you need a stall — EX hasn't produced the value when ID needs it:
+Compute the average CPI. Show your work.
+
+**Solution Sketch**:  
+\[
+\text{CPI}=1 + (0.25\times0.20\times1) + (0.25\times0.10\times2) = 1 + 0.05 + 0.05 = 1.10
+\]
+
+### 2. Medium – Design a Forwarding Unit
+Draw the datapath for a 5‑stage pipeline showing the two forwarding muxes (EX/MEM → ALU input, MEM/WB → ALU input). Write a small **SystemVerilog** module that takes the control signals `ForwardA` and `ForwardB` (2‑bit each) and selects the correct operand for the ALU. Include comments explaining why each path is needed.
+
+### 3. Hard – Branch Prediction Trade‑off
+Consider a tight loop:
+```c
+for (int i=0; i<N; ++i) {
+    if (data[i] > threshold)   // branch B1
+        sum += data[i];
+}
+```
+Assume the branch is taken with probability \(p=0.7\). A 2‑bit predictor starts weakly not taken (state=0).  
+*Derive* the steady‑state misprediction rate for this pattern.  
+Then, assuming a misprediction penalty of 3 cycles (due to a deeper pipeline where branch resolves in MEM), compute the effective CPI contribution of the branch.  
+Finally, discuss how increasing the predictor to a **2‑level adaptive** predictor would change the misprediction rate, and what hardware cost (in bits per branch) this entails.
+
+*Hint*: Model the predictor as a Markov chain on its 2‑bit state.
+
+### 4. Optional – Linux‑Based Measurement
+Write a bash script that:
+1. Compiles a simple C program with `-O0` and `-O3`.
+2. Runs each binary under `perf stat -e cycles,instructions,branch-misses,cache-references,cache-misses`.
+3. Parses the output to report IPC and branch‑miss rate for each optimization level.
+Explain how the observed differences relate to pipelining concepts discussed.
+
+## Linux Connection
+Linux exposes the micro‑architectural state of CPUs through **virtual filesystems** and **perf** interfaces, letting you observe the effects of pipelining directly.
+
+* **CPU topology** – list cores, threads, and cache layout:
+  ```bash
+  lscpu --extended
+  cat /sys/devices/system/cpu/cpu0/topology/thread_siblings_list
+  ```
+* **Performance counters** – `perf` reads the PMU (Performance Monitoring Unit) which counts pipeline events:
+  ```bash
+  # Measure CPI of a program
+  perf stat -e cycles,instructions ./myprog
+  # IPC = instructions / cycles
+  ```
+  To see pipeline stalls caused by load‑use hazards:
+  ```bash
+  perf stat -e ld_blocks.store_forward,mem_load_retired.l1_miss ./myprog
+  ```
+* **Branch prediction stats**:
+  ```bash
+  perf stat -e branch-misses,branches ./myprog
+  ```
+  The ratio `branch-misses / branches` is the misprediction probability \(m\).
+* **Controlling hyper‑threading** (which can exacerbate structural hazards on shared execution units):
+  ```bash
+  # Disable SMT (hyper‑threading) system‑wide
+  echo off > /sys/devices/system/cpu/smt/control
+  # Re‑enable
+  echo on > /sys/devices/system/cpu/smt/control
+  ```
+* **Setting affinity** to reduce cross‑core interference (helps keep a thread’s pipeline hot):
+  ```bash
+  taskset -c 0-3 ./myprog   # bind to cores 0‑3
+  ```
+* **Prefetch control** – some CPUs allow disabling hardware prefetchers to expose latent memory‑level stalls:
+  ```bash
+  echo 0 > /sys/devices/system/cpu/cpu0/CPUFreq/prefetch_disable   # varies by vendor
+  ```
+* **Reading MSR (Model‑Specific Registers)** for detailed pipeline stats (requires root):
+  ```bash
+  # Example: Intel X86 – count uops dispatched per cycle
+  rdmsr -p 0 0x000001B0   # IA32_PERF_CTR0 after configuring IA32_PERF_EVTSEL0
+  ```
+
+These tools let you verify hypotheses: e.g., if you see a high `branch-misses` count, you know the control hazard is limiting IPC; a high `ld_blocks.store_forward` indicates load‑use stalls that forwarding cannot eliminate.
+
+## Why This Matters
+Understanding pipelining transforms performance tuning from guesswork into a systematic engineering process:
+
+* **Instruction scheduling** – compilers (e.g., `gcc -O2 -fschedule-insins`) reorder instructions to keep the pipeline fed; knowing which stalls are avoidable informs whether to rely on the compiler or hand‑optimize assembly.
+* **Data‑layout decisions** – struct padding, array alignment, and cache‑friendly traversal reduce structural hazards caused by memory bank conflicts and load‑use latency.
+* **Branch‑friendly code** – using `likely/unlikely` macros, branch‑less tricks (conditional moves), or loop‑tiling lowers the misprediction probability \(m\), directly cutting the stall term in the CPI formula.
+* **Resource provisioning** – when designing kernels or RTL, you decide whether to duplicate functional units, add extra read/write ports to the register file, or split caches based on the quantified cost of structural hazards.
+* **Performance measurement** – tools like `perf` and `htop` give you the raw counters (cycles, instructions, branch‑misses) needed to compute real CPI and validate that your optimizations actually moved the pipeline closer to its ideal throughput.
+
+In short, pipelining is the bridge between ISA semantics and silicon speed. Mastering its mechanisms lets you write code, configure the kernel, and even propose hardware changes that sustain the highest possible instructions‑per‑cycle on modern Linux systems.

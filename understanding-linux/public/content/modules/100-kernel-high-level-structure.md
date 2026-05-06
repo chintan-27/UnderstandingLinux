@@ -10,144 +10,379 @@ resources:
     title: "Understanding the Linux Kernel (Bovet)"
 ---
 
-## Why This Matters
-
-Every time a process calls `read()`, the CPU changes privilege level, the kernel validates arguments it cannot trust, and control returns to user space — all in a few hundred nanoseconds. The kernel's internal structure determines whether that transition is safe, fast, and correct. This is not an academic concern: the boundary between user space and kernel space is what prevents process A from writing into process B's page tables, and what prevents a userland bug from silencing an interrupt handler mid-execution. Understanding the structure means understanding why these guarantees hold and where they can break.
-
 ## Core Concepts
+### Monolithic Kernel with Dynamic Extensibility
+The Linux kernel is a **monolithic** design: all core services (process scheduling, memory management, filesystem, device drivers, networking) execute in the same privileged address space and share data structures directly. This eliminates message‑passing overhead but raises concerns about size and fault isolation. To retain flexibility without sacrificing performance, Linux provides **kernel modules**—object files (`*.ko`) that can be linked into the running kernel via the module loader (`insmod`/`rmmod`). A module runs at **CPL 0** (kernel mode) with full access to kernel symbols, yet it can be loaded/unloaded without reboot, allowing hardware support, filesystems, or schedulers to be added on demand.
 
-### The Monolithic Design
+### Subsystem Decomposition
+Despite the monolithic image, the source is deliberately partitioned into loosely coupled subsystems, each owning a well‑defined set of data structures and invariants:
 
-Linux is a **monolithic kernel**: all subsystems run in a single privileged address space. The scheduler can call the memory manager with a direct function call. The VFS can reach a block driver with no serialization. There is no privilege transition between subsystems because there are no subsystem boundaries at the hardware level — just one ring-0 address space.
+| Subsystem | Primary Responsibility | Key Data Structures |
+|-----------|------------------------|---------------------|
+| **Scheduler** (`kernel/sched/`) | CPU time allocation, load balancing, preemption | `struct task_struct`, `struct rq`, `sched_class` |
+| **Memory Manager** (`mm/`) | Virtual memory, page allocation, swap, kmalloc/vmalloc | `struct mm_struct`, `struct vm_area_struct`, `struct page` |
+| **Virtual Filesystem (VFS)** (`fs/`) | Uniform namespace for all filesystems, dentry/inode caches | `struct inode`, `struct dentry`, `struct super_block` |
+| **Device Drivers** (`drivers/`) | Hardware abstraction, interrupt handling, DMA | `struct device`, `struct file_operations`, `struct usb_driver` |
+| **IPC** (`ipc/`) | SysV msg/sem/shm, POSIX queues | `struct msg_queue`, `struct sem_array` |
+| **Network** (`net/`) | Packet processing, socket layers, protocols | `struct sock`, `struct sk_buff`, `struct net_device` |
 
-The alternative is a **microkernel**: each subsystem runs as an isolated user-space server, and subsystems communicate via IPC. The isolation benefit is real — a crashing driver cannot corrupt the scheduler — but every cross-subsystem operation pays a context switch and a copy. Mach and L4 are microkernels. Linux is not, and the decision was deliberate: driver-to-filesystem calls happen millions of times per second on a busy system.
+Each subsystem enforces its own locking discipline (spinlocks, mutexes, rw-semaphores, RCU) to guarantee correctness under preemption and SMP.
 
-The cost is also real: a bug in a driver has write access to every kernel data structure. This is not hypothetical; it is the reason nearly all Linux privilege escalation exploits target drivers or kernel modules.
+### System‑Call Boundary
+The **syscall boundary** is the sole controlled transition from user mode (CPL 3) to kernel mode (CPL 0). On x86‑64 it is invoked via the `syscall` instruction, which:
 
-### Kernel Modules
+1. Saves user‑space `RIP`, `RFLAGS`, `RCX`, `R11` into kernel‑mode MSRs (`STAR`, `LSTAR`, `FKSMASK`, `CFG`).
+2. Loads kernel `RIP` from `LSTAR` (entry point `entry_SYSCALL_64`).
+3. Switches stack to the per‑CPU kernel stack (`% rsp` → `per_cpu(__irq_stack_ptr, cpu)`).
+4. Masks interrupts according to `FKSMASK` (typically clears `IF`).
 
-Monolithic does not mean static. Linux loads **kernel modules** (`.ko` files) at runtime by linking them directly into the kernel's address space. After loading, a call from module code to `printk` or `kmalloc` is a direct `call` instruction with a resolved address — identical to what statically compiled kernel code does. There is no IPC, no indirection, no privilege transition.
+The entry point then:
 
-The module system recovers microkernel-style flexibility without microkernel overhead: a Wi-Fi driver that nobody uses costs nothing until loaded, and a driver that crashes can be removed without rebooting (if the rest of the kernel is still coherent enough to do so).
+* Saves all general‑purpose registers on the kernel stack (`pt_regs` struct).
+* Extracts the syscall number from `regs->ax`.
+* Validates the number against `NR_syscalls` (currently 442 on x86‑64).
+* Dispatches via `sys_call_table[regs->ax]`.
+* After the subsystem routine returns, restores registers and executes `sysretq` to resume user mode.
 
-### Subsystems and Internal APIs
+Because the transition is synchronous and deterministic, the kernel can guarantee that any user request is mediated by a single, auditable entry point.
 
-The kernel is divided into **subsystems**, each owning a domain and exposing a defined internal API:
-
-| Subsystem | Kernel source path | Core internal interface |
-|---|---|---|
-| Process Scheduler | `kernel/sched/` | `schedule()`, `wake_up_process()` |
-| Memory Manager | `mm/` | `alloc_pages()`, `vmalloc()`, `handle_mm_fault()` |
-| VFS | `fs/` | `struct file_operations`, `struct inode_operations` |
-| Network Stack | `net/` | `struct sk_buff`, `netif_rx()` |
-| Device Drivers | `drivers/` | `struct device`, bus-specific probe callbacks |
-| Interrupt Subsystem | `kernel/irq/` | `request_irq()`, `irq_desc` table |
-
-The VFS enforces its abstraction through function pointers. When the kernel calls `file->f_op->read()`, it does not know or care whether the backing implementation is in `fs/ext4/`, `fs/tmpfs/`, or a FUSE driver. This is runtime polymorphism without C++ — just a struct of function pointers.
-
-```c
-/* From include/linux/fs.h — the interface every filesystem must implement */
-struct file_operations {
-    ssize_t (*read)  (struct file *, char __user *, size_t, loff_t *);
-    ssize_t (*write) (struct file *, const char __user *, size_t, loff_t *);
-    int     (*open)  (struct inode *, struct file *);
-    int     (*release)(struct inode *, struct file *);
-    /* ... ~30 more function pointers ... */
-};
-```
-
-Any driver or filesystem that populates this struct becomes accessible through the same `read(2)` / `write(2)` syscalls that work on regular files.
-
-### The Syscall Boundary
-
-User-space code cannot call kernel functions by address — the kernel's virtual address range is present in every process's page table but marked non-executable and inaccessible at user privilege. The **system call interface** is the only controlled gate.
-
-A syscall is a hardware trap, not a function call. On x86-64, the `syscall` instruction atomically:
-
-1. Saves `%rip` and `%rflags` into MSRs (`IA32_LSTAR`, `IA32_FMASK`)
-2. Loads the kernel-mode `%rsp` from the per-CPU TSS
-3. Transfers control to the address in `IA32_LSTAR` — the kernel's syscall entry point
-
-The kernel validates every pointer argument before dereferencing it. A user-space address passed to `read()` could be unmapped, could point to kernel memory, or could be concurrently unmapped by another thread. The `copy_from_user()` / `copy_to_user()` functions perform this validation — they fault safely if the address is invalid rather than oopsing the kernel.
-
-### The Three Execution Contexts
-
-At any instant a CPU is in exactly one of three states:
-
-| Context | Privilege | Has `task_struct`? | Can sleep? |
-|---|---|---|---|
-| User space | Ring 3 | Yes | Yes |
-| Kernel, process context | Ring 0 | Yes | Yes |
-| Kernel, interrupt context | Ring 0 | No | **No** |
-
-The "cannot sleep in interrupt context" rule is not a style convention. `schedule()` saves the current task's state and switches stacks. In interrupt context there is no task — no `struct task_struct`, no associated kernel stack. Calling `schedule()` from an interrupt handler would leave the scheduler with nothing to save and nothing to return to. The constraint is a structural consequence of the design.
+---
 
 ## How It Works
+### From User Request to Kernel Service
+Consider a generic system call `sys_foo(arg1, arg2)`. The end‑to‑end flow is:
 
-### Syscall Dispatch
+1. **User‑space invocation**  
+   ```asm
+   mov     eax, __NR_foo          ; syscall number
+   mov     edi, arg1              ; first arg in rdi
+   mov     esi, arg2              ; second arg in rsi
+   syscall                        ; trap to kernel
+   ```
+   The CPU performs the steps described above, switching to kernel mode and loading `entry_SYSCALL_64`.
 
-The C library's `read()` wrapper places the syscall number in `%rax` (for `read`, that is `0` on x86-64), places arguments in `%rdi`, `%rsi`, `%rdx`, and executes `syscall`. The kernel entry point reads `%rax` and indexes into `sys_call_table`:
+2. **Register saving & pt_regs construction**  
+   In `entry_SYSCALL_64` (arch/x86/entry/entry_64.S):
+   ```asm
+   push    rbp
+   push    rbx
+   /* … save all regs … */
+   mov     pt_regs_ax(%rsp), eax   ; store syscall number
+   ```
+   The `pt_regs` struct now mirrors the user‑space register state.
 
+3. **Syscall number validation**  
+   ```c
+   if (unlikely(regs->ax >= NR_syscalls))
+       return sys_ni_syscall(regs);   /* returns -ENOSYS */
+   ```
+   This check prevents out‑of‑bounds table access.
+
+4. **Dispatch via sys_call_table**  
+   ```c
+   nr = regs->ax;
+   ret = sys_call_table[nr](regs);   /* indirect call */
+   ```
+   The table is defined in `arch/x86/entry/syscalls/syscall_64.tbl` and linked at compile time; its address is exported as `sys_call_table`.
+
+5. **Subsystem execution**  
+   The target routine (e.g., `sys_fork`) performs:
+   * Argument copying from `pt_regs` to local variables.
+   * Validation (e.g., checking flags, permissions via `cred` struct).
+   * Invocation of internal helper functions (e.g., `copy_process()` for fork).
+   * Interaction with the relevant subsystem (scheduler, mm, fs, etc.).
+   * Return of an integer (`long`) result in `eax`.
+
+6. **Exit to user mode**  
+   ```c
+   /* in __syscall_return */
+   sysretq
+   ```
+   The CPU restores `RIP`, `RFLAGS`, `RCX`, `R11` from the saved MSRs and resumes execution at the instruction after `syscall`.
+
+### Performance Model
+A first‑order latency model for a syscall is:
+
+$$
+T_{\text{syscall}} = T_{\text{enter}} + T_{\text{dispatch}} + T_{\text{subsys}} + T_{\text{exit}}
+$$
+
+* `T_enter` ≈ 120 cycles (register save, stack switch, MSR loads)  
+* `T_dispatch` ≈ 30 cycles (bounds check, table lookup, indirect call)  
+* `T_subsys` varies:  
+  * Simple `getpid` → ~200 cycles (mostly field access)  
+  * `fork` (copy‑on‑write) → ~1500–3000 cycles (page‑table duplication, `task_struct` allocation)  
+  * `read` from cached file → ~500–800 cycles (VFS lookup, page cache hit)  
+* `T_exit` ≈ 80 cycles (register restore, `sysretq`)
+
+On a 3 GHz core, a `getpid` syscall costs ≈0.5 µs, while a `fork` costs ≈0.8–1.5 µs plus any page‑fault overhead from subsequent COT.
+
+Memory‑layout math: the kernel occupies the **upper half** of the 48‑bit virtual address space. On x86‑64:
+
+$$
+\text{PAGE\_OFFSET} = 0xffff\_ffff\_8000\_0000
+$$
+
+A physical address `phys` is mapped to kernel virtual address:
+
+$$
+v = \text{PAGE\_OFFSET} + \text{phys}
+$$
+
+Thus, a page frame at `0x0000_0000_0010_0000` appears at `0xffff_ffff_8010_0000`.
+
+---
+
+## Worked Examples
+### Example 1: `fork()` – Process Creation
+**Goal:** Show how a user request becomes a new `task_struct`, COW page‑table duplication, and scheduler enqueue.
+
+**Step‑by‑step (x86‑64):**
+
+1. **User invocation**  
+   ```c
+   pid_t pid = fork();    /* glibc wrapper → syscall */
+   ```
+   The wrapper loads `__NR_fork` (= 57) into `eax` and executes `syscall`.
+
+2. **Kernel entry** – as described in *How It Works*.
+
+3. **`sys_fork`** (`kernel/fork.c`):
+   ```c
+   SYSCALL_DEFINE0(fork)
+   {
+       return do_fork(SIGCHLD, 0, 0, NULL, NULL);
+   }
+   ```
+
+4. **`do_fork`**:
+   * Allocates a new `struct task_struct` via `alloc_task_struct_node()` (slab cache).
+   * Duplicates the parent’s `mm_struct` but marks all VMAs as `VM_COW` (`copy_mm()`).
+   * For each VMA, increments the `mm_users` counter; the actual page tables are **not** copied yet.
+   * Copies kernel stack, thread_info, and TLS.
+   * Sets `child->state = TASK_RUNNING` and enqueues on the parent’s runqueue via `wake_up_new_task()`.
+   * Returns child’s PID to parent, 0 to child.
+
+5. **Copy‑On‑Write fault** (first write by either process):
+   * Page fault handler (`do_page_fault`) sees a present‑but‑read‑only PTE.
+   * Allocates a new physical page (`alloc_page_vma`), copies contents, updates PTE to writable.
+   * Cost: one extra page allocation + memcpy (~4 KB) ≈ 2000 cycles.
+
+**Numbers (typical Intel i7‑12700K, Linux 6.6):**
+| Operation | Approx. Cycles | Approx. Time |
+|-----------|----------------|--------------|
+| `task_struct` allocation | 300 | 0.1 µs |
+| `mm_struct` dup + VMA walk | 500 | 0.17 µs |
+| Page‑table walk (no copy) | 200 | 0.07 µs |
+| Enqueue + wakeup | 250 | 0.08 µs |
+| **Total fork entry** | **≈1250** | **≈0.42 µs** |
+| First COW fault (per page) | ≈2000 | 0.67 µs |
+
+Thus, creating a process with a 2 MB stack (512 pages) costs ~0.42 µs + (pages actually dirtied)×0.67 µs. If only the stack top page is touched, latency ≈1.1 µs.
+
+**Code snippet (kernel side):**
 ```c
-/* arch/x86/entry/syscall_64.c — the actual table declaration */
-asmlinkage const sys_call_ptr_t sys_call_table[__NR_syscall_max+1] = {
-    [0 ... __NR_syscall_max] = &__x64_sys_ni_syscall,
-    [__NR_read]  = &__x64_sys_read,   /* slot 0 */
-    [__NR_write] = &__x64_sys_write,  /* slot 1 */
-    [__NR_open]  = &__x64_sys_open,   /* slot 2 */
-    /* ... */
-};
+/* kernel/fork.c */
+static long do_fork(unsigned long clone_flags,
+                    unsigned long stack_start,
+                    unsigned long stack_size,
+                    int __user *parent_tidptr,
+                    int __user *child_tidptr)
+{
+    struct task_struct *p;
+    int retval;
+
+    p = copy_process(clone_flags, stack_start, stack_size,
+                     parent_tidptr, child_tidptr);
+    if (IS_ERR(p))
+        return PTR_ERR(p);
+
+    retval = wake_up_new_task(p);
+    if (retval)
+        retval = PTR_ERR(p);
+    else
+        retval = p->pid;
+
+    return retval;
+}
 ```
 
-The dispatch is $O(1)$: the syscall number is an index, not a key in a lookup structure. The table has 256–350 populated entries on a typical x86-64 kernel.
+### Example 2: Loading a Kernel Module (`insmod`)
+**Goal:** Demonstrate ELF loading, symbol resolution, and module initialization.
 
-The total wall-clock cost of a null syscall (one that immediately returns) has two components:
+1. **User command**
+   ```bash
+   sudo insmod hello.ko
+   ```
+   `insmod` reads the ELF file, extracts the `.modinfo` section, and issues the `init_module` syscall (`__NR_init_module` = 175).
 
-$$T_{\text{syscall}} = T_{\text{entry}} + T_{\text{handler}} + T_{\text{exit}}$$
+2. **`sys_init_module`** (`kernel/module.c`):
+   * Copies the module image from user space (`copy_from_user`).
+   * Verifies ELF magic, section headers.
+   * Calls `load_module()` which:
+     * Allocates vmalloc space for core and init sections.
+     * Relocates references (`apply_relocations`).
+     * Resolves symbols against the kernel’s symbol table (`kallsyms`) and any already‑loaded modules (`find_symbol`).
+     * Marks the module state `MODULE_STATE_COMING`.
 
-where $T_{\text{entry}}$ and $T_{\text{exit}}$ each include register save/restore, page-table switching (if KPTI is enabled), and speculation barrier instructions. On a modern x86-64 with KPTI enabled, $T_{\text{entry}} + T_{\text{exit}} \approx 100\text{–}300\,\text{ns}$ even for a handler that does nothing. KPTI — Kernel Page Table Isolation, the Meltdown mitigation — doubles this cost by requiring a CR3 write on each transition.
+3. **Execution of init function**:
+   * The loader locates the `module_init` callback (via `__attribute__((section(".init.text")))`).
+   * Calls it; typical module prints via `printk`:
+     ```c
+     static int __init hello_init(void)
+     {
+         pr_info("Hello, world %s\n", THIS_MODULE->name);
+         return 0;
+     }
+     static void __exit hello_exit(void)
+     {
+         pr_info("Goodbye, %s\n", THIS_MODULE->name);
+     }
+     module_init(hello_init);
+     module_exit(hello_exit);
+     ```
+   * `printk` writes to the log buffer (`log_buf`) and wakes `klogd`/`journald`.
 
-### Module Linking
+4. **Cleanup on rmmod**:
+   * Calls `delete_module` syscall → `module_put()` → calls the `__exit` function, frees vmalloc memory, removes from `modules` list.
 
-When `insmod` loads a `.ko` file, the kernel executes a runtime link step:
-
-1. Reads the ELF `.ko` and allocates physically contiguous memory in the module region (`MODULES_VADDR` to `MODULES_END`, a 1 GiB window near the kernel on x86-64)
-2. Applies ELF relocations — patches every `R_X86_64_PC32` or `R_X86_64_PLT32` relocation with the actual address of the target symbol
-3. Resolves symbols against the kernel's exported symbol table (`__ksymtab` section), failing if any required symbol is not exported
-4. Calls `module->init()`
-
-After step 2, a call from module code to `kmalloc` is a `callq 0xffffffff81234567` — a direct call with a 32-bit PC-relative offset baked in. There is no PLT, no dynamic linker, no vtable. The module is structurally indistinguishable from statically compiled kernel code at the instruction level.
-
-A minimal compilable module:
-
-```c
-// my_module.c
-#include <linux/module.h>
-#include <linux/kernel.h>
-#include <linux/init.h>
-
-static int __init my_init(void)
-{
-    printk(KERN_INFO "my_module: loaded, kernel text at %px\n",
-           (void *)my_init);
-    return 0;  /* non-zero aborts load */
-}
-
-static void __exit my_exit(void)
-{
-    printk(KERN_INFO "my_module: unloaded\n");
-}
-
-module_init(my_init);
-module_exit(my_exit);
-MODULE_LICENSE("GPL");
-MODULE_DESCRIPTION("Minimal example");
+**Run‑time inspection:**
+```bash
+# Show loaded modules
+lsmod | grep hello
+# See init call address
+modinfo hello.ko | grep ^vermagic
+# Dump kernel symbols related to the module
+grep hello /proc/kallsyms
 ```
 
-The `__init` annotation places `my_init` in the `.init.text` ELF section. After the init function returns, the kernel frees that section's pages. The same applies to `__initdata`. This is not cosmetic — on a system with many built-in drivers, `__init` reclaims several hundred kilobytes at boot.
+**Performance note:** Relocation of a typical 30 KB module takes ~150 µs on an SSD‑backed system, dominated by `vmalloc` page table updates.
 
-### Interrupt Context and the Top/Bottom Half Split
+### Example 3: `read()` from a Regular File
+**Goal:** Trace VFS, page cache, and disk I/O.
 
-Because interrupt handlers cannot sleep, any interrupt-triggered work that might block must be deferred. Linux provides three deferral mechanisms, in increasing order of flexibility:
+1. **User call**
+   ```c
+   ssize_t n = fd = open("data.bin", O_RDONLY);
+   char buf[4096];
+   n = read(fd, buf, sizeof buf);
+   ```
 
-| Mechanism |
+2. **`sys_read`** (`fs/read_write.c`):
+   * Calls `vfs_read(fd, buf, count, ppos)`.
+
+3. **VFS layer**:
+   * Retrieves `struct file *f` from fd table.
+   * Calls `f->f_op->read` (usually `generic_file_read_iter`).
+
+4. **Page cache lookup**:
+   * `filemap_fault` finds the page for the requested offset via `find_get_page()`.
+   * If present, increments page count, copies data via `kmap_atomic`/`memcpy_toiovec`.
+   * If absent, triggers `readahead` and schedules disk read.
+
+5. **Disk I/O** (if miss):
+   * The block device driver’s `request_fn` (e.g., `sd` driver) builds a `struct request`.
+   * The I/O scheduler (CFQ, BFQ, or none) merges and orders requests.
+   * The low‑level driver issues DMA; completion interrupt triggers `end_io`.
+
+6. **Return**: copies up to `count` bytes to user buffer, updates `f->f_pos`, returns byte count.
+
+**Latency breakdown (SSD, 4 KiB read, cache hit):**
+| Stage | Approx. Time |
+|-------|--------------|
+| VFS lookup + fd table | 0.2 µs |
+| Page cache hit (find_get_page) | 0.3 µs |
+| kmap + memcpy | 0.5 µs |
+| **Total** | **≈1.0 µs** |
+
+If a miss requires a 4 KiB SSD read (~50 µs) plus scheduler overhead (~5 µs), total ≈55 µs.
+
+**Kernel snippet:**
+```c
+/* fs/read_write.c */
+ssize_t vfs_read(struct file *file, char __user *buf,
+                 size_t count, loff_t *ppos)
+{
+    if (!file->f_op->read)
+        return -EINVAL;
+    return file->f_op->read(file, buf, count, ppos);
+}
+
+/* fs/read_write.c (generic) */
+ssize_t generic_file_read_iter(struct kiocb *iocb,
+                               struct iov_iter *iter)
+{
+    struct address_space *mapping = file_inode(file)->i_mapping;
+    return generic_perform_read(iter, file->f_pos, mapping);
+}
+```
+
+---
+
+## Common Mistakes
+| # | Misconception | Why It’s Wrong | Correct Understanding |
+|---|---------------|----------------|-----------------------|
+| 1 | “The kernel is a single monolithic block; you cannot change anything without recompiling.” | Ignores the **module subsystem** which links object files at runtime, resolves symbols against `kallsyms`, and can invoke `init`/`exit` functions. | Kernel core is monolithic for performance, but modules provide **dynamic extensibility** without reboot. |
+| 2 | “System calls are the only way user space talks to the kernel.” | Overlooks **/proc**, **sysfs**, **debugfs**, **netlink sockets**, and **ioctl** on device nodes, which are also kernel‑mediated interfaces. | Syscalls are the *primary* controlled entry; other interfaces exist for configuration, diagnostics, and device‑specific control. |
+| 3 | “Kernel modules run in user space.” | Modules are loaded into kernel virtual address space and execute at CPL 0; they can call any kernel function and cause a panic if buggy. | Modules are **kernel‑mode** code; they share the same privilege as the core kernel. |
+| 4 | “File operations bypass the VFS and go straight to the underlying filesystem.” | The VFS layer provides **namespace unification**, dentry/inode caches, and permission checks; all file ops flow through `struct file_operations` pointers set by the VFS. | Every `open`, `read`, `write`, etc., first hits the VFS, which then delegates to the specific filesystem’s `->f_op`. |
+| 5 | “Because the kernel is preemptible, locks are unnecessary.” | Preemption only allows the scheduler to interrupt a task; **data races** still exist on shared structures (e.g., `task_struct`, page tables). | Preemptible kernel **requires** fine‑grained locking (spinlocks, mutexes, RCU) to protect concurrent access. |
+| 6 | “`fork()` copies the entire parent memory space immediately.” | Linux uses **copy‑on‑write**; physical pages are shared until a write triggers a page‑fault‑driven copy. | `fork()` duplicates page tables (read‑only) and increments page counts; actual memory copy occurs lazily on first write. |
+| 7 | “All kernel code runs with the same stack size.” | Each process has its own **kernel stack** (typically 8 KB on x86‑64) stored in `thread_info`; interrupt contexts use separate **per‑CPU IRQ stacks**. | Kernel stack size is fixed per task; deep recursion or large local variables can cause stack overflow → `oops`. |
+
+---
+
+## Exercises
+### Easy
+1. **Hello‑world module**  
+   Write a module that prints “Hello, LKM!” on load and “Goodbye!” on unload using `pr_info`.  
+   *Compile:* `make -C /lib/modules/$(uname -r)/build M=$PWD modules`  
+   *Load:* `sudo insmod hello.ko`  
+   *Verify:* `dmesg | tail -n 5`
+
+2. **Straight‑forward syscall tracing**  
+   Use `strace -e trace=open,read,write ./a.out` to observe the syscalls made by a simple program that reads a file and prints its length.
+
+### Moderate
+3. **Add a custom syscall**  
+   * Implement a syscall `sys_helloworld(const char __user *msg)` that copies the string from user space (max 128 bytes) and prints it via `pr_info`.  
+   * Add an entry to `arch/x86/entry/syscalls/syscall_64.tbl`:  
+     ```
+     442 common  helloworld          sys_helloworld
+     ```  
+   * Recompile the kernel (or use `kprobe`/`ftrace` to intercept an existing syscall for demonstration).  
+   * Test with a small C program invoking `syscall(442, "test")`.
+
+4. **Simple character device**  
+   Implement a misc device that returns a monotonically increasing counter on each read.  
+   * Define `struct file_operations { .read = counter_read, .owner = THIS_MODULE };`
+   * Register via `misc_register(&counter_device)`.  
+   * Verify with `dd if=/dev/counter of=/dev/null bs=1 count=10`.
+
+### Challenging
+5. **Implement a round‑robin scheduler class**  
+   * Clone `kernel/sched/fair.c` into a new file `rr.c`.  
+   * Implement `pick_next_task_rr()` that selects the next runnable task in a simple FIFO queue, ignoring VRUNTIME.  
+   * Register the class with `sched_register_class(&rr_sched_class)`.  
+   * Boot with `sched=rr` kernel parameter and verify via `chrt -r 0 ping -c 5 localhost` that all tasks get equal time slices.
+
+6. **Mini‑filesystem using tmpfs as a base**  
+   * Create a new filesystem type `simplefs` that stores all data in a single page‑cache backed inode (i.e., no actual block device).  
+   * Implement the `simplefs_mount`, `simplefs_fill_super`, and the `inode_operations`/`file_operations` stubs that just route to `generic_file_*`.  
+   * Mount with `mount -t simplefs none /mnt/simple` and run `dd if=/dev/zero of=/mnt/simple/file bs=1M count=1`.  
+   * Check that memory usage grows as shown by `cat /proc/meminfo`.
+
+---
+
+## Linux Connection
+### Real Subsystems and Source Locations
+| Subsystem | Source Directory | Key Header |
+|-----------|------------------|------------|
+| Scheduler | `kernel/sched/` | `<linux/sched.h>` |
+| Memory Manager | `mm/` | `<linux/mm.h>` |
+| VFS | `fs/` | `<linux/fs.h>` |
+| Block Layer | `block/` | `<linux/blkdev.h>` |
+| Network Core | `net/` | `<linux/net.h>` |
+| Device Drivers (example: USB) | `drivers/usb/` | `<linux/usb.h>` |
+| Module Loader | `kernel/module.c` | `<linux/module.h>` |
+| Syscall Table (x86‑64) | `arch/x86/entry/syscalls/sys

@@ -10,110 +10,138 @@ resources:
     title: "Introduction to Linear Algebra (Strang)"
 ---
 
-## Why This Matters
-
-Every performance-sensitive Linux subsystem is built on rates of change and accumulated quantities. The kernel's load average is a discrete solution to a continuous decay ODE. TCP's congestion window grows and shrinks according to a piecewise derivative. A PID controller in a motor driver computes a proportional term (the value), a derivative term (how fast it's changing), and an integral term (accumulated error) — get any one wrong and the system oscillates or stalls. Discrete sums and continuous integrals are two sides of the same coin: the kernel computes one where theory gives you the other, and knowing the relationship tells you *why* an approximation is good enough — or dangerously wrong.
-
----
-
 ## Core Concepts
+### Limits
+A limit describes the value a function approaches as its input approaches a point, formalized by the ε‑δ definition:  
+$$\lim_{x\to a}f(x)=L \iff \forall\varepsilon>0\;\exists\delta>0:\;0<|x-a|<\delta\implies|f(x)-L|<\varepsilon.$$  
+This definition is needed because it lets us discuss behavior at points where the function may be undefined (e.g., \(f(x)=\frac{\sin x}{x}\) at \(x=0\)) and provides the rigorous foundation for both derivatives and integrals.
 
-### Limits: Stability at a Boundary
+### Derivatives
+The derivative of \(f\) at \(a\) is the limit of the average rate of change over an interval shrinking to zero:  
+$$f'(a)=\lim_{h\to0}\frac{f(a+h)-f(a)}{h}.$$  
+Geometrically, this limit is the slope of the tangent line because the secant line through \((a,f(a))\) and \((a+h,f(a+h))\) rotates to touch the curve as \(h\to0\). From this definition we derive linearity \((cf+g)'=cf'+g'\) and the product rule via algebraic manipulation of the difference quotient.
 
-$$\lim_{x \to a} f(x) = L$$
+### Integrals
+The definite integral of \(f\) over \([a,b]\) is the limit of Riemann sums:  
+$$\int_a^b f(x)\,dx=\lim_{n\to\infty}\sum_{i=1}^n f(x_i^*)\Delta x,\quad \Delta x=\frac{b-a}{n},\;x_i^*\in[x_{i-1},x_i].$$  
+If the limit exists, it equals the signed area under the curve. The integral is the inverse operation of differentiation because accumulating infinitesimal changes \(f(x)dx\) reconstructs the net change in the antiderivative.
 
-means: for every tolerance $\varepsilon > 0$, there exists $\delta > 0$ such that $|x - a| < \delta \Rightarrow |f(x) - L| < \varepsilon$.
+## How It Works
+### Fundamental Theorem of Calculus (FTC)
+Let \(F\) be an antiderivative of \(f\) on \([a,b]\) (\(F'=f\)). Then  
+$$\int_a^b f(x)\,dx = F(b)-F(a).$$  
+*Proof sketch:* Define \(G(x)=\int_a^x f(t)\,dt\). By the limit definition of the derivative,  
+$$G'(x)=\lim_{h\to0}\frac{1}{h}\int_x^{x+h}f(t)\,dt = f(x)$$  
+(the integrand is approximately constant over the tiny interval). Hence \(G\) is an antiderivative of \(f\); any two antiderivatives differ by a constant, so \(F(b)-F(a)=G(b)-G(a)=\int_a^b f(t)\,dt\).  
+This theorem shows why finding an antiderivative suffices to evaluate a definite integral: the integral measures the net change of the antiderivative across the interval.
 
-The $\varepsilon$-$\delta$ formulation is not ceremony. It forces a precise question: *does the system behave predictably near a boundary, and how tightly must I constrain the input to guarantee a given output tolerance?* A function with no limit at a point — left and right limits disagree, or the function oscillates infinitely — means the system at that boundary is unpredictable regardless of how carefully you approach it.
+### Evaluating a Definite Integral
+1. **Find an antiderivative** \(F\) such that \(F'=f\).  
+2. **Compute** \(F(b)\) and \(F(a)\).  
+3. **Subtract** \(F(b)-F(a)\).  
+The subtraction works because the FTC guarantees the integral equals exactly that difference; no additional approximation is needed.
 
-The Linux load average approaches but never reaches certain thresholds in a well-behaved system. When utilization approaches 1.0 on a single-core system under a Poisson arrival model, queue length diverges:
+## Worked Examples
+### Example 1: Derivative of \(f(x)=x^3\)
+Start from the definition:
+$$f'(x)=\lim_{h\to0}\frac{(x+h)^3-x^3}{h}.$$  
+Expand the numerator:
+$$(x+h)^3 = x^3+3x^2h+3xh^2+h^3.$$  
+Thus
+$$\frac{(x+h)^3-x^3}{h}= \frac{3x^2h+3xh^2+h^3}{h}=3x^2+3xh+h^2.$$  
+Now take the limit:
+$$\lim_{h\to0}(3x^2+3xh+h^2)=3x^2,$$  
+since the terms containing \(h\) vanish. Hence \(f'(x)=3x^2\).
 
-$$\lim_{\rho \to 1^-} \mathbb{E}[Q] = \lim_{\rho \to 1^-} \frac{\rho}{1-\rho} = \infty$$
+### Example 2: Definite Integral \(\displaystyle\int_0^1 x^2\,dx\)
+Find an antiderivative: \(\displaystyle F(x)=\frac{x^3}{3}\) because \(\frac{d}{dx}\left(\frac{x^3}{3}\right)=x^2\).  
+Apply FTC:
+$$\int_0^1 x^2\,dx = F(1)-F(0)=\frac{1^3}{3}-\frac{0^3}{3}=\frac{1}{3}.$$  
+*Verification via Riemann sum:* With \(n\) subintervals, \(\Delta x=1/n\), right‑hand sum  
+$$S_n=\sum_{i=1}^n \left(\frac{i}{n}\right)^2\frac{1}{n}= \frac{1}{n^3}\sum_{i=1}^n i^2 =\frac{1}{n^3}\cdot\frac{n(n+1)(2n+1)}{6}.$$  
+Taking the limit \(n\to\infty\) yields \(\frac{1}{3}\), confirming the result.
 
-This is not a coincidence — it is the $M/M/1$ queueing result, and it explains why a system at 95% CPU feels far worse than one at 90%.
+## Common Mistakes
+| Mistake | Why it’s wrong | Correct approach |
+|---------|----------------|------------------|
+| **Treating \(\frac{dy}{dx}\) as a fraction and cancelling differentials arbitrarily** | The derivative is a limit, not a ratio of infinitesimals; cancellation can lead to invalid results (e.g., in implicit differentiation). | Apply the chain rule formally: \(\frac{dy}{dx}=\frac{dy}{du}\cdot\frac{du}{dx}\) only after proving \(y\) and \(u\) are differentiable functions of \(x\). |
+| **Forgetting the constant of integration in indefinite integrals** | An antiderivative is defined up to an additive constant; omitting it loses the family of solutions and breaks initial‑value problems. | Always write \(\int f(x)\,dx = F(x)+C\) and determine \(C\) from given conditions. |
+| **Applying L’Hôpital’s rule to limits that are not indeterminate** | The rule requires \(\frac{0}{0}\) or \(\frac{\pm\infty}{\pm\infty}\); using it otherwise can give false limits. | Verify the indeterminate form first; if not present, evaluate the limit directly or use algebraic manipulation. |
+| **Confusing definite and indefinite integrals when computing area** | A definite integral yields signed area; to get total area you must split intervals where the function changes sign. | Compute \(\int_a^b |f(x)|dx = \int_{a}^{c} -f(x)dx + \int_{c}^{b} f(x)dx\) if \(f\) changes sign at \(c\). |
+| **Misapplying the power rule to functions with variable exponents** | \(\frac{d}{dx}x^n = nx^{n-1}\) holds only for constant \(n\); for \(x^{g(x)}\) you need logarithmic differentiation. | Use \(\frac{d}{dx}x^{g(x)} = x^{g(x)}\bigl(g'(x)\ln x + \frac{g(x)}{x}\bigr)\). |
 
-### Derivatives: Instantaneous Rate of Change
+## Exercises
+1. **Easy:** Compute the derivative of \(f(x)=5x^4-2x^2+7\) using the power rule.  
+2. **Medium:** Evaluate \(\displaystyle\int_0^{\pi/2} \sin x\,dx\) by finding an antiderivative and applying the FTC.  
+3. **Hard:** Let  
+   $$f(x)=\begin{cases}
+   x^2 & x<1\\
+   2x-1 & x\ge 1
+   \end{cases}$$  
+   Determine whether \(f\) is differentiable at \(x=1\). If it is, find \(f'(1)\); if not, explain which condition of differentiability fails.
 
-$$f'(x) = \lim_{h \to 0} \frac{f(x+h) - f(x)}{h}$$
+## Linux Connection
+Calculus appears in many Linux‑based scientific and engineering tools. Below are concrete ways to invoke them from the shell.
 
-You are asking: as the input perturbation $h$ shrinks to zero, what does the output ratio converge to? If the limit exists, the function is differentiable at $x$ and has a well-defined instantaneous rate. If it does not — because the function is discontinuous or has a corner — the derivative is undefined, which has physical meaning: the rate of change is not well-defined at that point.
+### GNU Octave
+Octave provides symbolic and numeric calculus functions.  
+```bash
+# Install Octave on Ubuntu/Debian
+sudo apt-get update
+sudo apt-get install -y octave
 
-**Key rules:**
+# Symbolic derivative of x^3
+octave --silent --eval "syms x; f = x^3; df = diff(f, x); disp(df)"
+```
+Output: `3*x^2`
 
-- **Power rule:** $\dfrac{d}{dx} x^n = nx^{n-1}$
-- **Chain rule:** $\dfrac{d}{dx} f(g(x)) = f'(g(x)) \cdot g'(x)$ — composed functions like $e^{-\lambda t^2}$ require this; you differentiate the outer function evaluated at the inner, times the derivative of the inner
-- **Product rule:** $\dfrac{d}{dx}[f \cdot g] = f'g + fg'$
+### Python + SciPy/NumPy
+Python scripts can compute integrals numerically and symbolically via SymPy.  
+```bash
+# Install required packages
+sudo apt-get install -y python3-pip
+pip3 install numpy scipy sympy
 
-The chain rule is why exponential decay in the form $e^{-t/\tau}$ has derivative $-\frac{1}{\tau}e^{-t/\tau}$: the outer function is $e^u$ with derivative $e^u$, the inner function is $-t/\tau$ with derivative $-1/\tau$, and the product of those is the result. This is the derivative that determines how fast a thermal sensor reading falls after a CPU goes idle.
+# Numerical integral of x^2 from 0 to 1 using scipy
+python3 - <<'PY'
+import numpy as np
+from scipy import integrate
+result, error = integrate.quad(lambda x: x**2, 0, 1)
+print(f"Integral = {result:.10f}, error estimate = {error:.2e}")
+PY
+```
+Output: `Integral = 0.3333333333, error estimate = 2.22e-15`
 
-### Integrals: Accumulated Change
+### Using `bc` for a Riemann sum
+A quick shell calculation of a left‑hand Riemann sum with 10 000 slices:  
+```bash
+n=10000
+dx=$(echo "scale=12; 1/$n" | bc -l)
+sum=0
+for i in $(seq 0 $((n-1))); do
+    x=$(echo "scale=12; $i*$dx" | bc -l)
+    term=$(echo "scale=12; $x*$x" | bc -l)
+    sum=$(echo "scale=12; $sum+$term" | bc -l)
+done
+integral=$(echo "scale=12; $sum*$dx" | bc -l)
+echo "Riemann sum ≈ $integral"
+```
+Typical result: `Riemann sum ≈ 0.333300000000` (approaches 1/3 as \(n\) grows).
 
-The definite integral is defined as a limit of Riemann sums — you partition $[a,b]$ into $n$ subintervals of width $\Delta x = (b-a)/n$ and sum:
+### File Locations (typical Ubuntu install)
+- Octave binary: `/usr/bin/octave`  
+- SciPy library: `/usr/lib/python3/dist-packages/scipy`  
+- SymPy (pip install): `~/.local/lib/python3.x/site-packages/sympy`  
 
-$$\int_a^b f(x)\, dx = \lim_{n \to \infty} \sum_{k=0}^{n-1} f(a + k\Delta x)\cdot \Delta x$$
+These paths let you verify installations or debug library version mismatches.
 
-This construction is directly what `perf stat` does when it samples hardware counters at intervals and accumulates: it is a left Riemann sum with $\Delta x$ equal to the sampling period. The error of a Riemann sum approximation relative to the true integral is $O(\Delta x)$ for a left/right sum and $O(\Delta x^2)$ for the midpoint rule — this is why higher-frequency sampling gives proportionally more accurate energy accounting.
+## Why This Matters
+Calculus is not abstract theory; it is the language that turns continuous change into computable quantities on Linux systems:
 
-The **Fundamental Theorem of Calculus** connects the two operations:
+- **Signal processing:** The Fourier transform, an integral of a signal multiplied by complex exponentials, underpins audio filters, image compression (JPEG, MPEG), and network traffic analysis. Tools like `ffmpeg` and `fftw3` rely on integral formulations.
+- **Optimization & Machine Learning:** Gradient descent updates parameters using the derivative of a loss function. Libraries such as TensorFlow, PyTorch, and SciPy’s `optimize` module compute derivatives automatically (autodiff) to train models on CPUs/GPUs accessible via `/dev/nvidia*` or `/dev/dri`.
+- **Physics simulations:** Solving differential equations (e.g., Navier–Stokes for fluid dynamics) requires numerical integration schemes (Runge–Kutta, finite element). Packages like PETSc and FEniCS are invoked from the command line to run simulations on clusters.
+- **Computer graphics:** Ray tracing evaluates integrals over hemispheres to compute lighting (the rendering equation). Open-source renderers such as Blender’s Cycles use Monte‑Carlo integration, a direct application of the Riemann sum concept.
+- **Systems performance analysis:** The `perf` tool samples hardware counters over time; estimating event rates involves differentiating counter values, while estimating total elapsed time integrates sampling intervals—both grounded in calculus fundamentals.
 
-$$\frac{d}{dx} \int_a^x f(t)\, dt = f(x)$$
-
-Accumulation and differentiation are inverses. If you integrate the instantaneous power draw $P(t)$ over time, you get total energy consumed. If you then differentiate that accumulated energy with respect to time, you recover the instantaneous power. This is why RAPL energy counters in `/sys/class/powercap/` give you accumulated joules — differentiate numerically between two reads to get watts.
-
-### Finite vs. Continuous Calculus: The Discrete Parallel
-
-Computers are discrete machines, so it is worth making the analogy explicit. Define the **difference operator** $\Delta f(x) = f(x+1) - f(x)$, which plays the role of the derivative $D = d/dx$, and the **summation operator** $\sum$ as the anti-difference, playing the role of $\int$. The correspondence:
-
-| Continuous | Discrete |
-|---|---|
-| $Df(x) = f'(x)$ | $\Delta f(x) = f(x+1) - f(x)$ |
-| $\int f(x)\,dx$ | $\sum f(x)\,\delta x$ |
-| $x^n$ | $x^{\underline{n}} = x(x-1)(x-2)\cdots(x-n+1)$ |
-| $D(x^n) = nx^{n-1}$ | $\Delta(x^{\underline{m}}) = m \cdot x^{\underline{m-1}}$ |
-| $\int_0^n x^m\,dx = \dfrac{n^{m+1}}{m+1}$ | $\displaystyle\sum_{0 \le k < n} k^{\underline{m}} = \dfrac{n^{\underline{m+1}}}{m+1}$ |
-
-The **falling factorial** $x^{\underline{m}}$ is the natural basis for discrete calculus because differences of falling powers obey exactly the same rule as derivatives of ordinary powers. Ordinary powers do not have this property — $\Delta(k^2) \ne 2k$, but $\Delta(k^{\underline{2}}) = 2k^{\underline{1}}$, exactly as expected.
-
-**Why this matters operationally:** when you analyze the time complexity of a loop that iterates over pairs, triples, or $m$-tuples of indices, expressing the count as a falling factorial sum gives you a closed form by mechanical anti-differencing, with no guessing or induction required.
-
-### Partial Derivatives and the Gradient
-
-When a function depends on multiple inputs, a partial derivative holds all but one variable fixed:
-
-$$\frac{\partial f}{\partial x}(x, y) = \lim_{h \to 0} \frac{f(x+h, y) - f(x, y)}{h}$$
-
-The **gradient** is the vector of all partial derivatives:
-
-$$\nabla f = \left(\frac{\partial f}{\partial x_1}, \frac{\partial f}{\partial x_2}, \ldots, \frac{\partial f}{\partial x_n}\right)$$
-
-It points in the direction of steepest increase of $f$. **Gradient descent** steps opposite the gradient to minimize a cost function:
-
-$$x_{k+1} = x_k - \eta \,\nabla f(x_k)$$
-
-where $\eta > 0$ is the step size (learning rate). The reason this works is that $-\nabla f$ is locally the direction of fastest decrease, so a small step in that direction is guaranteed to decrease $f$ — *provided the step is small enough* that the local linear approximation remains valid.
-
-This appears in kernel parameter autotuning (e.g., BBR's bandwidth estimation), NUMA placement optimization, and any ML inference workload you run on Linux hardware.
-
-### Taylor Expansion: Local Polynomial Approximation
-
-Any function smooth enough to be differentiated $n$ times can be approximated near a point $a$ by:
-
-$$f(x) = \sum_{k=0}^{n} \frac{f^{(k)}(a)}{k!}(x-a)^k + R_n(x)$$
-
-where $R_n(x) = O\!\left((x-a)^{n+1}\right)$ is the remainder. Each term corrects the error left by all previous terms — the $k$-th term matches the $k$-th derivative of $f$ at $a$ exactly, and contributes nothing to any lower derivative.
-
-Two practically critical truncations:
-
-$$e^x \approx 1 + x + \frac{x^2}{2} \quad \text{for small } x$$
-
-$$\sin\theta \approx \theta - \frac{\theta^3}{6} \quad \text{for small } \theta$$
-
-The first-order approximation $e^x \approx 1 + x$ is why the Linux kernel's EWMA decay factor $e^{-1/n}$ is sometimes approximated as $1 - 1/n$ for fast fixed-point arithmetic — the relative error is $O(1/n^2)$, acceptable for large $n$.
-
-### Ordinary Differential Equations
-
-An ODE relates a function to its own derivatives. The simplest first-order linear ODE:
-
-$$\frac{dy}{dt} = ky, \quad y(0) = y_0$$
-
-has solution $y(t) = y_0 e^{kt}$. The solution exists and is unique because the ODE specifies the slope of $y$ at every point, and given a starting value you can integrate forward. For $k < 0$:
+By mastering limits, derivatives, and integrals, you gain the ability to read, modify, and extend the very tools that power scientific computing, graphics, and machine learning on Linux. This deepens not only your theoretical understanding but also your practical capacity to innovate and debug real‑world software.

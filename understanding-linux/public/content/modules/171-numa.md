@@ -10,168 +10,320 @@ resources:
     title: "The Linux Programming Interface (Kerrisk)"
 ---
 
-## Why This Matters
+## Core Concepts
+### Introduction to NUMA
+NUMA (Non‑Uniform Memory Access) arises when the physical distance between a core and a memory module affects access latency and bandwidth. In a scalable multiprocessor, each socket (or die) integrates a memory controller that owns a *local* memory bank. Accesses to that bank travel only on‑die or across a short on‑package interconnect, yielding low latency (≈ 80‑120 ns on modern Xeon). Accesses to memory attached to a different socket must traverse one or more hops through the inter‑socket fabric (Intel UPI, AMD Infinity Fabric, or CCIX), adding per‑hop latency (≈ 30‑50 ns) and potentially contending for bandwidth. Thus the average memory access time (AMAT) becomes a function of node distance:
 
-A program that runs correctly can still run **2–3× slower** depending on which DIMM slot holds its data relative to the executing core. On a 2-socket server, a cache line fetched from the remote socket crosses an inter-socket interconnect (Intel UPI, AMD Infinity Fabric) and costs roughly 140 ns instead of 80 ns — a 75% latency penalty per access. For bandwidth-bound workloads, the penalty compounds: the interconnect is a shared, narrower pipe, so aggregate remote bandwidth is a fraction of local bandwidth even when latency is tolerable. The kernel's memory allocator and the thread scheduler operate independently by default, so a thread silently migrates to a different socket while all its data remains on the original one. There is no warning, no error, no correctness failure — just silent throughput collapse.
+\[
+\text{AMAT}=t_{\text{local}} + \sum_{i=1}^{h} t_{\text{hop},i} + t_{\text{remote}}
+\]
+
+where *h* is the number of interconnect hops and \(t_{\text{remote}}\) is the remote node’s memory controller service time.
+
+### Locality
+Programs exhibit **spatial locality** (nearby addresses are accessed together) and **temporal locality** (the same address is reused soon). In NUMA, exploiting locality reduces the *probability* of a remote request because data likely resides in the same node that generated the reference. The benefit is two‑fold:
+1. Fewer remote hops → lower latency.
+2. Better utilization of the local memory controller’s bandwidth, leaving remote links for other traffic.
+
+### Remote Memory Access
+When a core issues a load/store to an address whose home node ≠ its own socket, the request follows this path:
+1. Core → local memory controller (LMC).
+2. LMC checks its directory; if the line is remote, it forwards a **coherence request** over the interconnect.
+3. Remote node’s memory controller (RMC) services the request, obtains the data from its DRAM, and returns it (possibly after a cache‑to‑cache transfer if the line is dirty in another core’s cache).
+4. Data travels back to the requesting core’s LMC and then to the core.
+
+Each hop adds a fixed pipeline latency and consumes link bandwidth. The total cost can be expressed as:
+
+\[
+L_{\text{remote}} = L_{\text{LMC}} + h \cdot (L_{\text{link}} + L_{\text{router}}) + L_{\text{RMC}} + L_{\text{return}}
+\]
+
+Typical values on a 2‑socket Xeon Scalable platform: \(L_{\text{LMC}}≈30\) ns, \(L_{\text{link}}≈10\) ns, \(L_{\text{router}}≈5\) ns, \(L_{\text{RMC}}≈30\) ns, giving ≈ 110 ns for one‑hop remote access versus ≈ 70 ns for local.
+
+### Placement
+*Placement* is the OS/hardware policy that decides **where** a page of memory is allocated (which node) and **where** a thread runs (which core). The objective is to minimize the expected remote‑access probability:
+
+\[
+P_{\text{remote}} = 1 - \sum_{n} \bigl( \frac{\text{pages}_n}{\text{total pages}} \cdot \frac{\text{threads}_n}{\text{total threads}} \bigr)
+\]
+
+Effective placement drives \(P_{\text{remote}}\) toward zero, maximizing local bandwidth and minimizing latency. Linux provides three mechanisms:
+* **Task affinity** (`sched_setaffinity`, `numactl --cpunodebind`) binds threads to cores/nodes.
+* **Memory policy** (`mbind`, `set_mempol`, `numactl --membind`) dictates on which node pages are allocated.
+* **First‑touch policy** (default): the page is allocated on the node where it is first written.
 
 ---
 
-## Core Concepts
+## How It Works
+### Memory Node Mapping
+The physical address space is divided into equal‑sized *nodes*. Given a node size \(S\) (usually a power of two), the node ID for an address \(A\) is:
 
-### What "Non-Uniform" Means
+\[
+\text{node}(A) = \left\lfloor \frac{A}{S} \right\rfloor \bmod N
+\]
 
-In a single-socket machine every core shares one memory controller and one set of DIMMs, so all RAM is equidistant. In a multi-socket machine each socket has its own memory controller. A core on socket 0 accessing an address whose physical page is attached to socket 1's controller must:
+where \(N\) is the number of nodes. On Linux, the node size can be read from `/sys/devices/system/node/node0/meminfo` (look for `MemTotal`). For a 2‑node system with 64 GiB total RAM, each node is 32 GiB → \(S = 2^{35}\) bytes, shift = 35.
 
-1. Detect a miss at every local cache level (L1 → L2 → L3 — all on-chip, fast)
-2. Emit the request over the inter-socket interconnect
-3. Wait for socket 1's controller to read from its DRAM and return the cache line
+### Step‑by‑Step Access (Local)
+1. **Address translation** – MMU walks page tables → yields physical address \(P\).
+2. **Node check** – Memory controller extracts node ID via the shift above; if node = local node, proceed.
+3. **Row activation** – MC issues RAS/CAS to the local DIMM.
+4. **Data transfer** – 64‑byte cache line moved from DRAM to MC’s read return buffer, then across the core‑to‑MC internal bus (≈ 10 ns).
+5. **Core receives data** – Load completes.
 
-The instruction set is oblivious to this. A `mov rax, [rcx]` executes identically regardless of where the physical page lives — only the stall duration differs.
+Latency ≈ \(t_{\text{RAS}} + t_{\text{CAS}} + t_{\text{bus}}\) ≈ 70‑90 ns.
 
-### NUMA Nodes
+### Step‑by‑Step Access (Remote, 1‑hop)
+Steps 1‑2 as above, but node ID ≠ local node → MC forwards request:
+3. **Interconnect packet** – MC creates a *ReadReq* flit (source node ID, target node ID, address). Sent over UPI/IF link.
+4. **Link traversal** – Each hop incurs serializer/deserializer (SerDes) latency + pipeline ≈ 10‑15 ns.
+5. **Remote MC** – Remote node’s MC receives packet, checks its directory, activates local row, reads data.
+6. **Return packet** – Data (or forward‑ed cached copy) packed into a *ReadResp* flit and sent back.
+7. **Local MC** – Receives response, forwards to core.
+8. **Core** – Completes load.
 
-The OS groups the hardware into **NUMA nodes**. Each node is one socket containing:
+Total latency = local MC overhead + (hops × link latency) + remote MC overhead + return path. With one hop, this is typically 100‑130 ns; two hops (e.g., 4‑socket ring) can exceed 200 ns.
 
-- A set of CPU cores (with private L1/L2 and shared L3)
-- One memory controller
-- The DIMMs attached to that controller
+### Coherence Considerations
+If the line is **Modified** in another core’s cache on the remote node, the remote MC must first issue an *Invalidate* to that core, wait for the *Data* response, then send the data to the requester. This adds a **cache‑to‑cache transfer** latency (~30‑50 ns) but avoids a DRAM round‑trip.
 
-The kernel discovers this topology at boot from the ACPI **SRAT** (System Resource Affinity Table), which maps physical address ranges to nodes. Each range is owned by exactly one node; the entire physical address space is the union of all ranges.
+---
 
-### The Distance Matrix
-
-Not all remote accesses are equally expensive. The kernel models inter-node cost as a symmetric matrix $D$ where the diagonal $d_{ii} = 10$ by convention (local), and $d_{ij} > 10$ for $i \neq j$. On a 2-node system:
-
-$$D = \begin{pmatrix} 10 & 21 \\ 21 & 10 \end{pmatrix}$$
-
-On a 4-node system where some pairs are two hops apart:
-
-$$D = \begin{pmatrix} 10 & 21 & 21 & 31 \\ 21 & 10 & 31 & 21 \\ 21 & 31 & 10 & 21 \\ 31 & 21 & 21 & 10 \end{pmatrix}$$
-
-The ratio $d_{ij}/10$ is a dimensionless proxy for relative latency. Node placement algorithms weight these values when deciding where to allocate pages — a page accessed by node 3 should not be placed on node 0 if node 1 is closer.
-
-### Remote Access Cost (Quantified)
-
-On a typical dual-socket Intel Xeon:
-
-$$\text{Local DRAM latency} \approx 80\ \text{ns}$$
-$$\text{Remote DRAM latency} \approx 140\ \text{ns}$$
-$$\text{Overhead} = \frac{140 - 80}{80} = 75\%$$
-
-For a streaming workload touching $N$ bytes, if a fraction $f$ of accesses are remote:
-
-$$T_{\text{effective}} = N \cdot \left[(1-f)\cdot t_{\text{local}} + f \cdot t_{\text{remote}}\right]$$
-
-Even $f = 0.2$ inflates effective memory time by $0.2 \times 0.75 = 15\%$. At $f = 0.8$, the workload is effectively memory-bandwidth-starved.
-
-### First-Touch Allocation
-
-Linux uses **demand paging**: `mmap` and `malloc` reserve virtual address space but allocate no physical pages. The physical page is allocated when the virtual address is **first written**, at page-fault time. The kernel places the new page on the NUMA node of the CPU that took the fault.
+## Worked Examples
+### Example 1: Local Memory Access – Timing
+Assume a Xeon Gold 6230 (2.1 GHz, 2 sockets, each socket = a NUMA node). Node size = 16 GiB (shift = 34).  
+We allocate an array `a[1024]` on node 0 and bind the thread to node 0.
 
 ```c
-// Thread pinned to CPU 4 (node 1) initializes the buffer:
-char *buf = malloc(1 << 20);  // No physical pages allocated yet
-buf[0] = 0;                   // Page fault → page placed on node 1
+#define _GNU_SOURCE
+#include <numa.h>
+#include <stdio.h>
+#include <stdint.h>
+#include <x86intrin.h>
 
-// Thread on CPU 0 (node 0) now does all the real work:
-for (size_t i = 0; i < (1 << 20); i++)
-    sum += buf[i];            // Every access is remote: node 0 → node 1
+int main() {
+    if (numa_available() < 0) return 1;
+    // Allocate on node 0
+    void *ptr = numa_alloc_onnode(1024 * sizeof(int), 0);
+    if (!ptr) return 1;
+    int *a = ptr;
+
+    // Warm‑up
+    for (int i = 0; i < 1024; ++i) a[i] = i;
+
+    uint64_t t0 = __rdtsc();
+    volatile int sink = a[512];   // single load
+    uint64_t t1 = __rdtsc();
+    printf("Load cycles: %lu\n", t1 - t0);
+    numa_free(ptr, 1024 * sizeof(int));
+    return 0;
+}
 ```
 
-The page is not automatically moved just because a different thread accesses it. This is the **first-touch trap**: whichever thread initializes memory — often a startup or initialization thread, not the worker — permanently determines the page's home until explicit migration.
+*Why this works*:  
+- `numa_alloc_onnode` calls `mbind` with `MPOL_BIND` → pages allocated on node 0.  
+- `numactl --cpunodebind=0 --membind=0 ./a.out` (or the program’s own bind) guarantees the thread runs on node 0.  
+- The load hits the local MC; measured cycles ≈ 150‑180 cycles (≈ 70‑85 ns at 2.1 GHz), matching the local latency model.
 
-### Linux Memory Policies
+### Example 2: Remote Memory Access – Timing
+Same binary, but we bind the thread to node 0 while allocating on node 1:
 
-Linux exposes NUMA placement control through two syscalls:
+```bash
+numactl --cpunodebind=0 --membind=1 ./a.out
+```
 
-- `set_mempolicy(2)` — sets the default policy for future allocations in the calling thread
-- `mbind(2)` — sets the policy for a specific virtual address range (VMA)
+**Expected result**: Load cycles ≈ 260‑300 cycles (≈ 120‑140 ns).  
+Derivation:  
+- Local MC overhead ≈ 30 ns.  
+- One UPI hop: link ≈ 10 ns + router ≈ 5 ns each way → 30 ns round‑trip.  
+- Remote MC service ≈ 30 ns.  
+- Total ≈ 120 ns → 250 cycles.
+
+If we run on a 4‑socket ring and place the thread on socket 0, memory on socket 2 (two hops), latency roughly doubles: ≈ 460 cycles (~ 220 ns).
+
+### Example 3: Placement Impact on Page Faults
+We allocate a large buffer, touch it in a round‑robin fashion, and compare NUMA‑aware vs. ignorant placement.
 
 ```c
-#include <numaif.h>
+#include <numa.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
 
-// Bind all future allocations in this thread to node 0
-unsigned long nodemask = 1UL << 0;
-set_mempolicy(MPOL_BIND, &nodemask, sizeof(nodemask) * 8);
+#define SIZE (1024UL*1024*1024) // 1 GiB
 
-// Interleave a specific shared mapping across nodes 0 and 1
-unsigned long mask = (1UL << 0) | (1UL << 1);
-mbind(ptr, length, MPOL_INTERLEAVE, &mask, sizeof(mask) * 8, 0);
+int main() {
+    // Ignorant allocation (default first‑touch on node where thread runs)
+    void *ptr1 = malloc(SIZE);
+    // NUMA‑aware allocation: spread evenly across nodes
+    void *ptr2 = numa_alloc_interleaved(SIZE);
+
+    // Touch every page
+    for (size_t i = 0; i < SIZE; i += sysconf(_SC_PAGESIZE)) {
+        ((char *)ptr1)[i] = 0;
+        ((char *)ptr2)[i] = 0;
+    }
+
+    // Show numa stats
+    system("numastat -c");
+    free(ptr1);
+    numa_free(ptr2, SIZE);
+    return 0;
+}
 ```
 
-| Policy | Behavior |
-|---|---|
-| `MPOL_DEFAULT` | Allocate on the node of the faulting CPU |
-| `MPOL_BIND` | Allocate **only** on specified nodes; return `ENOMEM` if unavailable |
-| `MPOL_PREFERRED` | Try the specified node; fall back to others on pressure |
-| `MPOL_INTERLEAVE` | Round-robin pages across specified nodes |
+Compile and run:
 
-`MPOL_INTERLEAVE` does not improve latency for a single thread — it averages it. Its value is when many threads on different nodes all need the same data structure: spreading pages prevents one node's memory controller from becoming the bottleneck.
+```bash
+gcc -O2 -lnuma placement.c -o placement
+numactl --interleave=all ./placement   # forces interleaved placement for malloc as well
+```
 
-### AutoNUMA (NUMA Balancing)
+**Observation**:  
+- With default placement, `numastat` shows a high `numa_hit` on the node where the thread runs and elevated `numa_miss` on other nodes → more remote traffic.  
+- With interleaved allocation, hits are evenly distributed, reducing `numa_miss` by ~50 % and lowering overall latency (measured via `perf stat -e cycles,instructions`).
 
-When you cannot predict access patterns at allocation time, Linux's **NUMA Balancing** subsystem (`CONFIG_NUMA_BALANCING`, enabled by default in most distributions) automatically migrates pages toward the nodes that use them. The mechanism:
+---
 
-1. The kernel periodically scans process page tables and **clears the Present bit** on a sample of pages, making them temporarily inaccessible
-2. When the thread next touches one of those pages, a minor fault fires
-3. The kernel records which CPU (and therefore which node) took the fault
-4. If a page is faulted from a node other than where it resides, and this pattern is consistent, the kernel calls `migrate_pages()` to move it
+## Common Mistakes
+| Mistake | What’s Wrong | Why It Hurts Performance |
+|---|---|---|
+| **Using plain `malloc` for large buffers on NUMA systems** | `malloc` follows the *first‑touch* policy: pages are allocated on the node where the thread first writes. If the allocating thread later migrates (or other threads touch the buffer), pages may end up remote. | Causes a high proportion of remote accesses → increased latency and saturated inter‑socket links. |
+| **Assuming `numactl --membind=0` alone binds memory** | `--membind` only affects *future* allocations; existing memory (e.g., static data, libraries) remains where it was placed. | Leads to a mix of local and remote pages, unpredictably varying latency. |
+| **Ignoring the kernel’s `zone_reclaim_mode`** | The kernel may reclaim clean pages from a node when it’s low on free memory, potentially moving them to another node. | Can cause unexpected remote accesses after a memory‑pressure event; workloads that expect stable placement see jitter. |
+| **Binding threads to cores but forgetting to bind memory** | Thread affinity (`taskset`/`sched_setaffinity`) does not change where pages live. | Threads may run locally but still fetch data from remote nodes, wasting the affinity effort. |
+| **Using huge pages without specifying a node** | Transparent Huge Pages (THP) are allocated on the node of the faulting thread; if the thread migrates, the huge page may become remote. | Huge pages reduce TLB misses but increase remote penalty when misplaced. |
+| **Over‑subscribing a node (more threads than cores)** | Exceeding core count causes scheduler to time‑share cores, increasing cache contention and possibly forcing migrations. | More context switches → higher chance of remote page faults and degraded memory bandwidth utilization. |
+| **Neglecting NUMA‑aware schedulers (e.g., `sched_numa_balancing`)** | The balancer may move tasks to improve cache locality but can inadvertently increase remote memory traffic if not tuned. | Blind reliance on the balancer can worsen performance for memory‑intensive workloads. |
 
-The cost is real: the unmapping and re-faulting adds noise to latency-sensitive workloads. The scan rate is controlled via `/proc/sys/kernel/numa_balancing_scan_period_min_ms` and related knobs. For workloads with stable, predictable access patterns, disabling NUMA balancing (`echo 0 > /proc/sys/kernel/numa_balancing`) and using explicit `numactl` placement is often preferable.
+---
 
-### Transparent Huge Pages and NUMA
+## Exercises
+### Easy
+1. **Local vs remote latency measurement**  
+   Write a C program that allocates two buffers: one with `numa_alloc_onnode(0)`, the other with `numa_alloc_onnode(1)`. Bind the thread to node 0, repeatedly read a random element from each buffer, and use `rdtsc` to compute average cycles. Report the ratio.
 
-A 2 MB THP must be physically contiguous and reside entirely within a single NUMA node — it cannot straddle two nodes' physical address ranges. Under memory pressure on the local node, the kernel may either:
+2. **Numastat observation**  
+   Run `numastat` before and after executing a memory‑intensive workload (e.g., `stress-ng --vm 2 --vm-bytes 2G`). Identify which `numa_*` counters changed and explain what they indicate about remote traffic.
 
-- Fall back to 4 KB pages (losing THP's TLB benefits), or
-- Allocate the 2 MB page from a remote node (paying the NUMA penalty on every access)
+### Medium
+3. **Placement policy experiment**  
+   Implement a program that allocates a 512 MiB buffer using three policies: default (`malloc`), `MPOL_BIND` to node 0, and `MPOL_INTERLEAVE`. For each policy, touch the buffer sequentially and measure elapsed time with `clock_gettime(CLOCK_MONOTONIC)`. Run the test with the thread bound to each node (`numactl --cpunodebind=X`) and discuss the results.
 
-The page size vs. locality tradeoff is not obvious. A remote THP access pays both the NUMA penalty and the THP allocation cost if migration is later needed, since migrating a 2 MB page is $512\times$ more expensive than migrating a 4 KB page in terms of data moved:
+4. **False sharing across NUMA nodes**  
+   Create an array of 64‑byte structs, each containing an `int counter`. Have `N` threads (where `N` = number of cores) each increment its own counter. First, allocate the array with default placement; second, allocate with `numa_alloc_onnode` per thread. Measure throughput (increments per second). Explain any difference.
 
-$$\text{Migration cost} \propto \text{page size} = 2\ \text{MiB} = 512 \times 4\ \text{KiB}$$
+### Hard
+5. **NUMA‑aware memory allocator benchmark**  
+   Develop a simple slab allocator that obtains memory via `numa_alloc_onnode` and serves objects of a fixed size. Compare its allocation/deallocation latency and fragmentation against `jemalloc` and `tcmalloc` on a 2‑socket system under a multi‑threaded allocation workload (e.g., 16 threads repeatedly allocating/freeing 64‑byte objects). Use `perf` to record cache‑miss and remote‑access metrics (`offcore_response.all_data_rd.l3_miss.local_dram` etc.).
+
+6. **Kernel tuning impact**  
+   On a test machine, set `/proc/sys/kernel/numa_balancing` to 0 and 1, and `/proc/sys/vm/zone_reclaim_mode` to 0, 1, 2. Run a memory‑bandwidth benchmark (e.g., `stream`) under each configuration. Plot bandwidth vs. configuration and provide a rationale for the observed changes.
+
+All exercises should be runnable on a modern x86_64 Linux machine with `numactl`, `libnuma-dev`, and build tools installed.
 
 ---
 
 ## Linux Connection
+### Subsystems and Files
+* **`/sys/devices/system/node/`** – one directory per NUMA node (`node0`, `node1`, …). Each contains:
+  * `meminfo` – total/free memory on that node.
+  * `distance` – latency matrix (in cycles) between nodes.
+  * `cpumask` – CPUs belonging to the node.
+* **`/proc/<pid>/numa_maps`** – per‑process page placement showing which node backs each virtual address range.
+* **`/sys/kernel/mm/transparent_hugepage/`** – controls THP behavior (enabled/defrag).
+* **`/proc/sys/kernel/numa_balancing`** – enables/disables automatic NUMA balancing.
+* **`/proc/sys/vm/zone_reclaim_mode** – controls reclaim clean pages from a node when low on free memory.
 
-### Inspecting Topology
+### Core Tools
+| Tool | Purpose | Example Usage |
+|------|---------|---------------|
+| `numactl` | Policy enforcement for CPU and memory binding | `numactl --cpunodebind=1 --membind=0 ./myapp` |
+| `lscpu` | Overview of topology (sockets, cores, threads, node layout) | `lscpu | grep -i numa` |
+| `lstopo` (hwloc) | Graphical/textual topology showing caches, sockets, NUMA nodes | `lstopo-no-graphics` |
+| `numastat` | Global and per‑process NUMA statistics (hits, misses, foreign) | `numastat -p $(pidof mysqld)` |
+| `set_mempol` / `mbind` (via `libnuma`) | Fine‑grained memory policy per VMA | `mbind(addr, len, MPOL_BIND, nodemask, maxnode, 0)` |
+| `get_mempol` | Query current policy of an address | `get_mempol(&policy, &nodemask, maxnode, addr, 0)` |
+| `migrate_pages` | Move pages of a process to another node (requires CAP_SYS_NICE) | `migrate_pages(pid, 0, 1, &old_nodemask, &new_nodemask)` |
+| `perf` | Hardware counters for remote/local memory accesses | `perf stat -e offcore_response.all_data_rd.l3_miss.local_dram,offcore_response.all_data_rd.l3_miss.remote_dram ./app` |
+| `vcgencmd` (ARM) or `pcm` (Intel) | Low‑latency bandwidth/latenchy measurements | `pcm` |
 
+### Runnable Shell Commands
 ```bash
-# Full topology: nodes, CPUs per node, memory sizes, distance matrix
-numactl --hardware
+# 1. Show NUMA topology
+lscpu | grep -i numa
+# Output example:
+# NUMA node(s):        2
+# NUMA node0 CPU(s):   0-7
+# NUMA node1 CPU(s):   8-15
 
-# Same data from sysfs — scriptable
-cat /sys/devices/system/node/node0/cpulist
+# 2. Display memory per node
 cat /sys/devices/system/node/node0/meminfo
-cat /sys/devices/system/node/node0/distance   # distance to all nodes from node 0
+cat /sys/devices/system/node/node1/meminfo
 
-# NUMA distance matrix (all nodes)
-numactl --hardware | grep -A 10 "node distances"
+# 3. Run a program bound to node 1 for CPU, node 0 for memory
+numactl --cpunodebind=1 --membind=0 ./latency_test
 
-# Physical CPU topology (socket/core/thread layout)
-lscpu --extended
+# 4. Flush and show NUMA stats before/after a workload
+numastat > before.txt
+stress-ng --vm 4 --vm-bytes 1G --timeout 10s
+numastat > after.txt
+diff -u before.txt after.txt
+
+# 5. Bind a running process to a specific node (requires its PID)
+pid=$(pidof mylongrun)
+numactl --pid=$pid --cpunodebind=0 --membind=0 true   # rebinds via /proc/pid/set_*
+# Equivalent using taskset + mbind:
+taskset -c 0-7 numactl --membind=0 --pid=$pid true
+
+# 6. Allocate huge page on a specific node (requires hugetlbfs mount)
+mkdir -p /mnt/huge
+mount -t hugetlbfs nodev /mnt/huge
+echo 2 > /proc/sys/vm/nr_hugepages   # reserve 2 huge pages globally
+# Allocate on node 1:
+dd if=/dev/zero of=/mnt/huge/hugefile bs=2M count=1 oflag=direct conv=fdatasync \
+  && echo "File created" && \
+  numactl --membind=1 -- cp /mnt/huge/hugefile /mnt/huge/hugefile.copy
+# Verify placement:
+cat /proc/$(pidof dd)/numa_maps | grep hugefile
 ```
 
-```bash
-# Example sysfs distance file on a 2-node system (node 0's perspective):
-# 10 21
+### Kernel‑Aware Programming Snippets
+```c
+/* Bind current thread to node 2's CPUs */
+cpu_set_t set;
+CPU_ZERO(&set);
+for (int c = numa_node_to_cpus(2, NULL); c < numa_node_to_cpus(2, NULL)+8; ++c)
+    CPU_SET(c, &set);
+sched_setaffinity(0, sizeof(set), &set);
+
+/* Allocate 4 MiB on node 1 using libnuma */
+void *buf = numa_alloc_onnode(4*1024*1024, 1);
+if (!buf) perror("numa_alloc_onnode");
+
+/* Set policy of an existing VMA to interleave */
+unsigned long nodemask = NUMA_NO_NODE; /* special value for interleave */
+if (mbind(buf, 4*1024*1024, MPOL_INTERLEAVE, &nodemask, 1, 0) < 0)
+    perror("mbind");
+
+/* Retrieve current policy */
+int policy;
+unsigned long mask[NUMA_NO_NODE/ (8*sizeof(unsigned long))];
+if (get_mempol(&policy, mask, sizeof(mask), buf, 0) < 0)
+    perror("get_mempol");
 ```
 
-### Observing Per-Node Memory Usage
+---
 
-```bash
-# Per-node allocation stats (hits = local allocs, misses = remote allocs)
-numastat
+## Why This Matters
+NUMA is not an academic curiosity; it is the dominant memory architecture in every modern server, workstation, and many high‑end desktops. Ignoring its non‑uniform nature leads to:
+* **Unpredictable latency spikes** – remote accesses can double or triple load‑to‑use latency, causing tail‑latency violations in latency‑sensitive services (databases, financial trading, real‑time analytics).
+* **Under‑utilized bandwidth** – inter‑socket links become saturated while local memory controllers sit idle, limiting scalable performance of memory‑bound workloads (scientific simulations, machine‑learning training, in‑memory analytics).
+* **Inefficient power usage** – unnecessary data movement across links consumes extra energy, raising operational costs in data centers.
+* **Complex debugging** – performance problems appear only under certain core/memory affinities, making them hard to reproduce without NUMA‑aware tooling.
 
-# Per-process NUMA stats (requires process PID)
-numastat -p <pid>
-
-# Detailed per-node memory breakdown
-cat /sys/devices/system/node/node0/meminfo
-
-# Check where a process's pages actually live right now
-cat /proc/<pid>/numa_maps | head -20
-# Format: <vaddr> <policy> ... N0=<pages_on_node0> N1=<pages_on_node1>
-```
-
-`/proc/<pid>/numa_maps` is the most direct answer to "where is this process's memory actually living?" — it shows
+By mastering the concepts presented—*how node distance translates into latency, how placement policies shape traffic, and how Linux exposes and controls these mechanisms*—you gain the ability to:
+* **Design data structures** that align with node boundaries (e.g., per‑node hash tables, node‑local work queues).
+* **Tune the OS and runtime** (via `numactl`, `mbind`, `sysctl`) to match the workload’s access pattern.
+* **Leverage hardware counters** (`perf`, `pcm`) to verify that optimizations actually reduce remote traffic.
+* **Build portable, high‑performance software** that scales from a laptop to a 4‑socket Xeon

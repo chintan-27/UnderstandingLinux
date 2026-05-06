@@ -10,138 +10,284 @@ resources:
     title: "Unix Network Programming (Stevens)"
 ---
 
-## Why This Matters
-
-Without layering, swapping Ethernet for Wi-Fi requires rewriting every protocol above it — your application becomes coupled to the physical medium. Without framing, a receiver seeing a raw bit stream has no mechanism to locate message boundaries; every byte is equally ambiguous. Without longest-prefix routing, networks cannot be hierarchically aggregated, and routing tables grow proportional to the number of hosts rather than the number of network blocks. Each concept eliminates a specific failure mode. Understanding which failure mode each one solves tells you more than any definition.
-
----
-
 ## Core Concepts
+### Layering and Encapsulation
+Layering exists to **decouple concerns**: each layer implements a well‑defined service for the layer above while hiding its own complexity. This enables independent evolution (e.g., replacing Ethernet with Wi‑Fi without touching IP) and facilitates reuse (the same TCP implementation runs over many link layers).  
 
-### Layering: Isolating Concerns Across a Stack
+Encapsulation is the concrete mechanism: when a layer passes data down, it **prepends a header** (and sometimes appends a trailer) that contains control information needed by the peer layer. The header size determines the **maximum payload** that can be carried without fragmentation:
 
-Layering enforces that each protocol only sees the payload of the layer directly above it — headers from other layers are opaque data. This is why a TCP implementation doesn't branch on "is this Ethernet or Wi-Fi?": from TCP's perspective, IP is IP regardless of what's underneath. The interface contract between layers is that the lower layer delivers bytes reliably enough for the upper layer's own reliability mechanisms to function (or not — UDP makes no such guarantee).
+\[
+\text{Payload}_{\text{max}} = \text{MTU} - \sum_{i=1}^{L} H_i
+\]
 
-The TCP/IP model (not OSI, which splits layers in ways that don't correspond to actual implementations):
+where \(MTU\) is the maximum transmission unit of the link layer and \(H_i\) are header sizes of layers \(L\) (e.g., Ethernet II = 14 B, IPv4 = 20 B, TCP = 20 B → payload = 1500 − 54 = 1446 B).  
 
-| Layer | Name | Protocols | Unit |
-|---|---|---|---|
-| 5 | Application | HTTP, DNS, SMTP | Message |
-| 4 | Transport | TCP, UDP | Segment / Datagram |
-| 3 | Network | IP, ICMP | Packet |
-| 2 | Link | Ethernet, Wi-Fi | Frame |
-| 1 | Physical | Cables, radio | Bits |
+If the payload exceeds this limit, the network layer must **fragment** the packet, incurring reassembly overhead and increased loss probability (a fragment loss discards the whole original packet). Hence, applications often tune their **MSS** (Maximum Segment Size) to avoid IP fragmentation:
 
-Each layer adds a header on the way down (encapsulation) and strips it on the way up (decapsulation). The payload at layer $N$ is the complete frame at layer $N-1$. An IP packet is not modified by the Ethernet layer — it is enclosed by it.
+\[
+\text{MSS} = \text{MTU} - (H_{\text{IP}} + H_{\text{TCP}})
+\]
 
-### Framing: Carving Byte Streams Into Messages
+### Framing
+At the data‑link layer, a raw bit stream is meaningless without **synchronization** and **error detection**. Framing solves both:
 
-Physical media deliver a continuous bit stream. The receiver needs two things: clock synchronization (which bit edge is a "1"?) and boundary detection (where does one frame end and the next begin?).
+* **Synchronization** – a preamble (e.g., 7 bytes of 0x55 + 0xD5 in Ethernet) lets the receiver lock onto the clock.
+* **Error detection** – a trailer containing a Frame Check Sequence (FCS), typically a CRC‑32 polynomial \(x^{32}+x^{26}+x^{23}+x^{22}+x^{16}+x^{12}+x^{11}+x^{10}+x^{8}+x^{7}+x^{5}+x^{4}+x^{2}+x+1\), lets the receiver detect any burst of up to 32‑bit errors with probability \(1-2^{-32}\).
 
-Ethernet solves both with the preamble: 7 bytes of alternating `10101010` followed by the Start Frame Delimiter `10101011`. The alternating pattern lets the receiver's PLL lock onto the sender's clock before the actual frame data arrives. After the SFD, the receiver knows exactly where byte boundaries are.
+A frame therefore consists of:
 
-End-of-frame detection is implicit: the transmitter stops driving the line, and the receiver detects the carrier drop. The CRC-32 at the tail then validates the entire frame was received intact. If the CRC fails, the frame is silently dropped at Layer 2 — no NACK, no retransmission at this layer. That's TCP's problem.
+```
+[Preamble][SFD][Dest MAC][Src MAC][Etype][Payload][FCS]
+```
 
-The minimum 64-byte frame size (header + payload, excluding preamble) is not arbitrary. On a 10 Mbps half-duplex segment with a maximum length of 2500 m, the round-trip propagation delay is approximately:
+### Packets and the Network Layer
+The network layer’s job is **host‑to‑host delivery** across heterogeneous links. It adds a logical address (IPv4/IPv6) and optionally performs fragmentation. Key fields in an IPv4 header:
 
-$$t_{prop} = \frac{2 \times 2500\,\text{m}}{2 \times 10^8\,\text{m/s}} = 25\,\mu\text{s}$$
+| Field          | Size (bits) | Purpose |
+|----------------|-------------|---------|
+| Version        | 4           | 4 for IPv4 |
+| IHL            | 4           | Header length in 32‑bit words |
+| DSCP/ECN       | 6+2         | QoS / congestion |
+| Total Length   | 16          | Entire packet size (bytes) |
+| Identification | 16          | Fragment identification |
+| Flags/Offset   | 3+13        | Fragment control |
+| TTL            | 8           | Hop limit (prevents loops) |
+| Protocol       | 8           | Upper‑layer protocol (TCP=6, UDP=17) |
+| Header Checksum| 16          | One’s‑complement sum of header |
+| Src/Dst Addr   | 32 each     | IP addresses |
+| Options        | variable    | Rarely used; padded to 32‑bit boundary |
 
-A transmitter must still be sending when a collision signal returns from the far end, otherwise it finishes transmitting before detecting the collision and has no mechanism to retransmit. At 10 Mbps, 64 bytes takes:
+The **header checksum** is recomputed at every router because TTL changes; it is a simple one’s‑complement sum that detects bit‑flips with high probability.
 
-$$t_{frame} = \frac{64 \times 8\,\text{bits}}{10 \times 10^6\,\text{bps}} = 51.2\,\mu\text{s}$$
+### Switching
+Switching moves frames **within a single broadcast domain**. Two fundamental modes:
 
-Since $51.2\,\mu\text{s} > 25\,\mu\text{s}$, the transmitter is still on the wire when the collision arrives. Drop below 64 bytes and this guarantee breaks. Modern full-duplex links have no collisions, but the minimum frame size is preserved for compatibility.
+* **Store‑and‑Forward** – the entire frame is received, CRC verified, then forwarded. Latency = frame length / link speed + processing delay. Guarantees error‑free forwarding.
+* **Cut‑Through** – forwarding begins after reading the destination address (first 14 bytes of Ethernet). Latency ≈ address length / link speed. Faster but may forward corrupt frames; modern ASICs often use **adaptive cut‑through** (switch to store‑and‑forward if error rate rises).
 
-### Packets: Independent Forwarding Units
+The choice impacts **throughput** under load. For a 1 Gbps link, storing a 1500‑byte frame adds ~12 µs of latency; cut‑through saves ~10 µs but risks retransmissions if error rate > 10⁻⁵.
 
-A packet is self-contained: it carries source and destination addresses, so every router can make a forwarding decision independently. In circuit switching, a path is reserved end-to-end before any data flows; bandwidth on that path is unavailable to other traffic even during silence. Packet switching reclaims that idle capacity.
+### Routing
+Routing determines the **next‑hop** for a packet whose destination lies outside the local link. It relies on a **routing table** populated by static configuration or dynamic protocols (RIP, OSPF, BGP). The lookup algorithm is **longest prefix match (LPM)**: among all entries where \((\text{dest} \& \text{mask}) = \text{network}\), choose the one with the largest mask (most specific route).  
 
-The cost is that packets sharing a link are multiplexed, creating queuing delay and the possibility of loss under congestion. Packets may also arrive out of order if they take different paths. TCP absorbs this with sequence numbers and a reordering buffer; UDP exposes it directly to the application.
+LPM can be implemented with a **trie** (binary or Patricia) yielding O(W) lookup where W = address width (32 for IPv4, 128 for IPv6). In Linux, the FIB (Forwarding Information Base) uses a **radix tree** (trie with path compression) for both speed and memory efficiency.
 
-### Switching: Forwarding Within a Layer-2 Domain
-
-A switch maintains a MAC address table mapping 48-bit MAC addresses to physical ports. It populates this table purely by observing source MAC addresses of incoming frames — no configuration required. When a frame arrives destined for a MAC not yet in the table, the switch **floods** it out every port except the ingress port. When the destination replies, its source MAC is learned and future frames are unicast directly.
-
-The critical property: each switch port is its own collision domain. On a hub, all ports share one collision domain — only one frame can be in flight at a time, and every host receives every frame. On a switch with $N$ full-duplex ports, you have $N$ simultaneous collision-free conversations. Aggregate throughput scales linearly with port count rather than collapsing under contention.
-
-Spanning Tree Protocol (STP) exists because switches learn by flooding and physical loops exist for redundancy — without loop prevention, a broadcast frame would circulate forever, consuming all bandwidth.
-
-### Routing: Forwarding Between Layer-3 Networks
-
-A router connects networks with distinct address spaces. The distinction from switching is not just Layer 2 vs. Layer 3 — it's that routers participate in protocols that exchange topology information across administrative boundaries (BGP) or within them (OSPF, IS-IS).
-
-On each hop, the router: verifies the IP header checksum, decrements TTL, recomputes the IP header checksum, looks up the destination in its routing table via longest-prefix match, rewrites the Ethernet frame's destination MAC to the next-hop's MAC, and decrements nothing in the TCP/UDP header (that's end-to-end). The IP payload — TCP segment, UDP datagram — is never modified by a router under normal operation.
-
----
+The routing table also stores the **preference** (admin distance) and **metrics** (e.g., OSPF cost). When multiple protocols supply routes for the same prefix, the lowest admin distance wins; ties are broken by metric.
 
 ## How It Works
+### End‑to‑End Data Flow (TCP Example)
+1. **Application** – data is written to a socket; TCP segments it according to MSS.
+2. **Transport (TCP)** – adds a TCP header (seq/ack, window, flags, checksum). The checksum includes a **pseudo‑header** (src/dst IP, zero, protocol, TCP length) to bind the segment to the IP layer, providing end‑to‑end error detection.
+3. **Network (IP)** – encapsulates the segment in an IP header, performs fragmentation if needed (unlikely if MSS respected). The IP header’s TTL is set (commonly 64).
+4. **Data Link (Ethernet)** – builds a frame: preamble, SFD, MAC addresses, EtherType (0x0800 for IPv4), payload (the IP packet), FCS. The frame is handed to the NIC driver.
+5. **Physical** – NIC encodes bits (e.g., NRZ for copper, PAM‑4 for 10GBASE‑R) and transmits onto the medium.
 
-### Encapsulation Down the Stack
+At each hop, routers repeat steps 3‑5: they **de‑encapsulate** to IP, decrement TTL, recompute header checksum, look up next hop via LPM, then re‑encapsulate into a new link‑layer frame appropriate for the outgoing interface.
 
-```
-[Application] "GET / HTTP/1.1\r\nHost: example.com\r\n\r\n"
-[Transport]   [ TCP hdr | HTTP data          ]
-[Network]     [ IP hdr  | TCP hdr | HTTP data               ]
-[Link]        [ Eth hdr | IP hdr  | TCP hdr  | HTTP data | CRC ]
-```
+### Timing and Bandwidth‑Delay Product
+The **bandwidth‑delay product (BDP)** quantifies how many bits can “fill the pipe”:
 
-The Ethernet header contains the MAC addresses of the two directly connected interfaces (not the ultimate source and destination). These MAC addresses are rewritten at every router hop. The IP addresses in the IP header are not rewritten (in the absence of NAT). This is why `tcpdump` on a transit router shows your IP but the router's own MAC as the source.
+\[
+\text{BDP} = \text{Bandwidth} \times \text{RTT}
+\]
 
-### Ethernet Frame Layout
+For a 100 Mbps link with 30 ms RTT, BDP = 3 Mbit ≈ 375 KB. If the TCP receive window is smaller than BDP, the link is underutilized. Linux exposes the window via `/proc/sys/net/ipv4/tcp_rmem` (min, default, max). Adjusting `tcp_window_scaling` (option `SO_SNDBUF`/`SO_RCVBUF`) allows windows > 64 KB.
 
-```
-Offset  Size    Field
-0       7       Preamble (0xAA AA AA AA AA AA AA)
-7       1       SFD (0xAB)
-8       6       Destination MAC
-14      6       Source MAC
-20      2       EtherType (0x0800=IPv4, 0x86DD=IPv6, 0x0806=ARP)
-22      46–1500 Payload
-22+N    4       CRC-32
-```
+### Congestion Control (High‑Level)
+TCP’s congestion avoidance approximates **additive increase/multiplicative decrease (AIMD)**:
 
-The EtherType field doubles as a length field in 802.3 framing when its value is ≤ 1500 — a design artifact from before Ethernet II was standardized. Values above `0x05DC` are always EtherTypes. The Linux kernel's `net/ethernet.h` defines these:
+* On each ACK (no loss): increase cwnd by \( \frac{1}{\text{cwnd}} \) MSS → roughly linear growth.
+* On loss (triple duplicate ACK or timeout): set cwnd = cwnd/2 (or 1 MSS on timeout).
 
+This yields a saw‑tooth whose average throughput approximates:
+
+\[
+\text{Throughput} \approx \frac{\text{MSS}}{\text{RTT} \sqrt{2p/3}}
+\]
+
+where \(p\) is packet loss probability (Mathis formula). Understanding this explains why lossy wireless links severely limit TCP performance.
+
+## Worked Examples
+### Example 1: Sending a TCP Packet via the Socket API
 ```c
-#include <linux/if_ether.h>
+/* tcp_send.c – send a 1000‑byte buffer to 8.8.8.8:80 */
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <sys/socket.h>
+#include <netinet/in.h>
+#include <arpa/inet.h>
+#include <netinet/tcp.h>   /* for TCP_NODELAY */
 
-/* EtherType constants */
-#define ETH_P_IP    0x0800  /* IPv4 */
-#define ETH_P_IPV6  0x86DD  /* IPv6 */
-#define ETH_P_ARP   0x0806  /* ARP  */
+int main(void) {
+    int sockfd = socket(AF_INET, SOCK_STREAM, 0);
+    if (sockfd < 0) {
+        perror("socket");
+        return 1;
+    }
 
-/* struct ethhdr from include/uapi/linux/if_ether.h */
-struct ethhdr {
-    unsigned char   h_dest[ETH_ALEN];    /* 6 bytes: destination MAC */
-    unsigned char   h_source[ETH_ALEN];  /* 6 bytes: source MAC      */
-    __be16          h_proto;             /* EtherType / length        */
-} __attribute__((packed));
+    /* Disable Nagle’s algorithm for low‑latency demo */
+    int flag = 1;
+    setsockopt(sockfd, IPPROTO_TCP, TCP_NODELAY, &flag, sizeof(flag));
+
+    struct sockaddr_in serv = {0};
+    serv.sin_family = AF_INET;
+    serv.sin_port   = htons(80);          /* HTTP */
+    if (inet_pton(AF_INET, "8.8.8.8", &serv.sin_addr) <= 0) {
+        perror("inet_pton");
+        close(sockfd);
+        return 1;
+    }
+
+    if (connect(sockfd, (struct sockaddr *)&serv, sizeof(serv)) < 0) {
+        perror("connect");
+        close(sockfd);
+        return 1;
+    }
+
+    const size_t payload_len = 1000;
+    char *payload = calloc(1, payload_len);
+    if (!payload) { perror("calloc"); close(sockfd); return 1; }
+    /* Fill with a known pattern for later verification */
+    for (size_t i = 0; i < payload_len; ++i) payload[i] = (char)(i & 0xFF);
+
+    ssize_t sent = send(sockfd, payload, payload_len, 0);
+    if (sent != (ssize_t)payload_len) {
+        perror("send");
+        free(payload);
+        close(sockfd);
+        return 1;
+    }
+    printf("Sent %zd bytes\n", sent);
+
+    free(payload);
+    close(sockfd);
+    return 0;
+}
 ```
+**Explanation of steps**
 
-The kernel's `skb` (socket buffer, `struct sk_buff` in `include/linux/skbuff.h`) tracks head, data, tail, and end pointers. Encapsulation is `skb_push()` (moves `data` pointer back, "prepending" a header without copying); decapsulation is `skb_pull()`. No data is copied between layers — only pointers move.
+1. `socket(AF_INET, SOCK_STREAM, 0)` creates a TCP endpoint (returns file descriptor).  
+2. `setsockopt(..., TCP_NODELAY, ...)` disables the Nagle algorithm; without it, TCP would buffer small writes to improve efficiency, adding latency unsuitable for this demonstration.  
+3. `inet_pton` converts the dotted‑decimal address to binary network order (big‑endian).  
+4. `connect` performs the three‑way handshake (SYN, SYN‑ACK, ACK) – the kernel exchanges SYN packets with sequence numbers chosen randomly (RFC 793 §3.3).  
+5. `send` copies the user buffer into kernel socket buffers, then TCP adds its header (20 B) and calculates the checksum over the TCP segment + pseudo‑header. The resulting IP packet is passed to `ip_queue_xmit`, which adds the IPv4 header (20 B) and hands the frame to the NIC driver (`dev_queue_xmit`).  
+6. The NIC driver builds the Ethernet frame, appends the FCS, and transmits via the PHY.
 
-### IPv4 Header
-
-```c
-#include <linux/ip.h>
-
-struct iphdr {
-    __u8    ihl:4,        /* header length in 32-bit words (min 5 = 20 bytes) */
-            version:4;    /* always 4 for IPv4                                 */
-    __u8    tos;          /* DSCP / ECN                                        */
-    __be16  tot_len;      /* total length including header                     */
-    __be16  id;           /* fragment identification                           */
-    __be16  frag_off;     /* fragment offset + flags                           */
-    __u8    ttl;          /* decremented at each hop; drop at 0                */
-    __u8    protocol;     /* 6=TCP, 17=UDP, 1=ICMP                             */
-    __sum16 check;        /* one's-complement checksum of header only          */
-    __be32  saddr;        /* source IP                                         */
-    __be32  daddr;        /* destination IP                                    */
-};
+**Validation** – On another terminal run:
+```bash
+sudo tcpdump -i eth0 -nn -s 0 -A 'tcp port 80 and host 8.8.8.8'
 ```
+You will see the payload pattern (`00 01 02 …`) inside the TCP data segment, confirming the user data reached the wire intact.
 
-The IP checksum covers only the IP header, not the payload. TCP and UDP have their own checksums that include a pseudo-header (source IP, dest IP, protocol, length) — this is why an IP address change without checksum recalculation breaks TCP connections silently.
+### Example 2: Static Routing Between Two Subnets
+Consider two LANs:
+* **LAN‑A**: 192.168.1.0/24, gateway R1 at 192.168.1.1  
+* **LAN‑B**: 10.0.0.0/24, gateway R2 at 10.0.0.1  
 
-### IP Addressing and CIDR Math
+R1 and R2 are connected via a point‑to‑point link 172.16.0.0/30 (R1 = 172.16.0.1, R2 = 172.16.0.2).
 
-An IPv4
+**Step‑by‑step on R1**
+
+1. **Enable IP forwarding** (kernel option):
+   ```bash
+   sudo sysctl -w net.ipv4.ip_forward=1
+   ```
+2. **Add interface addresses** (assuming eth0 = LAN‑A, eth1 = link to R2):
+   ```bash
+   sudo ip addr add 192.168.1.1/24 dev eth0
+   sudo ip addr add 172.16.0.1/30 dev eth1
+   sudo ip link set eth0 up
+   sudo ip link set eth1 up
+   ```
+3. **Add route to LAN‑B** via the point‑to‑point link:
+   ```bash
+   sudo ip route add 10.0.0.0/24 via 172.16.0.2 dev eth1
+   ```
+   The kernel inserts this entry into the FIB (forwarding information base).  
+4. **Verify** with `ip route show`:
+   ```
+   default via 192.168.1.254 dev eth0 
+   10.0.0.0/24 via 172.16.0.2 dev eth1 
+   172.16.0.0/30 dev eth1 proto kernel scope link src 172.16.0.1 
+   192.168.1.0/24 dev eth0 proto kernel scope link src 192.168.1.1 
+   ```
+
+**Packet flow** (host A = 192.168.1.10 → host B = 10.0.0.20):
+
+* Host A sends IP packet (dst = 10.0.0.20).  
+* Its ARP cache resolves 192.168.1.1 → MAC of R1’s eth0; frame sent to R1.  
+* R1 receives frame, strips Ethernet header, sees dst = 10.0.0.20.  
+* FIB lookup: longest prefix match yields `10.0.0.0/24 via 172.16.0.2 dev eth1`.  
+* R1 decrements TTL, recalculates IP header checksum, builds new Ethernet frame with src = MAC(eth1), dst = MAC of R2’s eth1 (via ARP on 172.16.0.2), and transmits.  
+* R2 performs analogous steps, delivering the frame to host B.
+
+If the `via` address were omitted (mistake), the kernel would treat the destination as directly reachable on eth0, ARP for 10.0.0.20 would fail, and the packet would be dropped—illustrating why **next‑hop** must be on a locally connected subnet.
+
+## Common Mistakes
+| # | Mistake | Why It’s Wrong | Consequence |
+|---|---------|----------------|-------------|
+| 1 | **Assuming TCP guarantees in‑order delivery at the link layer** | TCP provides ordered byte stream **after** reassembly at the receiver; lower layers may deliver frames out of order (e.g., wireless retransmissions, Ethernet frame reordering in switches). | Applications that rely on per‑frame ordering (e.g., custom protocols) will see gaps or duplicates. |
+| 2 | **Setting MTU > 1500 on Ethernet without enabling jumbo frames** | Ethernet standard MTU is 1500 B; exceeding it causes frames to be silently dropped by NICs or switches that don’t support jumbo frames. | Persistent packet loss, apparent “network latency”. |
+| 3 | **Neglecting to adjust TCP MSS for VPN overhead** | A VPN adds encapsulation (e.g., 20 B IP + 8 B UDP for GRE). If MSS stays at 1460 B, the inner TCP segment + VPN headers may exceed the physical MTU, triggering IP fragmentation and possible loss. | Reduced throughput, increased latency due to fragmentation/reassembly. |
+| 4 | **Using `route add -net` with an incorrect netmask (e.g., /24 for a /26 subnet)** | The kernel installs a route that claims a larger address space than actually owned; packets for addresses outside the real subnet are incorrectly forwarded, causing **black‑holing** or misrouting. | Traffic loss for legitimate hosts, possible security exposure. |
+| 5 | **Believing that `ping` loss percentage directly measures available bandwidth** | `ping` uses ICMP Echo, which is often rate‑limited or deprioritized; loss can stem from congestion control policies, not link capacity. | Misdiagnosis of congestion; over‑provisioning or under‑utilization of links. |
+| 6 | **Leaving `tcp_timestamps` disabled on high‑BDP links** | TCP timestamps (RFC 1323) protect against PAWS (Protection Against Wrapped Sequence) and enable RTT measurement; without them, large windows can cause spurious retransmissions when sequence numbers wrap. | Unnecessary retransmissions, throughput collapse on long‑fat pipes. |
+
+## Exercises
+### Easy
+1. **Ping with variable payload**  
+   ```bash
+   ping -c 5 -s 1472 google.com   # 1472 + 28 B IP/ICMP = 1500 B (no fragmentation)
+   ping -c 5 -s 1500 google.com   # Forces fragmentation; observe “frag needed” messages
+   ```
+   Explain the output differences and relate them to the MTU formula.
+
+2. **Inspect socket buffers**  
+   ```bash
+   sysctl net.ipv4.tcp_rmem net.ipv4.tcp_wmem
+   ss -i state established '( dport = :80 or sport = :80 )'
+   ```
+   Note the `rcv_buf` and `snd_buf` values; adjust them with `sysctl -w net.ipv4.tcp_rmem="4096 87380 6291456"` and observe changes in `ss -i`.
+
+### Medium
+3. **Write a UDP echo client/server that measures RTT**  
+   *Server*: bind to port 5000, `recvfrom`, `sendto`.  
+   *Client*: send a 500‑byte packet, record `clock_gettime(CLOCK_MONOTONIC)` before and after `recvfrom`.  
+   Run over `lo` and over a Wi‑Fi link; compute RTT and compare to `ping`. Explain why UDP RTT can be lower than TCP (no handshake, no congestion control).
+
+4. **Manipulate TCP congestion control**  
+   ```bash
+   sysctl net.ipv4.tcp_congestion_control   # list available algorithms
+   sudo sysctl -w net.ipv4.tcp_congestion_control=bbr
+   # Transfer a large file with iperf3 and plot cwnd via:
+   sudo ss -ti state established '( dport = :5201 )'
+   ```
+   Observe the cwnd evolution and relate to BDP calculation.
+
+### Hard
+5. **Implement a simple distance‑vector routing protocol in Python**  
+   Use UDP sockets on port 2000 to exchange routing tables (dictionary `{dest: (distance, next_hop)}`).  
+   Implement Bellman‑Ford update: on receiving a neighbor’s table, for each entry compute `new_dist = neighbor.dist + 1` (unit link cost) and update if better.  
+   Simulate a small topology (4 routers) and show convergence after a link‑cost change. Discuss count‑to‑infinity problem and how split horizon mitigates it.
+
+6. **Use eBPF to count dropped packets per interface**  
+   ```bash
+   sudo bpftrace -e '
+   tracepoint:net:net_dev_queue {
+     if (args->bytes == 0) { @[args->name, "dropped"] = count(); }
+   }
+   '
+   ```
+   Run a traffic generator (e.g., `hping3 -i u1000 -S -p 80 192.168.1.10`) and watch the drop count increase as you lower the interface tx queue length with `txqueuelen`. Explain the relationship between queue length, buffering, and packet loss.
+
+## Linux Connection
+### Core Subsystems
+| Subsystem | Source File (approx.) | Role |
+|-----------|----------------------|------|
+| Socket layer | `net/socket.c` | Implements `socket()`, `bind()`, `connect()`, `send()`, `recv()` syscalls; manages sock structures and protocol‑specific ops. |
+| TCP/IPv4 | `net/ipv4/tcp_ipv4.c`, `net/ipv4/tcp_input.c` | Handles TCP header creation, checksum, retransmission timers, congestion control (plugable via `tcp_congestion_control`). |
+| IP | `net/ipv4/ip_input.c`, `net/ipv4/ip_output.c` | Performs routing lookup (`fib_lookup`), TTL decrement, header checksum, fragmentation/reassembly. |
+| Neighbor (ARP) | `net/ipv4/neigh.c` | Implements ARP request/reply, neighbor cache, proxy ARP. |
+| Device driver | `net/core/dev.c` | Generic network device API; `dev_queue_xmit`, `netif_receive

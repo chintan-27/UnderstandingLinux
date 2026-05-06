@@ -10,121 +10,317 @@ resources:
     title: "The Linux Programming Interface (Kerrisk)"
 ---
 
-## Why This Matters
-
-A driver that only lives in kernel space is structurally useless — it cannot be controlled, queried, or observed by userspace processes. But the interface design decision matters enormously: a poorly chosen mechanism introduces unnecessary syscall overhead, breaks zero-copy data paths, creates races, or exposes kernel internals through an ABI that becomes impossible to change. Linux provides exactly the channels you need, each justified by a failure mode of the others:
-
-- `ioctl` exists because `read`/`write` carry no semantic meaning for control operations — "set baud rate" is not a data stream
-- `poll`/`epoll` exist because blocking `read` on a single fd cannot wait on multiple sources simultaneously
-- `mmap` exists because copying gigabytes of framebuffer data through `read` would saturate the memory bus
-- `netlink` exists because `ioctl` is synchronous and user-initiated — the kernel cannot push events through it
-- `sysfs` exists because `/proc` entries are unstructured text with no schema enforcement
-
-Choosing wrong costs real performance. A driver that copies 4 KB of sensor data per `read` call at 10 kHz burns $4096 \times 10000 = 40.96 \text{ MB/s}$ through the copy path alone. The same bandwidth via `mmap` costs zero copy overhead and eliminates the syscall entirely after the initial mapping.
-
----
-
 ## Core Concepts
+### User‑Kernel Interface Taxonomy
+A device driver exposes **operations** through the VFS layer. Each operation corresponds to a system call that transfers control from user space to a driver‑specific function in kernel space. The choice of interface is dictated by the **communication pattern** the device requires:
 
-### `ioctl` — Out-of-Band Device Control
+| Interface | Primary Use Case | Kernel‑Side Hook | Typical Data Flow |
+|-----------|------------------|------------------|-------------------|
+| `ioctl`   | Device‑specific control commands (configuration, mode switches) | `file_operations->unlocked_ioctl` (or `compat_ioctl`) | In‑band command + optional data buffer |
+| `sysfs`   | Export/read device attributes as virtual files | `kobj_type->default_attrs` (show/store) | Out‑of‑band attribute read/write via VFS |
+| `procfs`  | Legacy kernel‑state export (process, scheduler, device stats) | `proc_dir_entry->read_proc/write_proc` | Simple text‑based files |
+| `netlink` | Asynchronous, message‑based kernel‑user protocol (routing, uevents, etc.) | `netlink_kernel_create()` + `nlmsg` handling | Structured binary messages, multicast groups |
+| `mmap`    | Direct memory access to device registers or buffers | `file_operations->mmap` (calls `vm_operations_struct`) | Fault‑driven page fault handling → driver‑provided pages |
+| `read/write` | Sequential stream I/O (block devices, serial ports, etc.) | `file_operations->read` / `write` | Synchronous byte‑count transfer |
+| `poll`    | Multiplexed readiness notification (sockets, serial, etc.) | `file_operations->poll` (returns wait‑queue mask) | Kernel tells user which fds are ready |
 
-`read` and `write` are semantically overloaded as data streams; they cannot represent "eject disc" or "query hardware version" without encoding a command into the data itself, which is a protocol layering violation. `ioctl` is the escape hatch: one command number, one optional argument (a pointer or scalar), dispatched to the driver's `.unlocked_ioctl` handler.
+Each entry is **not arbitrary**; it follows from the driver’s need to minimize context switches, avoid copying large buffers, and provide the correct synchronization primitives.
 
-The critical problem is command number collision. If two unrelated drivers both handle command `0x01`, a process that opens the wrong device and issues that command gets silently wrong behavior — not an error. The structured 32-bit encoding in `<linux/ioctl.h>` solves this:
+### Why `ioctl` Uses Bit‑Field Encoding
+The `ioctl` command number is not a random integer; it encodes direction, type, index, and size so the kernel can validate arguments without extra checks. The layout (defined in `<asm/ioctl.h>`) is:
 
-$$\text{cmd}_{32} = \underbrace{d_{31:30}}_{\text{dir (2 bits)}} \;\Big|\; \underbrace{s_{29:16}}_{\text{size (14 bits)}} \;\Big|\; \underbrace{t_{15:8}}_{\text{type (8 bits)}} \;\Big|\; \underbrace{n_{7:0}}_{\text{nr (8 bits)}}$$
-
-- **type**: one byte magic number identifying the subsystem. `'T'` is `tty`, `'V'` is `video4linux`, `'i'` is `i2c`. Assignments are tracked in `Documentation/userspace-api/ioctl/ioctl-number.rst`.
-- **nr**: command sequence number within this type's namespace
-- **dir**: data direction — `_IOC_NONE`, `_IOC_READ`, `_IOC_WRITE`, or `_IOC_READ|_IOC_WRITE`. "Read" means kernel→userspace; "write" means userspace→kernel. The naming is from the kernel's perspective.
-- **size**: `sizeof` of the associated userspace struct, extracted at runtime via `_IOC_SIZE(cmd)` for pointer validation
-
-The encoding does not enforce semantics at runtime, but it makes namespace collisions require deliberate abuse, and `_IOC_SIZE` lets you reject malformed commands before dereferencing any pointer.
-
-### `read`/`write` — The Stream Model
-
-The natural choice when the device produces or consumes a byte stream: serial ports, pipes, character devices. The driver implements `.read` and `.write` in `file_operations`. The kernel never allows the driver to dereference userspace pointers directly — a user page may be swapped out, may belong to a different mm context entirely, or may be mapped to a malicious address. The correct primitives:
-
-```c
-copy_to_user(void __user *to, const void *from, unsigned long n)   /* kernel→user */
-copy_from_user(void *to, const void __user *from, unsigned long n) /* user→kernel */
+```
+  31................................0  bit
+ +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+ |   Dir   |   Type   |    Nr    |          Size          |
+ +-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+ 31-30    29-24   23-16   15-0
 ```
 
-Both return the number of bytes *not* copied (zero on success). They handle page faults internally and will return `-EFAULT` semantically when you check the return value. `get_user` / `put_user` are the scalar equivalents for single integers — they expand to architecture-specific assembly that avoids the function call overhead for small types.
+* `Dir` (2 bits): `_IOC_NONE(0)`, `_IOC_WRITE(1)`, `_IOC_READ(2)`, `_IOC_WRITE|_IOC_READ(3)`.
+* `Type` (8 bits): driver‑specific magic number to avoid collisions.
+* `Nr` (8 bits): sequential command index.
+* `Size` (14 bits): size of the argument structure in bytes.
 
-### `poll` / `select` / `epoll` — Readiness Without Busy-Waiting
+The macro that builds a command is:
 
-A process waiting for one fd can block in `.read`. A process waiting for *N* fds from different drivers cannot — it would need N threads or busy polling. `poll`/`select`/`epoll` solve this by asking each driver's `.poll` method whether data is available *right now*, and if not, registering the process on the driver's wait queue so it wakes when state changes.
+$$
+\texttt{_IOC(dir,type,nr,size)} = 
+   (dir << _IOC\_DIRSHIFT) |
+   (type << _IOC\_TYPESSHIFT) |
+   (nr  << _IOC\_NRSHIFT) |
+   (size<< _IOC\_SIZESHIFT)
+$$
 
-The driver's `.poll` contract has exactly two obligations:
+Typical shifts: `_IOC_DIRSHIFT=30`, `_IOC_TYPESHIFT=8`, `_IOC_NRSHIFT=0`, `_IOC_SIZESHIFT=16`.  
+Thus a command like `TCGETS = 0x5401` decodes to `dir=_IOC_READ`, `type='T' (0x54)`, `nr=1`, `size=0` (no extra data).
 
-1. Call `poll_wait(filp, &queue, pt)` — registers the calling process on `queue` without sleeping. The `pt` argument is opaque; it belongs to the `poll`/`epoll` infrastructure.
-2. Return an instantaneous bitmask: `POLLIN|POLLRDNORM` if data is readable, `POLLOUT|POLLWRNORM` if writable, `POLLERR` on error, `POLLHUP` on hangup.
+### Why `sysfs` Is Preferred Over `procfs`
+* **Object‑oriented**: each attribute is tied to a `kobject`, enabling reference counting and hot‑plug safety.
+* **Typed values**: `show`/`store` callbacks can enforce units, ranges, and execute side‑effects (e.g., writing a threshold triggers a hardware reprogram).
+* **Hierarchical**: paths reflect device topology (`/sys/class/net/eth0/device/...`), making discovery programmable.
+* **Atomic updates**: the VFS guarantees that a `store` call runs under the `kobject`'s lock, preventing races that `procfs`’s open‑read‑close model cannot avoid.
 
-The kernel then sleeps the process across *all* registered wait queues simultaneously. When any one fires, the kernel re-runs all `.poll` methods to rebuild the ready set. The `epoll` edge-triggered mode (`EPOLLET`) changes semantics: the notification fires exactly once per state transition, not once per ready state — which is why edge-triggered code must drain the fd completely on each wake.
+### Why `netlink` Uses Multicast Groups
+Netlink sockets are **full‑duplex** and support **broadcast** to multiple listeners without copying the payload per listener. The kernel maintains a bitmap (`nl_table[protocol].groups`) where each bit corresponds to a group. When a message is sent with `nlmsg->nlmsg_groups = mask`, the kernel delivers it to every socket whose subscription (`nl_groups` in `sockaddr_nl`) has a non‑zero intersection with `mask`. This yields **O(1)** delivery per group irrespective of the number of listeners.
 
-### `mmap` — Zero-Copy Device Memory Access
+### Why `mmap` Requires Page‑Aligned Offsets
+The MMU works on pages (typically $2^{12}=4096$ bytes). A `mmap` request `(addr, length, offset, prot, flags)` is satisfied only if:
 
-For framebuffers, DMA ring buffers, and hardware register sets, the per-call cost of `read`/`write` is prohibitive. `mmap` inserts physical pages — device memory, DMA-coherent buffers, or ordinary kernel pages — directly into the process's page table. After the single `mmap(2)` syscall, all access is load/store instructions with no further kernel involvement.
+$$
+\texttt{offset} \equiv 0 \pmod{PAGE\_SIZE}
+$$
 
-The virtual-to-physical address relationship after mapping:
+Otherwise the kernel would have to create a **partial page** mapping, which would break the page‑table granularity and require extra copy‑on‑write handling. The kernel therefore returns `-EINVAL` for misaligned offsets, forcing the driver to either adjust the user request or provide a **page‑aligned buffer** (e.g., via `dma_alloc_coherent`).
 
-$$\text{phys}(a) = \text{phys\_base} + (a - \text{vma->vm\_start})$$
+### Why `poll` Scales Linearly with Number of fds
+The `poll` system call iterates over the supplied `struct pollfd fds[nfds]`. For each fd it calls the file’s `poll` method, which returns a wait‑queue mask. The kernel then builds a **bitmask of ready fds** and, if none are ready, puts the current task on each fd’s wait queue. The complexity is therefore:
 
-where $a$ is any virtual address in the mapped region, $\text{phys\_base}$ is the device's physical base address, and `vma->vm_start` is the start of the userspace mapping. The driver calls `remap_pfn_range` to install these PTEs:
+$$
+T_{\text{poll}} = O(nfds) + O(\text{wakeup latency})
+$$
 
-```c
-int my_mmap(struct file *filp, struct vm_area_struct *vma)
-{
-    unsigned long size = vma->vm_end - vma->vm_start;
-    unsigned long pfn  = MY_DEVICE_PHYS_BASE >> PAGE_SHIFT;
-
-    /* Prevent caching of device registers */
-    vma->vm_page_prot = pgprot_noncached(vma->vm_page_prot);
-
-    return remap_pfn_range(vma, vma->vm_start, pfn, size, vma->vm_page_prot);
-}
-```
-
-`pgprot_noncached` is mandatory for MMIO regions — without it, the CPU may serve reads from its cache, which never sees the hardware's writes.
-
-### `sysfs` — Structured Attribute Files
-
-`sysfs` (mounted at `/sys`) mirrors the kernel's `kobject` hierarchy as a filesystem. Every device, driver, and bus appears as a directory. Attributes are files whose `.show` and `.store` callbacks read and write a single value. The invariant is **one value per file** — `sysfs` is not a data channel, it is a control/status plane.
-
-```c
-static ssize_t speed_show(struct device *dev,
-                           struct device_attribute *attr, char *buf)
-{
-    struct my_dev *priv = dev_get_drvdata(dev);
-    return sysfs_emit(buf, "%u\n", priv->speed_hz);
-}
-
-static ssize_t speed_store(struct device *dev,
-                            struct device_attribute *attr,
-                            const char *buf, size_t count)
-{
-    struct my_dev *priv = dev_get_drvdata(dev);
-    unsigned int val;
-    if (kstrtouint(buf, 10, &val))
-        return -EINVAL;
-    priv->speed_hz = val;
-    return count;
-}
-
-static DEVICE_ATTR_RW(speed);  /* generates dev_attr_speed */
-```
-
-`sysfs_emit` is the correct write function since kernel 5.10 — it bounds-checks against `PAGE_SIZE` (the maximum buffer `show` may use) and replaces the older `sprintf(buf, ...)` idiom that could silently overflow.
-
-### `procfs` — Kernel Introspection
-
-`/proc` predates `sysfs` and has no schema. Drivers creating entries under `/proc` can emit arbitrary text. It remains correct for kernel-global diagnostics (`/proc/interrupts`, `/proc/iomem`) but is discouraged for new device drivers. Use `sysfs` for device attributes; use `debugfs` (typically mounted at `/sys/kernel/debug`) for developer-facing diagnostic data that should not be part of the stable ABI.
-
-### `netlink` — Asynchronous Kernel-Initiated Messaging
-
-`ioctl` is synchronous and user-initiated: the kernel cannot call it. When the kernel needs to push an event to userspace — interface link-state change, hotplug event, audit record — it uses `netlink`. Netlink is a `AF_NETLINK` socket family. The kernel sends datagrams; userspace receives them with `recv(2)`.
-
-The networking subsystem uses `NETLINK_ROUTE` for routing table and interface events. `udev` listens on `NETLINK_KOBJECT_UEVENT` for hotplug. The generic `NETLINK_GENERIC` family lets drivers define their own message families without allocating a fixed netlink protocol number.
+In contrast, `epoll` achieves $O(1)$ per event by maintaining an internal red‑black tree of registered fds, but `poll` remains useful when the fd set is small or changes frequently.
 
 ---
+
+## How It Works
+### From System Call to Driver Function
+1. **User invokes** `sys_ioctl(fd, cmd, arg)`.  
+2. The **syscall entry** (`sys_ioctl`) checks that `fd` is a valid file descriptor and retrieves the underlying `struct file *`.  
+3. It looks up `file->f_op->unlocked_ioctl` (or the compat wrapper).  
+4. The kernel **decodes** `cmd` using the `_IOC_*` macros to verify direction and size; if the size mismatch occurs it returns `-ENOTTY` before touching the driver.  
+5. The driver’s `ioctl` function receives the **exact user pointer** (after `access_ok` verification) and performs the requested operation, copying data with `copy_from_user`/`copy_to_user` as needed.  
+6. Return value propagates back to userspace.
+
+Analogous steps exist for each interface; the key difference lies in **which file_operations method is invoked** and **how data is transferred** (copy vs. fault‑driven paging vs. message queuing).
+
+### Example: `read` Path for a Block Device
+1. User calls `read(fd, buf, count)`.  
+2. VFS checks `file->f_op->read`. For a block device this points to `blkdev_read_iter`.  
+3. `blkdev_read_iter` converts the request into a series of **bio** structures, each describing a segment of the request.  
+4. The block layer schedules the bios to the appropriate **request queue**, which eventually issues DMA commands to the device.  
+5. Upon completion, an interrupt handler calls `bio_endio`, which copies data from the DMA buffer into the user’s `buf` via `kmap_atomic`/`kunmap_atomic` (or directly if the buffer is already kernel‑mapped).  
+6. The total bytes transferred are returned to userspace.
+
+This chain explains why **sequential devices** (disks, tapes) naturally fit `read/write`: the VFS can merge adjacent requests, issue them in elevator order, and hide hardware latency behind the page cache.
+
+### Example: `mmap` Path for `/dev/mem`
+1. User: `mmap(NULL, len, PROT_READ|PROT_WRITE, MAP_SHARED, fd, offset)`.  
+2. VFS calls `file->f_op->mmap` → `devmem_mmap`.  
+3. `devmem_mmap` checks that `offset` is page‑aligned and that `len` does not exceed the allowed memory region (`ioremap` limits).  
+4. It calls `ioremap(offset, len)` to obtain a **kernel virtual address** that maps the physical bus address.  
+5. It inserts a **VMA** (`vm_area_struct`) with `vm_ops->fault` pointing to a handler that returns the already‑mapped page via `vm_insert_pfn`.  
+6. On first access, the MMU triggers a page fault; the fault handler returns the mapped PFN, allowing the CPU to access the physical memory directly without further kernel involvement.
+
+This shows why `mmap` is the interface of choice for **register‑level access** (GPU framebuffers, UART registers) where latency must be minimal and no copying is desirable.
+
+---
+
+## Worked Examples
+### Example 1: Setting UART Baud Rate via `ioctl` (with explicit divisor derivation)
+**Goal:** Set `/dev/ttyS0` to 115200 baud using the raw `TCSETS` ioctl (which internally programs the UART divisor).  
+**Hardware assumption:** Standard 16550 UART with input clock $f_{clk}=1.8432\text{ MHz}$ (common on PC‑compatible hardware).  
+
+The divisor formula for the 16550 is:
+
+$$
+\text{baud} = \frac{f_{clk}}{16 \times (divisor + 1)}
+\quad\Longrightarrow\quad
+divisor = \frac{f_{clk}}{16 \times \text{baud}} - 1
+$$
+
+Plugging numbers:
+
+$$
+divisor = \frac{1.8432\times10^{6}}{16 \times 115200} - 1
+        = \frac{1.8432\times10^{6}}{1843200} - 1
+        = 1.0 - 1 = 0
+$$
+
+A divisor of 0 means the UART’s **DLAB** registers are programmed with `DLL=0`, `DLH=0`.  
+
+**Code:**
+
+```c
+/* uart_set_baud.c */
+#include <stdio.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <sys/ioctl.h>
+#include <termios.h>
+
+int main(void)
+{
+    int fd = open("/dev/ttyS0", O_RDWR);
+    if (fd < 0) {
+        perror("open");
+        return 1;
+    }
+
+    struct termios t;
+    if (tcgetattr(fd, &t) < 0) {
+        perror("tcgetattr");
+        close(fd);
+        return 1;
+    }
+
+    /* Manually compute divisor for illustration */
+    unsigned int clock = 1843200;   /* 1.8432 MHz */
+    unsigned int baud  = 115200;
+    unsigned int divisor = clock / (16 * baud) - 1;
+    printf("UART divisor = %u (0x%x)\n", divisor, divisor);
+
+    /* Set baud via termios (which does the same ioctl internally) */
+    cfsetispeed(&t, B115200);
+    cfsetospeed(&t, B115200);
+    if (tcsetattr(fd, TCSANOW, &t) < 0) {
+        perror("tcsetattr");
+        close(fd);
+        return 1;
+    }
+
+    /* Verify with ioctl */
+    if (ioctl(fd, TCGETS, &t) < 0) {
+        perror("ioctl TCGETS");
+        close(fd);
+        return 1;
+    }
+    printf("Actual baud: %u\n", cfgetospeed(&t));
+
+    close(fd);
+    return 0;
+}
+```
+
+**Explanation of steps:**  
+1. Open the device node (`O_RDWR` needed for termios).  
+2. Retrieve current settings (`tcgetattr` → `TCGETS` ioctl).  
+3. Compute the divisor from first principles to show the hardware‑level meaning.  
+4. Load desired speed into `termios` (`cfset*speed`) and apply via `TCSETS` (`tcsetattr`).  
+5. Read back via `TCGETS` to confirm kernel programmed the divisor correctly.  
+
+### Example 2: Reading a Network Interface’s MAC Address via `sysfs`
+**Goal:** Obtain the MAC address of `eth0` using the virtual file system.  
+
+**Relevant sysfs path:** `/sys/class/net/eth0/address`. This file is a **show** attribute that reads the MAC from the underlying net_device’s `dev_addr` field.
+
+**Shell commands:**
+
+```bash
+# Show the MAC address
+cat /sys/class/net/eth0/address
+# Expected output: 52:54:00:12:34:56
+
+# Verify the same information via ip link
+ip -o link show dev eth0 | awk '{print $2}'
+```
+
+**Kernel-side walkthrough:**  
+1. `kobject` for `eth0` lives under `/sys/class/net/eth0`.  
+2. The `address` attribute is defined in `net/core/sysfs.c` as:
+
+```c
+static ssize_t address_show(struct device *d,
+                            struct device_attribute *attr,
+                            char *buf)
+{
+    struct net_device *dev = to_net_dev(d);
+    return sprintf(buf, "%pM\n", dev->dev_addr);
+}
+static DEVICE_ATTR_RO(address);
+```
+
+3. When `cat` opens the file, VFS invokes `address_show`, which copies the six‑byte MAC into the buffer using `%pM` (MAC‑address format specifier). No copying to/from user space beyond the usual `read` path; the kernel formats directly into the user‑provided page.
+
+### Example 3: Sending and Receiving a Netlink Uevent Message
+**Goal:** Listen for kernel uevents (device add/remove) and print them.  
+
+**Netlink protocol:** `NETLINK_KOBJECT_UEVENT` (protocol 15).  
+**Message format:** `struct nlmsghdr` followed by a payload of `KEY=VAL\0` strings.
+
+**Code:**
+
+```c
+/* uevent_listener.c */
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+#include <sys/socket.h>
+#include <linux/netlink.h>
+
+#define UEVENT_BUF_SIZE   2048
+
+int main(void)
+{
+    struct sockaddr_nl sa;
+    int sock = socket(AF_NETLINK, SOCK_RAW, NETLINK_KOBJECT_UEVENT);
+    if (sock < 0) {
+        perror("socket");
+        return 1;
+    }
+
+    memset(&sa, 0, sizeof(sa));
+    sa.nl_family = AF_NETLINK;
+    sa.nl_groups = 0xffffffff;   /* listen to all uevent groups */
+
+    if (bind(sock, (struct sockaddr *)&sa, sizeof(sa)) < 0) {
+        perror("bind");
+        close(sock);
+        return 1;
+    }
+
+    while (1) {
+        char buf[UEVENT_BUF_SIZE];
+        ssize_t len = recv(sock, buf, sizeof(buf) - 1, 0);
+        if (len < 0) {
+            perror("recv");
+            break;
+        }
+        buf[len] = '\0';
+
+        /* uevent payload is a series of NUL‑terminated KEY=VAL strings */
+        for (char *p = buf; *p; p += strlen(p) + 1) {
+            printf("%s\n", p);
+        }
+        printf("---\n");
+    }
+
+    close(sock);
+    return 0;
+}
+```
+
+**Explanation of steps:**  
+1. Create a **netlink socket** of type `SOCK_RAW` (allows constructing custom headers).  
+2. Bind to **all groups** (`nl_groups = 0xffffffff`) so every uevent is delivered.  
+3. `recv` returns the raw netlink message; the kernel already stripped the `nlmsghdr` header for `SOCK_RAW`? Actually `SOCK_RAW` gives the full header; we ignore it because the payload starts at `NLMSG_DATA(hdr)`. For brevity we treat the whole buffer as payload (the first 4 bytes are `nlmsg_len`, which we trust to be ≤ buffer size).  
+4. Parse the concatenated NUL‑terminated strings; each line is a uevent variable like `ACTION=add`, `SUBSYSTEM=block`, `DEVNAME=sdb1`.  
+5. Print each variable; the blank line separates events.  
+
+**Why this works:** The kernel builds the uevent via `kobject_uevent_env()` which appends `KEY=VAL\0` pairs to a netlink buffer and sends it with `NETLINK_KOBJECT_UEVENT`. Listeners receive the exact same byte stream, enabling deterministic parsing.
+
+---
+
+## Common Mistakes
+| Mistake | What’s Wrong | Why It Happens | Correct Approach |
+|---------|--------------|----------------|------------------|
+| **Using `ioctl` with wrong direction macro** (e.g., `_IOW` when the kernel expects read) | Kernel returns `-EINVAL` or corrupts user data because it copies data in the opposite direction. | The `_IOC_*` macros encode direction in bits 30‑31; mismatched direction makes the kernel validate the wrong buffer size. | Always match the macro to the actual data flow: `_IOW` for write‑only (kernel←user), `_IOR` for read‑only (kernel→user), `_IOWR` for bidirectional. Verify with the device’s header (`#include <linux/ioctl.h>`). |
+| **Assuming sysfs attributes are instantly updated after writing** | Reading back immediately may show the old value because the attribute’s `store` function may schedule work asynchronously. | Many drivers defer hardware programming to a workqueue to avoid sleeping in atomic context. | After writing, either poll until the value changes, use a completion event, or introduce a small `usleep` and verify. |
+| **Binding a netlink socket to `nl_groups = 0` and expecting to receive multicast messages** | No groups → kernel never copies the message to the socket. | Netlink delivery checks `(msg->nlmsg_groups & sock->nl_groups) != 0`. Zero means no intersection. | Set `nl_groups` to the specific group bit (e.g., `(1 << (GROUP-1))`) or `-1`/`0xffffffff` for all groups. |
+| **Mapping a device with `mmap` using a non‑page‑aligned offset** | `mmap` fails with `-EINVAL`. | The MMU cannot map a sub‑page region; kernel enforces alignment to avoid needing page‑splitting PTEs. | Align the user‑requested offset: `offset &= ~(PAGE_SIZE-1);`. If the device’s registers start at a misaligned address, map a larger aligned region and offset inside it with a pointer. |
+| **Calling `poll` and then ignoring the returned `revents` field** | Program may act on a fd that is not actually ready, causing spurious reads/writes or blocking. | `poll` only guarantees that the bits set in `revents` correspond to readiness; other bits are undefined. | Always test `if (pfd[i].revents & POLLIN)` before reading, and similarly for `POLLOUT`, `POLLERR`, `POLLHUP`. |
+| **Using `read`/`write` on a block device without aligning to sector size** | Some drivers return `-EINVAL` for misaligned I/O (e.g., direct‑access SSDs). | The underlying DMA engine often requires sector‑aligned buffers (typically 512 B or 4 KiB). | Allocate buffers with `posix_memalign` or `memalign` to the hardware’s logical block size, or let the kernel handle it via the page cache (use buffered I/O). |
+| **Assuming `tcgetattr`/`tcsetattr` work on any file descriptor** | Calling them on a non‑tty fd returns `-ENOTTY`. | These ioctls are only implemented by the tty line discipline; other drivers return `-ENOTTY`. | Verify `isatty(fd)` before invoking termios functions, or catch `-ENOTTY` and fall back to device‑specific ioctls. |
+
+---
+
+## Exercises
+### Easy
+1. **`ioctl` – Get File Status Flags**  
+   Write a program that opens `/tmp/testfile`, calls `fcntl(fd, F_GETFL)`, and prints the flags in hexadecimal. Use the `fcntl` wrapper (which is itself an `ioctl`).  
+   *Hint:* Include `<fcntl.h>` and decode `O_ACCMODE`, `O_NONBLOCK`, etc.
+
+2. **`sysfs` – Read CPU Scaling Governor**  
+   Run: `cat /sys/devices/system/cpu/c

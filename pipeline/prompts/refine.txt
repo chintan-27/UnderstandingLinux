@@ -11,15 +11,26 @@ DRAFT:
 {draft}
 ---
 
-Rewrite this lesson to be sharper and more useful. Specifically:
+Rewrite this lesson to be sharper, more thorough, and more useful. Specifically:
 
 1. Cut anything vague or obvious. If a sentence could appear in any generic article, cut it.
-2. Strengthen the causal explanations. Every "what" should have a "why".
-3. Make the Linux Connection section concrete — real subsystem names, real tool names, real file paths where relevant. Add runnable shell commands in ```bash blocks.
-4. Add or improve math where relevant: use $...$ for inline formulas and $$...$$ for display equations. This applies especially to: timing calculations, memory layout math, complexity analysis, signal formulas, bitwise operations, address calculations.
-5. Add or improve code examples: every concept that has a syscall, C struct, or shell command should show it in a properly tagged code block.
-6. Add a "Common Mistakes" section at the end with 2–3 genuine misconceptions beginners have about this topic.
-7. Add an "Exercises" section with 2–3 hands-on tasks a student can do right now to test understanding.
-8. Keep the same markdown structure. Do not add a top-level # heading — the platform renders the title separately.
+2. Strengthen the causal explanations. Every "what" should have a "why". Every mechanism should be explained from first principles.
+3. Expand sections that are too thin — each section should have genuine depth. Add intermediate steps, derivations, and reasoning that the draft skipped.
+4. Make the Linux Connection section concrete — real subsystem names, real tool names, real file paths where relevant. Add runnable shell commands in ```bash blocks. Even for foundational topics, show how the concept manifests in Linux.
+5. Add or improve math where relevant: use $...$ for inline formulas and $$...$$ for display equations. This applies especially to: timing calculations, memory layout math, complexity analysis, signal formulas, bitwise operations, address calculations. Show derivations, not just results.
+6. Add or improve code examples: every concept that has a syscall, C struct, or shell command should show it in a properly tagged code block.
+7. Ensure Worked Examples are detailed with step-by-step reasoning and real numbers.
+8. Ensure Common Mistakes are genuine (not trivial) and each includes what's wrong and why.
+9. Ensure Exercises are actionable and span easy → hard difficulty.
+10. Ensure the "Why This Matters" section at the end ties everything together — it should feel like a payoff, not an afterthought.
 
-Output only the refined lesson markdown. No preamble.
+Required section order (do not change):
+1. Core Concepts
+2. How It Works
+3. Worked Examples
+4. Common Mistakes
+5. Exercises
+6. Linux Connection
+7. Why This Matters
+
+Output only the refined lesson markdown. No preamble, no top-level # heading.

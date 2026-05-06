@@ -10,105 +10,248 @@ resources:
     title: "Computer Organization and Design (Patterson and Hennessy)"
 ---
 
-## Why This Matters
-
-Every flip-flop in a synchronous system makes an implicit promise: given a stable input for $t_{setup}$ before the clock edge and $t_{hold}$ after it, the output will be a valid logic level within $t_{pcq}$. The entire edifice of digital design — pipelining, caching, out-of-order execution — rests on that promise being kept everywhere, simultaneously, on every cycle. When it isn't, the flip-flop doesn't output a wrong bit; it outputs a voltage stuck between logic thresholds, which propagates through subsequent gates as an indeterminate value. No exception handler catches this. The CPU may decode a garbage instruction, corrupt a cache line, or latch a bad address into the MMU. The synchronous design discipline exists to make timing violations *impossible by construction*, not merely unlikely.
-
-This matters beyond ASIC design. Linux kernel drivers for USB controllers, PCIe devices, and network interfaces all cross clock domain boundaries in hardware they rely on. When those crossings are handled incorrectly, the result is not a software bug — it is a hardware non-determinism that manifests as random crashes, data corruption, or silent wrong results that survive reboots.
-
----
-
 ## Core Concepts
+### Synchronous Design
+Synchronous design relies on **edge‑triggered storage elements** (flip‑flops) that sample their inputs only at well‑defined instants of a periodic clock signal. Between two successive clock edges the combinational logic may change arbitrarily; the flip‑flops hide this activity and present a stable value to the next stage.  
+*Why this matters:* By restricting state changes to clock edges we eliminate **race conditions** that would otherwise require hand‑shaking protocols. The system’s behavior becomes a deterministic function of the clock, which simplifies timing analysis and verification.
 
-### The Aperture: Setup and Hold Time
+### Clock Domains
+A **clock domain** is a maximal set of sequential elements that share the same clock source (including its phase and frequency). All signals that travel entirely within a domain experience the same clock‑edge timing, so intra‑domain paths can be verified with static timing analysis (STA).  
+When a signal leaves one domain and enters another, the relative phase between the two clocks is unknown; the crossing must be handled by a **synchronizer** (usually a chain of two flip‑flops) to reduce the probability of metastability to an acceptable level. The mean time between failures (MTBF) of a synchronizer is  
 
-A D flip-flop samples $D$ on the rising clock edge. But the transistor network implementing the master-slave latch requires the input to be stable *before* the edge so the master stage has time to charge its internal nodes to a valid level, and *after* the edge so the slave stage can latch a stable value before the master gate closes. These constraints are:
+$$
+\text{MTBF} = \frac{e^{\frac{t_w}{\tau}}}{T_0 \cdot f_{data} \cdot f_{clk}}
+$$
 
-- **Setup time** $t_{su}$: $D$ must be stable for at least $t_{su}$ before the clock edge.
-- **Hold time** $t_h$: $D$ must remain stable for at least $t_h$ after the clock edge.
-
-Together they define the **aperture window** $[-t_{su},\, +t_h]$ centered on the clock edge, during which $D$ must not transition.
-
-The flip-flop's output timing is characterized by two parameters:
-
-- **Clock-to-Q propagation delay** $t_{pcq}$: the *maximum* time from clock edge to valid $Q$. Used for setup analysis — it bounds how late $Q$ can arrive.
-- **Clock-to-Q contamination delay** $t_{ccq}$: the *minimum* time from clock edge before $Q$ begins to change. Used for hold analysis — it bounds how early $Q$ can corrupt a downstream input.
-
-These four numbers — $t_{su}$, $t_h$, $t_{pcq}$, $t_{ccq}$ — appear in every flip-flop datasheet and every static timing analysis (STA) report. Everything else in synchronous timing is derived from them.
-
-### Setup Time Violations: Maximum Frequency
-
-In a register-to-register path, $F_1$ drives combinational logic with propagation delay $t_{pd}$, whose output feeds $F_2$. The data launched by $F_1$ at clock edge $i$ must arrive at $F_2$'s input and be stable before clock edge $i+1$. This gives the **setup constraint**:
-
-$$T_c \geq t_{pcq} + t_{pd} + t_{su}$$
-
-where $T_c = 1/f_c$ is the clock period. The maximum operating frequency is therefore:
-
-$$f_{max} = \frac{1}{t_{pcq} + t_{pd} + t_{su}}$$
-
-A setup violation means $F_2$'s input is still transitioning when the clock edge arrives. Because the input hasn't reached a valid logic level, the master latch captures an indeterminate voltage. The result is metastability (see below) or a captured wrong value — not a predictable error.
-
-Setup violations are fixed by: reducing $t_{pd}$ (faster gates, shorter wires, pipeline insertion), increasing $T_c$ (lower clock frequency), or using flip-flops with smaller $t_{pcq}$ and $t_{su}$.
-
-### Hold Time Violations: The Dangerous One
-
-The hold constraint governs the *shortest* path from $F_1$ to $F_2$, not the longest. After $F_1$ launches new data, $F_2$ must not see that new data until it has finished capturing the old value. The constraint is:
-
-$$t_{ccq} + t_{cd} \geq t_h$$
-
-where $t_{cd}$ is the **contamination delay** of the combinational path — the minimum time for a change at the path's input to reach its output. This constraint is **independent of clock frequency**: it depends only on how fast the shortest path can propagate a change, regardless of $T_c$.
-
-The dangerous case is a direct flip-flop-to-flip-flop connection with no intervening logic ($t_{cd} = 0$). Then the constraint reduces to $t_{ccq} \geq t_h$, which may fail because $t_{ccq}$ is a small, technology-limited number. The canonical fix is **buffer insertion** on the short path: a buffer adds contamination delay without being on the critical (long) path, so it fixes the hold violation without degrading $f_{max}$.
-
-Hold violations cannot be fixed by slowing the clock. This is why they are more dangerous in silicon: they survive tape-out and manifest as functional failures at any frequency.
+where \(t_w\) is the available resolution time, \(\tau\) the metastability time constant, \(T_0\) a technology‑dependent constant, \(f_{data}\) the data‑change frequency, and \(f_{clk}\) the clock frequency.
 
 ### Metastability
+A flip‑flop is a bistable circuit. If the data input changes within the **setup‑hold window** around a clock edge, the circuit may be driven into a metastable state where the output lingers at an intermediate voltage before resolving to either logic‑0 or logic‑1. The resolution time follows an exponential distribution:
 
-When $D$ transitions inside the aperture window, the cross-coupled inverters inside the flip-flop's latch are driven to a symmetric unstable equilibrium — both nodes at approximately $V_{DD}/2$. This is the **metastable state**. The circuit will resolve to 0 or 1 as noise or asymmetry breaks the symmetry, but the time to resolve follows an exponential distribution: the probability of remaining metastable for longer than time $t_r$ decays as $e^{-t_r/\tau}$, where $\tau$ is a technology-dependent time constant (typically 20–200 ps in modern CMOS).
+$$
+P\{t_{res} > t\} = e^{-t/\tau}
+$$
 
-The mean time between failures (MTBF) for a synchronizer is:
-
-$$MTBF = \frac{e^{t_r / \tau}}{T_c \cdot f_{in} \cdot C}$$
-
-where $t_r$ is the resolution time available before the metastable output is sampled by the next stage, $f_{in}$ is the rate of input transitions, and $C$ is a flip-flop-specific constant. The numerator grows exponentially with $t_r$; the denominator grows linearly with $f_{in}$. Consequently:
-
-- Adding one extra synchronization stage (one more $T_c$ of resolution time) multiplies MTBF by $e^{T_c/\tau}$ — an exponential improvement.
-- Running the input faster ($f_{in}$) degrades MTBF only linearly.
-- Metastability cannot be eliminated, but MTBF can be made to exceed the age of the universe for practical parameters.
-
-A critical implication: you cannot detect metastability in software, and you cannot "check" whether a flip-flop resolved correctly after the fact. The only defense is architectural — giving the flip-flop enough time to resolve before its output is used.
-
-### Clock Domains and Synchronizers
-
-A **clock domain** is a set of flip-flops all driven by the same clock signal (or phase-aligned copies of it). When data crosses from domain A (clock $\phi_A$) to domain B (clock $\phi_B$), the standard setup and hold constraints do not apply — $\phi_B$'s edges are asynchronous to the moment $F_A$ changes its output, so $F_B$ may sample $D$ anywhere in its aperture window.
-
-The standard remedy is a **two-flip-flop synchronizer**: the signal passes through $FF_1$ then $FF_2$, both clocked by $\phi_B$.
-
-```
-Domain A          Domain B
-─────────    ┌──────────────────────────┐
-  FF_A ────▶ │ FF_1 ────▶ FF_2 ────▶ Logic │
-             └──────────────────────────┘
-                    clocked by φ_B
-```
-
-$FF_1$ may go metastable. It then has a full period $T_B$ to resolve before $FF_2$ samples it. $FF_2$ samples a (now valid) 0 or 1 and presents it to the rest of the domain. The MTBF equation above applies with $t_r = T_B - t_{su} - t_{pcq}$.
-
-For multi-bit CDC, a two-flop synchronizer is insufficient: the bits of a bus may be sampled by $FF_1$ across different cycles. Solutions include:
-
-- **Gray coding**: encode multi-bit counters so adjacent values differ by only one bit; a synchronizer error then produces the previous or next value, not an arbitrary one.
-- **Handshake protocols**: assert a "valid" signal, synchronize it, and only read the data bus after the synchronized acknowledge returns.
-- **Asynchronous FIFOs**: use Gray-coded read/write pointers, each synchronized into the opposite domain.
+with \(\tau\) typically on the order of picoseconds for modern CMOS. The longer we allow the output to settle (by adding extra synchronizer stages), the lower the failure probability.
 
 ### Reset Strategies
+* **Synchronous reset** – The reset signal is fed into the flip‑flop’s synchronous input (often via an AND gate with the data path) and is sampled on the clock edge. This guarantees that reset removal never violates setup/hold, but the reset latency is at least one clock period.  
+* **Asynchronous reset** – The reset pin directly forces the flip‑flop output to a known value, independent of the clock. De‑assertion, however, must be synchronized to the clock; otherwise a reset released near a clock edge can induce metastability. A common practice is to **synchronize the de‑assertion** with a two‑flip‑flop reset synchronizer.
 
-**Synchronous reset**: The reset signal is sampled on the clock edge, like any data input. The flip-flop's $D$ input is muxed: if `reset` is asserted, $D$ is forced to 0; otherwise $D$ is the real input. This means reset only takes effect one clock cycle after assertion, which is predictable and easy to time-analyze. It also means the clock must be running for reset to work.
+Both strategies must be chosen based on latency tolerance and the risk of reset‑induced metastability.
 
-**Asynchronous reset**: An asynchronous reset input on the flip-flop drives a direct path to the latch, independent of the clock. The flip-flop enters the reset state immediately upon assertion, regardless of clock state. This is essential at power-up, before the PLL or clock tree is stable.
+## How It Works
+### Timing Budgets
+Consider a launch flip‑flop **FF1**, a combinational block with propagation delay \(t_{pd}\), and a capture flip‑flop **FF2**.
 
-The hazard is **reset release** (deassertion). If `reset` goes low near a clock edge, different flip-flops in the design may see the deassertion on different cycles — a partial reset of the state machine. Worse, any flip-flop that sees the deassertion inside its aperture goes metastable *simultaneously with every other flip-flop in the design*.
+1. **Launch edge** at time \(t=0\) (clock edge at FF1).  
+2. After FF1’s clock‑to‑Q delay \(t_{pcq}\), the new data appears at FF1’s output.  
+3. The data traverses the combinational logic, arriving at FF2’s input after \(t_{pd}\).  
+4. FF2 will capture the data on the next clock edge at time \(T_c\) (the clock period).  
 
-The standard discipline is **asynchronous assert, synchronous deassert**:
+For correct capture the data must be stable **before** the setup window of FF2 closes:
 
-1. Assert reset asynchronously (immediate, clock-independent).
-2. Deassert reset through a synchronizer: feed
+$$
+t_{pcq} + t_{pd} \le T_c - t_{setup} - t_{skew}
+$$
+
+where \(t_{skew}\) accounts for the difference in clock arrival times at FF1 and FF2 (positive skew means the clock arrives later at FF2). Rearranging gives the **setup constraint**:
+
+$$
+\boxed{T_c \ge t_{pcq} + t_{pd} + t_{setup} + t_{skew}} \tag{1}
+$$
+
+The **hold constraint** ensures that the new data does not overwrite the previous capture too early:
+
+$$
+t_{pcq} + t_{pd} \ge t_{hold} + t_{skew}
+\quad\Longrightarrow\quad
+\boxed{t_{hold} \le t_{pcq} + t_{pd} - t_{skew}} \tag{2}
+$$
+
+If (2) is violated, a hold‑time failure occurs regardless of clock frequency; the fix is to add delay (e.g., buffer insertion) in the data path.
+
+### Clock Frequency
+From (1) the maximum usable frequency is
+
+$$
+f_{max} = \frac{1}{T_c^{min}} = \frac{1}{t_{pcq} + t_{pd} + t_{setup} + t_{skew}} .
+$$
+
+Clock **jitter** (\(\sigma_{jitter}\)) effectively reduces the available period; designers often substitute \(T_c \rightarrow T_c - \sigma_{jitter}\) in (1) for a safety margin.
+
+## Worked Examples
+### Example 1 – Minimum Clock Period
+Given:  
+\(t_{pcq}=2\text{ ns}\) , \(t_{pd}=5\text{ ns}\) , \(t_{setup}=1\text{ ns}\) , \(t_{skew}=0.5\text{ ns}\).
+
+Apply (1):
+
+$$
+\begin{aligned}
+T_c^{min} &= 2 + 5 + 1 + 0.5 \\
+          &= 8.5\text{ ns}.
+\end{aligned}
+$$
+
+Thus the system must be clocked at **≤ 117.6 MHz** (since \(f = 1/T_c\)).
+
+### Example 2 – Maximum Operating Frequency with Hold Check
+Given:  
+\(T_c = 10\text{ ns}\) , \(t_{pcq}=2\text{ ns}\) , \(t_{setup}=1\text{ ns}\) , assume \(t_{skew}=0\) and \(t_{hold}=0.5\text{ ns}\).
+
+First compute the allowable combinational delay from (1):
+
+$$
+t_{pd}^{max} = T_c - t_{pcq} - t_{setup} - t_{skew}
+              = 10 - 2 - 1 - 0 = 7\text{ ns}.
+\]
+
+Now verify hold using (2):
+
+$$
+t_{hold}^{max} = t_{pcq} + t_{pd} - t_{skew}
+               = 2 + 7 - 0 = 9\text{ ns} \gg 0.5\text{ ns},
+$$
+
+so the hold constraint is easily satisfied. The maximum frequency is
+
+$$
+f_{max} = \frac{1}{10\text{ ns}} = 100\text{ MHz}.
+$$
+
+### Example 3 – Impact of Clock Skew
+Suppose the same parameters as Example 1 but the clock arrives **0.3 ns later** at FF2 (\(t_{skew}=+0.3\text{ ns}\)). Then
+
+$$
+T_c^{min}=2+5+1+0.3=8.3\text{ ns}\;(≈120.5\text{ MHz}).
+\]
+
+If the skew were **‑0.3 ns** (clock early at FF2), the bound tightens to \(8.8\text{ ns}\) (≈113.6 MHz), illustrating how skew directly shifts the feasible frequency window.
+
+## Common Mistakes
+| # | Mistake | Why It’s Wrong | Consequence |
+|---|---------|----------------|-------------|
+| 1 | **Neglecting clock jitter** in the period budget | Jitter reduces the effective usable interval; treating \(T_c\) as deterministic yields optimistic frequency estimates. | Sporadic setup violations → silent data corruption, especially at high frequencies. |
+| 2 | **Using an asynchronous reset without a de‑assertion synchronizer** | Reset release can occur arbitrarily close to a clock edge, violating the flip‑flop’s recovery/removal time and inducing metastability. | System may power‑up correctly but lock up sporadically after reset de‑assertion. |
+| 3 | **Assuming a single‑cycle path for all logic** | Some functional blocks (e.g., multipliers, barrel shifters) inherently require multiple clock cycles; forcing them into one cycle inflates \(t_{pd}\) beyond the budget. | Timing closure fails; designers resort to unsafe clock gating or voltage over‑scaling. |
+| 4 | **Crossing clock domains with a single flip‑flop** | A single FF cannot sufficiently reduce metastability; the MTBF may be unacceptably low for the required operation time. | Field failures manifest as rare glitches that are hard to reproduce. |
+| 5 | **Over‑looking hold time when tightening the clock** | Reducing \(T_c\) to increase frequency does not affect hold; hold depends only on data path delays. | Hold violations appear after frequency scaling, necessitating redesign. |
+
+Each mistake stems from ignoring a **first‑principles timing constraint** (setup, hold, metastability, or domain crossing) and leads to unreliable silicon.
+
+## Exercises
+### Easy
+1. A design has \(t_{pcq}=1.2\text{ ns}\), \(t_{pd}=3.8\text{ ns}\), \(t_{setup}=0.8\text{ ns}\), and \(t_{skew}=0.2\text{ ns}\).  
+   Compute the minimum clock period \(T_c^{min}\) and the corresponding maximum frequency.
+
+### Medium
+2. Given \(T_c = 12\text{ ns}\), \(t_{pcq}=1.5\text{ ns}\), \(t_{setup}=0.9\text{ ns}\), \(t_{skew}=0.1\text{ ns}\), and a required hold time \(t_{hold}=0.4\text{ ns}\).  
+   Determine the maximum allowable combinational delay \(t_{pd}^{max}\) that satisfies both setup and hold.
+
+### Hard
+3. You must transfer a 1‑bit signal from a 125 MHz domain to a 100 MHz domain.  
+   * (a) Design a two‑flip‑flop synchronizer and compute its MTBF assuming \(\tau = 50\text{ ps}\), \(T_0 = 1\times10^{-12}\text{ s}\), \(f_{data}=125\text{ MHz}\), \(f_{clk}=100\text{ MHz}\), and a available resolution time \(t_w = 2\text{ ns}\).  
+   * (b) If the system must run for 10 years without a metastailure, what is the minimum \(t_w\) required?  
+
+### Challenge
+4. A processor core runs at 2 GHz with a clock‑to‑Q delay of 30 ps, setup of 40 ps, and negligible skew.  
+   * (a) What is the maximum combinational delay permissible per pipeline stage?  
+   * (b) If a particular ALU operation needs 250 ps of combinational delay, how many pipeline stages are required to meet the timing budget, assuming ideal stage balancing?  
+
+## Linux Connection
+Linux’s time‑keeping and interrupt subsystems are built on synchronous‑design principles at the hardware‑software boundary.
+
+### Clock Sources and HRTimers
+The kernel abstracts hardware timers through the **clocksource** framework (`include/linux/clocksource.h`). Each clocksource provides a free‑running counter that is read atomically; the counter value is derived from a **synchronous hardware incrementer** (e.g., the TSC on x86, ARM’s CNTVCT). The kernel converts the raw count to nanoseconds using a fixed‑point multiplier (`mult` and `shift`) – a direct application of the formula  
+
+$$
+\text{nsec} = \frac{(\text{cycles} \times \text{mult})}{2^{\text{shift}}} .
+\]
+
+*Real file:* `arch/x86/include/asm/msr.h` (RDTSC) and `kernel/time/clocksource.c`.
+
+**Shell command to view the current clocksource and its rating:**
+
+```bash
+cat /sys/devices/system/clocksource/clocksource0/available_clocksource
+cat /sys/devices/system/clocksource/clocksource0/current_clocksource
+```
+
+### High‑Resolution Timers (hrtimers)
+`hrtimer` (`kernel/time/hrtimer.c`) implements per‑CPU timer bases that are programmed into the hardware comparator (e.g., APIC timer on x86). The timer interrupt handler runs in a **hard interrupt context**, which is synchronous to the CPU’s local APIC clock. The hr timer’s callback is executed after the hardware compare‑match event, guaranteeing sub‑microsecond latency.
+
+*Example: measuring a short interval with `clock_gettime` (CLOCK_MONOTONIC):*
+
+```c
+/* measure_latency.c */
+#include <stdio.h>
+#include <time.h>
+#include <unistd.h>
+
+int main(void) {
+    struct timespec start, end;
+    clock_gettime(CLOCK_MONOTONIC, &start);
+    /* a tiny busy‑wait */
+    for (volatile int i = 0; i < 1000; ++i) ;
+    clock_gettime(CLOCK_MONOTONIC, &end);
+    double elapsed = (end.tv_sec - start.tv_sec) +
+                     1e-9 * (end.tv_nsec - start.tv_nsec);
+    printf("Elapsed: %.3f µs\n", elapsed * 1e6);
+    return 0;
+}
+```
+
+Compile and run:
+
+```bash
+gcc -O2 -o measure_latency measure_latency.c
+./measure_latency
+```
+
+### Synchronizing Access to Shared Data
+The Linux kernel uses **futexes** (`fs/futex.c`) as the primitive behind `pthread_mutex_lock/unlock`. A futex operation consists of:
+
+1. An atomic userspace test (e.g., `cmpxchg`).  
+2. If the test fails, the task executes a system call (`futex(FUTEX_WAIT)`) that puts it to sleep **synchronously** with the kernel scheduler’s tick (or hrtimer‑based timeout).  
+
+*Kernel source:* `kernel/futex.c`, `include/linux/futex.h`.
+
+**Shell command to inspect futex usage of a process:**
+
+```bash
+# Replace 1234 with the target PID
+cat /proc/1234/wchan   # shows if the task is waiting on a futex
+perf trace -p 1234 -e sys_exit:futex
+```
+
+### Real‑World Subsystem: Networking Stack
+The NIC driver’s **TX ring** is populated by the driver in sync with the NIC’s internal descriptor clock (often derived from the PCIe reference clock). The driver updates the producer index using a **memory‑mapped register**; the NIC consumes descriptors on its own synchronous clock. If the driver writes faster than the NIC can consume, the ring overruns—a classic **producer‑consumer** synchronous design issue. The driver must therefore respect the NIC’s reported `tx_ring->count` and use `netif_tx_lock` (a spinlock) to serialize accesses, ensuring that the producer and consumer stay within the same clock domain of the descriptor ring.
+
+*File:* `drivers/net/ethernet/vendor/device.c` (look for `netdev_tx_queue`).
+
+**Command to view TX ring statistics:**
+
+```bash
+ethtool -S eth0 | grep tx_queue
+```
+
+### Takeaway
+Linux synchronizes software actions to hardware clocks whenever deterministic timing is required—whether it’s reading a cycle counter, programming a hardware comparator, or coordinating descriptor rings. The same setup/hold, metastability, and clock‑domain concepts that govern FPGA/ASIC design also govern the kernel’s interaction with silicon.
+
+## Why This Matters
+Synchronous design is not an academic abstraction; it is the **foundation of reliable, predictable digital systems**. By anchoring every state transition to a clock edge we:
+
+* **Eliminate race conditions** that would otherwise demand complex handshaking or arbitration.  
+* **Enable static timing analysis**, allowing designers to certify timing closure before silicon is fabricated.  
+* **Bound metastability** to quantifiable probabilities, letting us size synchronizers for MTBF targets that exceed product lifetimes.  
+* **Provide a clear interface** between software and hardware: the kernel reads synchronous counters, programs synchronous timers, and coordinates DMA descriptors—all of which rely on the same setup/hold principles.
+
+In domains where a single glitch can have catastrophic consequences—financial trading platforms, medical imaging equipment, avionics, automotive control units—predictable timing is a **non‑functional requirement** that directly maps to safety certifications (DO‑178C, ISO 26262, IEC 61508). Mastery of synchronous design lets engineers:
+
+* Size clock periods and pipeline stages to meet throughput goals while preserving timing margins.  
+* Design robust clock‑domain crossing circuits that keep system MTBF in the centuries.  
+* Choose reset strategies that avoid power‑up glitches without sacrificing boot time.  
+* Interact confidently with Linux’s time‑keeping, interrupt, and synchronization subsystems, knowing that the underlying hardware obeys the same timing laws.
+
+Thus, a deep grasp of synchronous design transforms a theoretical concept into a practical lever for building **fast, correct, and safe** systems that Linux—and the applications that run on it—can depend on.

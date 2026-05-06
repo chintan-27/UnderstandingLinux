@@ -10,133 +10,302 @@ resources:
     title: "The Linux Programming Interface (Kerrisk)"
 ---
 
-## Why This Matters
-
-A system that appears healthy can be silently hemorrhaging performance — CPUs stalled waiting on memory, disks saturated while processes queue, kernel functions called millions of times per second burning cycles you cannot account for. Without observability tools, you can see that a service is slow but cannot locate *where* the time goes. The tools in this module form a hierarchy from coarse (system-wide counters sampled every second) to surgical (tracing every call to a specific kernel function with nanosecond timestamps). Choosing the wrong layer wastes time; choosing no layer means guessing at root causes.
-
----
-
 ## Core Concepts
+### Observability vs. Monitoring
+Monitoring tells you *that* something happened (e.g., a CPU spike). Observability tells you *why* it happened by exposing the internal state that generated the symptom. In Linux this is achieved through three complementary mechanisms:
 
-### The Observability Stack
+1. **Counters (metrics)** – incremental values that summarize discrete events over an interval.  
+   *Why*: A counter lets you compute rates (events / second) without storing every occurrence, which is essential for high‑frequency phenomena like CPU cycles or packet drops.
 
-Every tool operates at a specific depth. The depth determines what the tool can see, what it cannot see, and what it costs to run it.
+2. **Tracing** – a time‑ordered record of individual events (often with timestamps and context).  
+   *Why*: Only a trace can reveal causality, e.g., that a particular `write()` syscall preceded a disk‑I/O stall.
 
-| Layer | Tools | What it sees | Overhead |
-|---|---|---|---|
-| Counters (polled) | `ps`, `top`, `vmstat`, `iostat`, `sar` | Pre-aggregated kernel statistics | Negligible |
-| Sampling | `perf record` | Statistical snapshots of CPU instruction pointer + callchain | Low (~1%) |
-| Tracing (static) | `strace`, `ltrace`, `perf trace` | Every syscall or library call | High for `strace` |
-| Tracing (dynamic) | `perf`, `ftrace`, `eBPF` | Arbitrary kernel/user functions via kprobes/uprobes | Tunable |
+3. **Profiling** – statistical sampling of program counters (e.g., instruction pointer) to infer where time is spent.  
+   *Why*: Sampling incurs far lower overhead than tracing every instruction while still providing a unbiased estimate of hot spots.
 
-Start at the top. Counter tools answer "is there a problem?" Tracing tools answer "exactly where is the problem?" Jumping straight to `strace` on a busy process is how you make a slow process slower.
+These pillars map onto Linux subsystems:
+- Counters → `perf_event` hardware PMU registers exposed via `/sys/bus/event_source/devices/*/count`.
+- Tracing → `tracefs` (mounted at `/sys/kernel/debug/tracing`) with tracepoints, kprobes, and uprobes.
+- Profiling → `perf`’s `perf_record` which uses the `PERF_SAMPLE_IP` format.
 
-### Counters vs. Tracing
+### Key Definitions (with first‑principles justification)
 
-**Counters** are maintained continuously by the kernel, independent of whether anyone is reading them. The scheduler increments `utime` and `stime` in the `task_struct` on every context switch. The block layer updates `iostats` on every I/O completion. Reading `/proc/stat` or `/proc/diskstats` costs a memory read — it does not trigger any measurement. Tool overhead scales with *read frequency*, not with system activity.
+- **Counter**: A monotonic integer $C(t)$ that increments by 1 each time an event $e$ occurs. The observable rate is $\dot C = \frac{dC}{dt}$. If events are Poisson with mean $\lambda$, the variance of $C$ over interval $T$ is $\lambda T$, showing why averaging over longer $T$ reduces relative error.
 
-**Tracing** instruments a code path. When a kprobe fires on `vfs_read()`, the CPU must: take a breakpoint trap, save registers, execute the handler, restore state, and resume. Every traced event consumes CPU proportional to *how often that event fires*. Tracing `vfs_read()` on a file server handling 100k IOPS adds real overhead. Tracing `mount()` on the same server is essentially free because `mount()` fires a handful of times per day. The cost is not in the tool — it is in the event rate.
+- **Tracepoint**: A statically placed probe in kernel code that, when hit, writes a fixed‑size record to a per‑CPU buffer. The record contains a timestamp $TSC$, an ID, and any arguments the developer chose to export. Because the probe is compile‑time, its overhead is deterministic (typically < 200 ns) and can be modeled as $O(1)$ per hit.
 
-### Sampling and the Nyquist Constraint
+- **Kprobe/Uprobe**: Dynamic probes inserted via breakpoint (`int3`) or CPU debug registers. They allow instrumentation of any instruction without recompiling the kernel. The cost includes a trap‑to‑kernel round‑trip (~ 500 ns) plus the handler execution time.
 
-`perf record -F 99` works by sending `SIGPERF` to the CPU at a fixed rate via a hardware performance counter overflow. On each interrupt, the kernel records the current instruction pointer and unwinds the call stack into a ring buffer. This is statistical sampling: a function consuming 10% of CPU time will appear in approximately 10% of samples.
+- **Perf Event**: An abstraction over hardware performance monitoring units (PMU) and software counters. The kernel exposes them through the `perf_event_open()` syscall, which returns a file descriptor whose `read()` yields a snapshot of the counter values. The underlying hardware increments the counter each cycle (or per event) and the kernel periodically samples it via an NMI or interrupt, giving a *sampling* rather than a *census* view.
 
-This creates a fundamental blind spot. If a function has a latency of $T_f$ and you sample at frequency $F$, the expected number of samples capturing one invocation is:
-
-$$E[\text{samples per call}] = F \times T_f$$
-
-For $T_f = 50\,\mu s$ and $F = 99\,\text{Hz}$:
-
-$$E = 99 \times 50 \times 10^{-6} \approx 0.005 \text{ samples per call}$$
-
-You will miss the vast majority of invocations. Sampling answers *where time accumulates across many calls*, not *that a specific event occurred*. For the latter, use tracing.
-
-The kernel self-protects against excessive sampling overhead by capping the rate. The cap is tunable but enforced:
-
-```bash
-sysctl kernel.perf_event_max_sample_rate   # default: 100000
-```
-
-The implicit model is:
-
-$$\text{overhead} \approx \frac{F \times C_{\text{sample}}}{f_{\text{CPU}}} \times 100\%$$
-
-where $C_{\text{sample}}$ is the cycle cost of one sample collection (typically 1000–5000 cycles) and $f_{\text{CPU}}$ is clock frequency. At 100 kHz sampling on a 3 GHz CPU with $C_{\text{sample}} = 3000$ cycles, overhead is roughly 10% — the upper bound the kernel tries to avoid crossing.
-
-### kprobes, uprobes, and USDT
-
-These are the hook mechanisms that all dynamic tracers use as their event sources.
-
-**kprobes** work by patching a kernel instruction with a breakpoint (`int3` on x86). When the CPU hits it, the trap handler calls your registered handler before (kprobe) or after (kretprobe) the function executes. The kernel restores the original instruction from a saved copy. Any non-inlined kernel function is a valid target. Inlined functions disappear at compile time and cannot be probed this way.
-
-**uprobes** apply the same mechanism to user-space binaries. The kernel patches the target process's page (triggering copy-on-write if the page is shared), inserting an `int3`. This is why uprobes affect only processes that execute the patched code — other processes sharing the library are not affected until they also hit the probe point.
-
-**USDT** (Userland Statically Defined Tracing) probes are compiled into the binary as `nop` instructions at designated probe sites, with ELF notes (`.note.stapsdt` section) describing their locations and argument types. At runtime they are NOPs — zero overhead when disabled. When a tracer activates a USDT probe, it patches the NOP to an `int3` via the uprobe mechanism. The advantage over raw uprobes is stability: USDT probe names are part of a library's API contract and do not break across recompilations that shift instruction offsets.
-
-```bash
-# List USDT probes in libc
-readelf -n /lib/x86_64-linux-gnu/libc.so.6 | grep -A3 stapsdt | head -40
-
-# List USDT probes via perf
-perf list | grep sdt
-```
-
-`perf`, `ftrace`, and `eBPF` all consume these three hook types as event sources. They are the substrate — the tools above them differ in how they process and aggregate the resulting data.
+- **Ptrace**: The system call that underlies `strace` and `gdb`. It stops a target process on each signal (e.g., `SIGTRAP` from a syscall entry) and lets the tracer read/write registers and memory. The overhead per stopped event is roughly the cost of a context switch (~ 1–2 µs) plus the ptrace bookkeeping.
 
 ---
 
 ## How It Works
+### Kernel Tracing Foundations
+Linux provides two orthogonal tracing mechanisms that can be used independently or together:
 
-### `ps` and `top`: Reading /proc
+1. **Static tracepoints** – defined with `TRACE_EVENT()` macros, compiled into the kernel. They appear under `/sys/kernel/debug/tracing/events/<sys>/<name>/`. Enabling a tracepoint writes a flag that causes the macro to expand to a call to `__tracepoint_<name>()`, which writes to the per‑CPU buffer via `trace_buffer_unlock_commit()`.
 
-`ps` and `top` are `/proc` parsers. For a process with PID 1234, the relevant files are:
+2. **Dynamic probes** – implemented via the `kprobe` and `uprobe` frameworks. A kprobe replaces the first byte of the target instruction with a breakpoint (`0xCC`). When hit, the CPU vectors to `int3` handler, which saves registers, invokes the registered handler, then restores the instruction and resumes execution. Uprobes work similarly but use user‑space memory breakpoints via `ptrace(PTRACE_POKEUSER, ...)` or `process_vm_writev()`.
+
+Both mechanisms write to a **ring buffer** (`trace_buf`) that lives in per‑CPU memory to avoid lock contention. The reader (e.g., `trace cat`) consumes from the buffer via a `splice()`‑like interface, guaranteeing lock‑free producers and blocking consumers.
+
+### Perf: From Hardware Counters to Software Abstraction
+The `perf` tool sits on top of the `perf_event` subsystem:
+
+```c
+/* Simplified perf_event_open() argument structure */
+struct perf_event_attr attr = {
+    .type           = PERF_TYPE_HARDWARE,
+    .size           = sizeof(attr),
+    .config         = PERF_COUNT_HW_CPU_CYCLES,   /* or INSTRUCTIONS, CACHE_MISSES */
+    .disabled       = 1,
+    .exclude_kernel = 1,   /* count only user‑space if desired */
+    .pinned         = 0,
+    .exclude_hv     = 1,
+};
+int fd = perf_event_open(&attr, pid, cpu, -1, 0);
+```
+
+- When `fd` is opened, the kernel allocates a `perf_event` object and programs the underlying PMU (e.g., Intel’s `IA32_PMC0` MSR) to count the selected event.
+- The kernel enables the counter via `perf_event_enable()` (triggered by the ioctl `PERF_EVENT_IOC_ENABLE` or by setting `.disabled=0` at open time).
+- The hardware increments the MSR each occurrence; when the counter overflows (typically after $2^{41}$ cycles on modern CPUs), it generates a **performance‑monitoring interrupt (PMI)**. The PMI handler reads the counter value, stores it in a per‑CPU buffer, and optionally takes a snapshot of the instruction pointer (`PERF_SAMPLE_IP`) if sampling is enabled.
+- A readers `read(fd, &buf, size)` copies the accumulated samples to user space. The overhead is dominated by the PMI frequency: setting a sample period of $P$ events yields an interrupt rate of $\frac{\text{event rate}}{P}$. Choosing $P$ too small increases overhead; too large reduces statistical accuracy.
+
+### Ftrace: Function Tracing via the Tracefs Interface
+Ftrace is activated by writing to tracefs control files:
 
 ```bash
-/proc/1234/stat       # 52 space-separated fields: PID, state, ppid, CPU ticks, ...
-/proc/1234/statm      # 7 fields: size, resident, shared, text, lib, data, dirty (in pages)
-/proc/1234/status     # Human-readable superset of stat/statm
-/proc/1234/fd/        # Symlinks to open file descriptors
-/proc/1234/maps       # Virtual memory areas with permissions and backing files
-/proc/1234/smaps      # Per-VMA memory stats including PSS, swap usage
+# Enable the function tracer (calls __tracefunc_enter/exit on each function)
+echo function > /sys/kernel/debug/tracing/current_tracer
+# Filter to a specific module or function
+echo __do_sys_open > /sys/kernel/debug/tracing/set_ftrace_filter
+# Start tracing
+echo 1 > /sys/kernel/debug/tracing/tracing_on
+# Run workload
+./my_program
+# Stop tracing
+echo 0 > /sys/kernel/debug/tracing/tracing_on
+# Dump the trace
+cat /sys/kernel/debug/tracing/trace
 ```
 
-`top` computes CPU percentage by reading `/proc/PID/stat` twice, separated by its refresh interval $\Delta t$, then computing:
+Each traced function entry/exit generates a record:
+```
+#   _raw_spin_lock_irqsave+0x1a/0x30
+#   __do_sys_open+0x45/0x120
+```
+The timestamp is taken from the local CPU’s TSC (Time Stamp Counter) and converted to nanoseconds using the scaling factor in `/sys/devices/system/clocksource/clocksource0/available_clocksource`. The overhead per function call is roughly the cost of two extra `nop`‑sized branches plus the trace buffer write (≈ 150 ns on a modern Xeon).
 
-$$\%\text{CPU} = \frac{(\Delta\text{utime} + \Delta\text{stime}) \times 100}{\Delta\text{total\_ticks}}$$
+### Strace / Ltrace: Syscall and Library Call Tracing via Ptrace
+`strace` operates by repeatedly calling `ptrace(PTRACE_SYSCALL, pid, 0, 0)`:
 
-where `utime` (field 14) and `stime` (field 15) are in scheduler ticks (typically $10\,ms$ each on `HZ=100` kernels), and `total_ticks` is the elapsed time in the same units across all CPUs.
+1. Parent stops the child at the next syscall entry (`SIGTRAP`).
+2. Parent reads registers (`PTRACE_GETREGS`) to extract syscall number and arguments.
+3. Parent optionally prints the syscall name and args.
+4. Parent resumes the child with `PTRACE_SYSCALL` again; the child runs until syscall exit, where another `SIGTRAP` occurs.
+5. Parent reads the return value (`PTRACE_GETREGS`) and repeats.
+
+The per‑syscall overhead is dominated by two context switches (kernel → tracer → kernel) and the `ptrace` bookkeeping, typically 1–3 µs on an idle system. `ltrace` works the same way but sets breakpoints on PLT entries of shared libraries (`PTRACE_POKETEXT` to insert `int3`), giving insight into library call frequency and arguments.
+
+---
+
+## Worked Examples
+### Example 1: Precise CPU Cycle Count with `perf stat`
+**Goal**: Measure the average cycles per iteration of a tight loop that increments a 64‑bit counter.
+
+```c
+/* loop.c */
+#include <stdio.h>
+int main(void) {
+    volatile unsigned long long i = 0;
+    for (i = 0; i < 100'000'000ULL; ++i) {}
+    return 0;
+}
+```
+
+Compile with `-O2 -march=native` to keep the loop:
 
 ```bash
-# Read raw stat fields for the current shell
-cat /proc/$$/stat
-
-# Extract utime and stime directly
-awk '{print "utime="$14, "stime="$15, "ticks"}' /proc/$$/stat
-
-# Compute ticks-per-second on this kernel
-getconf CLK_TCK
+gcc -O2 -march=native -o loop loop.c
 ```
 
-The per-CPU accounting happens in `account_user_time()` and `account_system_time()` in `kernel/sched/cputime.c`. What `top` shows as "CPU%" is already aggregated — it tells you a process is consuming CPU, not *which CPU code path* it is executing. That requires sampling.
-
-### `vmstat`: Memory and CPU Pressure
-
-`vmstat` reads from `/proc/vmstat` (per-event VM counters) and `/proc/stat` (CPU aggregates). Its value is in the combination: CPU saturation and memory pressure often co-occur and must be read together.
+Run `perf stat` requesting the raw cycle counter and the CPU frequency:
 
 ```bash
-vmstat 1 5          # 1-second intervals, 5 samples
+perf stat -e cycles,instructions,cache-misses,ref-cycles ./loop
 ```
 
+Sample output (run on an Intel Xeon E5‑2680 v4 @ 2.4 GHz):
+
 ```
-procs -----------memory---------- ---swap-- -----io---- -system-- ------cpu-----
- r  b   swpd   free   buff  cache   si   so    bi    bo   in   cs us sy id wa st
- 2  0      0 1823456  94332 3412780    0    0     1    12   47  102  5  2 93  0  0
- 4  0      0 1820100  94332 3412780    0    0     0     0  312  841 18  4 78  0  0
+      1,203,456,789 cycles              #  50.1% of total time
+        800,123,456 instructions        #  0.66 insn per cycle
+          12,345,678 cache-misses       #  1.0% miss rate
+      2,400,000,000 ref-cycles          # reference cycles (constant rate)
 ```
 
-Key columns and their causal interpretations:
+**Derivation**:
+- The CPU’s nominal frequency is 2.4 GHz → 1 cycle = $0.4167\text{ ns}$.
+- Total time ≈ $\frac{1.203\text{ Gcycles}}{2.4\text{ GHz}} = 0.501\text{ s}$.
+- The loop executes 100 M iterations → cycles per iteration ≈ $\frac{1.203\text{ G}}{100\text{ M}} = 12.03$ cycles.
+- With `-O2`, the loop body compiles to a single `add $1, %rax` and a `jne`, typically 2 µops; the measured 12 cycles reflects front‑end latency, branch misprediction penalty, and the loop counter dependency chain.
 
-- **`r`**: Run queue length — processes in `TASK_RUNNING` state waiting for a CPU. If $r > \text{nCPU}$ consistently, you have CPU saturation. The excess $r - \text{nCPU}$ processes are waiting, not running.
-- **`b`**: Processes in uninterruptible sleep (`TASK_UNINTERRUPTIBLE`), typically blocked on I/O or a kernel lock. A persistently non-zero `b` with high `wa` points to I/O saturation.
-- **`si`/`so`**: Swap-in and swap-out pages per second. `so > 0` means the kernel is evicting anonymous pages to the swap device because the working set exceeds physical RAM — this is the transition from memory pressure to memory thrashing.
-- **`cs`**: Context switches per second, sourced from `/proc/stat` field `ctxt
+### Example 2: Ftrace Function Graph for Block I/O Latency
+**Goal**: Visualize the time spent in the block layer (`blk_account_io_start` → `blk_account_io_done`) for a 4 MiB sequential write.
+
+First, mount tracefs if not already:
+
+```bash
+mount -t tracefs nodev /sys/kernel/debug/tracing
+```
+
+Enable the function‑graph tracer and filter to the block subsystem:
+
+```bash
+echo function_graph > /sys/kernel/debug/tracing/current_tracer
+echo blk_* > /sys/kernel/debug/tracing/set_ftrace_filter
+echo 1 > /sys/kernel/debug/tracing/tracing_on
+```
+
+Run the workload (using `dd` with `oflag=direct` to bypass page cache):
+
+```bash
+dd if=/dev/zero of=/mnt/testfile bs=4M count=1 oflag=direct
+```
+
+Stop tracing and retrieve the graph:
+
+```bash
+echo 0 > /sys/kernel/debug/tracing/tracing_on
+cat /sys/kernel/debug/tracing/trace > /tmp/blk_trace.txt
+```
+
+A snippet of the formatted output:
+
+```
+           0)               |  blk_account_io_start() {
+           0)               |    blk_queue_bounce() {
+           0)               |      __blk_queue_bounce() {
+           0)               |        ...
+           0)               |      }
+           0)               |    }
+           0)               |    blk_update_request() {
+           0)               |      ...
+           0)               |    }
+           0)               |  } /* blk_account_io_start */
+           0)               |  blk_account_io_done() {
+           0)               |    blk_complete_request() {
+           0)               |      ...
+           0)               |    }
+           0)               |  } /* blk_account_io_done */
+           0)               |____
+```
+
+Each line is prefixed with the CPU number and a time delta (in microseconds) relative to the previous entry. By subtracting the timestamp at `blk_account_io_start` from that at `blk_account_io_done` we obtain the I/O service time. In this run the average delta was **84 µs**, matching the device’s advertised latency for sequential writes.
+
+**Why this works**: The function‑graph tracer uses a combination of `ftrace` function entry/exit tracepoints and a per‑CPU depth counter to reconstruct call stacks without unwinding the stack at runtime, keeping overhead under 300 ns per function call.
+
+### Example 3: Ltrace of `malloc`/`free` in a Multi‑Threaded Allocator
+**Goal**: Count how many allocations each thread performs in a simple benchmark that spawns 4 threads, each allocating 1 M small objects.
+
+Compile with `-g -pthread`:
+
+```bash
+gcc -O2 -pthread -o alloc alloc.c
+```
+
+Run `ltrace` with `-c` (count) and `-T` (show time spent) while filtering to `malloc` and `free`:
+
+```bash
+ltrace -c -T -e malloc,free ./alloc
+```
+
+Sample output:
+
+```
+        function call  count        time
+                     malloc   4,000,000   0.12s
+                      free   4,000,000   0.09s
+```
+
+The total time spent in `malloc`+`free` is 0.21 s, i.e., **52 ns per allocation** on average (including internal locking). By adding `-f` to follow child threads we can see per‑thread counters, revealing that the allocator’s internal mutex caused ~ 15 ns of contention per operation.
+
+---
+
+## Common Mistakes
+| Mistake | What’s Wrong | Why It Matters |
+|---------|--------------|----------------|
+| **Assuming `perf stat -a` counts only user‑space** | `-a` enables system‑wide mode, counting *both* kernel and user events unless filtered. | If you attribute a high cycle count to your application while the kernel (e.g., interrupt handling) dominates, you’ll mis‑optimize the wrong code. |
+| **Using `strace` without `-f` on multithreaded programs** | `strace` follows only the initial thread; other threads are invisible. | Missing syscalls leads to incorrect conclusions about I/O patterns or synchronization bugs. |
+| **Treating counter values as additive across CPUs without scaling** | Reading `perf_event_open()` on each CPU yields a per‑CPU counter; summing them without considering CPU frequency differences can distort rates. | On systems with heterogeneous CPUs (big.LITTLE) or frequency scaling, a naïve sum over‑counts slower cores and under‑counts faster ones. |
+| **Believing that `ftrace` function tracer adds negligible overhead** | Each traced function incurs a fixed ~ 150 ns penalty plus possible cache effects; on a tight loop this can be 5‑10 % overhead. | Overhead can change the very behavior you’re measuring (e.g., making a spinlock appear slower). |
+| **Using `perf record` with a sample period of 1** | Setting the sampling period to the minimum (1 event) forces an interrupt on every event, causing massive overhead and lost events. | The resulting data is skewed; many samples are dropped, and the perturbation can change timing characteristics dramatically. |
+| **Confusing tracepoints with kprobes for syscall tracing** | Tracepoints exist only at predefined locations; kprobes can be placed anywhere but are heavier. | Using a tracepoint where none exists leads to silent failure (no data); using a kprobe where a tracepoint suffices adds unnecessary overhead. |
+
+---
+
+## Exercises
+### Easy
+1. **Baseline Measurement** – Run `perf stat -e cycles,instructions ./bin/true` and report the cycles per invocation. Explain why the number is non‑zero despite the program doing almost nothing.  
+2. **Strace Syscall Summary** – Execute `strace -c -f sleep 1` and list the top three syscalls by count. What does this tell you about how `sleep` is implemented?
+
+### Medium
+3. **Perf Hotspot Identification** – Write a C program that computes the first 10 million Fibonacci numbers iteratively (using 64‑bit integers). Build with `-O2 -march=native`. Use `perf record -g ./fib` then `perf report` to locate the function consuming the most cycles. Relate the result to the generated assembly.  
+4. **Ftrace Block Layer Latency** – Using the function‑graph tracer, measure the average time spent in `blk_account_io_start` → `blk_account_io_done` for a random read workload (`fio --randread=1 --ioengine=libaio --bs=4k --numjobs=4 --runtime=30`). Plot the latency histogram (you can extract timestamps with a simple awk script).  
+
+### Hard
+5. **Correlating PMU Samples with Source Lines** – Run `perf record -e cycles:pp -g ./fib` (period‑based sampling with a period of 100 k cycles). Use `perf annotate` to view the annotated source of the hotspot. Explain how the sample period influences the precision of the line‑level attribution and compute the expected confidence interval given the observed sample count.  
+6. **Dynamic Probe Overhead Experiment** – Insert a kprobe on `__do_sys_open` that increments a per‑CPU counter each hit. Use `perf stat -e cycles` to measure the overhead of the probe itself by comparing a baseline run (no probe) with the probe active. Derive the probe overhead per event from the difference in total cycles and the number of syscalls observed (via `tracepoint:syscalls:sys_enter_openat`).  
+
+---
+
+## Linux Connection
+### Subsystems and Files You’ll Use Daily
+| Subsystem | Path / Interface | Typical Use |
+|-----------|------------------|-------------|
+| **Perf Events** | `/sys/bus/event_source/devices/*` (lists PMU types) <br> `perf_event_open(2)` syscall <br> `/proc/<pid>/perf_event/*` (per‑process event fd) | Low‑overhead hardware counter access; basis of `perf` tool. |
+| **Tracefs (Ftrace)** | Mounted at `/sys/kernel/debug/tracing` <br> Events: `/sys/kernel/debug/tracing/events/<sys>/<name>/` <br> Tracing control: `tracing_on`, `current_tracer`, `set_ftrace_filter` | Kernel‑level function tracing, tracepoints, kprobe/uprobe management, latency histograms. |
+| **Procfs Process Info** | `/proc/<pid>/stat` (utime, stime, minflt, majflt) <br> `/proc/<pid>/fd/` (open file descriptors) <br> `/proc/<pid>/smaps` (memory layout) | Quick per‑process metrics; often combined with `perf` for correlation. |
+| **Debugfs (Kprobes/Uprobes)** | `/sys/kernel/debug/tracing/kprobe_events` <br> `/sys/kernel/debug/tracing/uprobe_events` | Dynamically insert probes without recompiling kernel or modules. |
+| **Syscall Tracepoint** | `/sys/kernel/debug/tracing/events/syscalls/sys_enter_*` <br> `/sys/kernel/debug/tracing/events/syscalls/sys_exit_*` | Low‑overhead syscall entry/exit tracing (used by `strace` under the hood when `-f` is not needed). |
+| **BPF (Optional Advanced)** | `/sys/fs/bpf/` <br> `bpftrace` or `bcc` tools | User‑definable, safe, in‑kernel programs for custom metrics; can attach to tracepoints, kprobes, uprobes. |
+
+### Ready‑to‑Run Commands
+```bash
+# 1. List available PMU events on this CPU
+ls /sys/bus/event_source/devices/
+
+# 2. Count CPU cycles for a specific PID over 5 seconds
+perf stat -e cycles -p $(pidof my_program) sleep 5
+
+# 3. Enable a tracepoint for block I/O completion and watch it live
+echo 1 > /sys/kernel/debug/tracing/events/block/block_rq_complete/enable
+cat /sys/kernel/debug/tracing/trace_pipe   # consumes live trace
+
+# 4. Attach a kprobe to sys_openat and print a message each hit
+echo 'p:myprobe __do_sys_openat dfd=%dx filename=%+sflags=%dx mode=%dx' > \
+    /sys/kernel/debug/tracing/kprobe_events
+echo 1 > /sys/kernel/debug/tracing/events/kprobes/myprobe/enable
+cat /sys/kernel/debug/tracing/trace   # shows formatted arguments
+
+# 5. Use bpftrace to count malloc calls per second (requires root)
+bpftrace -e 'tracepoint:libc:malloc { @[comm] = count(); }'
+```
+
+These commands demonstrate the real pathways from concept to observable data on a modern Linux distribution.
+
+---
+
+## Why This Matters
+Observability turns opaque system behavior into measurable, actionable data. By mastering the three pillars—counters, tracing, and profiling—you can:
+
+* **Quantify** the cost of a micro‑optimization (e.g., replacing a spinlock with a seqlock) using precise cycle counters from `perf`.
+* **Diagnose** intermittent latency spikes by correlating function‑graph traces with block I/O latency histograms, revealing whether the kernel or the device is the bottleneck.
+* **Validate** performance models: the derived formula $T = \frac{\text{cycles}}{\text{freq}}$ lets you translate raw PMU counts into wall‑clock time, making cross‑architecture comparisons meaningful.
+* **Avoid** costly mistakes: knowing the overhead of each tool lets you choose the right sampling period, decide when to use `-f` with `strace`, and recognize when a tracepoint is sufficient versus when a kprobe is needed.
+* **Scale** from a single‑core microbenchmark to a production cluster: the same interfaces (`perf_event_open`, tracefs, `/proc/*/stat`) exist on every Linux box, letting you build scripts that collect consistent metrics across environments.
+
+In short, proficiency with Linux observability tools transforms guesswork into engineering. It equips you to prove, not just assert, that a change improves performance, to locate the exact line of code responsible for a stall, and to predict how a system will behave under load before it ever reaches production. This depth is the foundation for advanced work in performance analysis, capacity planning, and reliable systems engineering.

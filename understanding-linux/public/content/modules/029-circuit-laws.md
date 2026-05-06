@@ -10,142 +10,320 @@ resources:
     title: "Microelectronic Circuits (Sedra and Smith)"
 ---
 
-## Why This Matters
-
-Every circuit you will analyze — from the voltage regulator powering a CPU core to the pull-up resistor on an I²C bus — obeys three laws. Without Ohm's law you cannot predict current through a resistor, which means you cannot size a current-limiting resistor for an LED, cannot explain why a GPIO pin burns out when driven into a short, and cannot derive why a linear regulator's heat output scales with input-output voltage difference. Without Kirchhoff's laws you cannot track current at a junction or enforce voltage consistency around a loop — which means you cannot analyze a voltage divider, a feedback network, or a power rail. These laws are not approximations for simple circuits: they are the constraints that make any circuit analysis deterministic.
-
----
-
 ## Core Concepts
+### Ohm’s Law from Microscopic Charge Transport  
+In a conductor, free electrons experience an average drift velocity \(v_d\) proportional to the applied electric field \(E\):  
+\[
+v_d = \mu E
+\]  
+where \(\mu\) is the electron mobility (m² V⁻¹ s⁻¹). Current density \(J\) is charge per unit area per unit time:  
+\[
+J = n e v_d = n e \mu E
+\]  
+with \(n\) the free‑electron density and \(e\) the elementary charge. Defining conductivity \(\sigma = n e \mu\) gives the microscopic Ohm’s law \(J = \sigma E\). For a uniform conductor of length \(L\) and cross‑section \(A\),  
+\[
+V = EL,\qquad I = JA \;\Rightarrow\; V = \frac{L}{\sigma A} I \equiv RI,
+\]  
+so resistance \(R = L/(\sigma A)\) and conductance \(G = 1/R = \sigma A/L\).  
 
-### Ohm's Law
+### Kirchhoff’s Current Law (KCL) – Charge Conservation  
+Consider a node (junction) where \(k\) conductors meet. Over a time interval \(\Delta t\), the net charge entering the node must equal the net charge leaving, otherwise charge would accumulate, violating the continuity equation \(\partial\rho/\partial t + \nabla\!\cdot\!J = 0\). Summing currents (positive for entering, negative for leaving) gives  
+\[
+\sum_{i=1}^{k} I_i = 0 \quad\Longleftrightarrow\quad \sum I_{\text{in}} = \sum I_{\text{out}} .
+\]  
+KCL holds for any lumped‑element circuit regardless of element linearity.
 
-A resistor is defined by a linear relationship between voltage and current:
+### Kirchhoff’s Voltage Law (KVL) – Conservative Electrostatic Field  
+The electric field in a static circuit is conservative: \(\oint_{\mathcal{C}} \mathbf{E}\cdot d\mathbf{l}=0\) for any closed loop \(\mathcal{C}\). Voltage drop across an element is defined as the line integral of \(\mathbf{E}\) through that element. Summing the signed drops around a loop yields zero:  
+\[
+\sum_{j=1}^{m} V_j = 0 .
+\]  
+If time‑varying magnetic flux links the loop, Faraday’s law adds an emf term; KVL then applies to the *total* voltage (including induced emf).
 
-$$V = IR$$
+### Conductance, Resistance, and the Passive Sign Convention  
+* Conductance \(G\) (S) quantifies how easily current flows for a given voltage: \(I = GV\).  
+* Resistance \(R\) (Ω) quantifies opposition: \(V = IR\).  
+* The passive sign convention assigns current entering the positive voltage terminal of an element; then \(P = VI\) is the power *absorbed* by the element (positive for dissipation, negative for generation).  
 
-The linearity is the key property. It means resistance is a *constant* — independent of $V$ and $I$ — which is what distinguishes a resistor from a diode or a transistor. If you apply 5 V across a 1 kΩ resistor, you get exactly 5 mA. If you double the voltage, you get exactly 10 mA. Any deviation from this linearity means the device is not behaving as a resistor.
-
-The physical origin of resistance is electron-lattice scattering. Electrons moving through a conductor collide with atoms; each collision transfers kinetic energy to the lattice as heat. More scattering per unit length means higher resistance. This gives the macroscopic formula:
-
-$$R = \rho \frac{L}{A}$$
-
-where $\rho$ is resistivity (units: $\Omega \cdot \text{m}$, a material constant), $L$ is conductor length, and $A$ is cross-sectional area. Doubling the length doubles the scattering path; doubling the area provides two parallel scattering paths, halving resistance. This is why PCB trace resistance matters: a long, thin trace on a high-current rail creates a measurable voltage drop.
-
-Power dissipated in a resistor — energy delivered to the lattice per second — is:
-
-$$P = IV = I^2 R = \frac{V^2}{R}$$
-
-All three forms follow from substituting $V = IR$ into $P = IV$. Use whichever form matches what you know: if you know current and resistance, use $I^2 R$; if you know voltage and resistance, use $V^2/R$.
-
-### Kirchhoff's Current Law (KCL)
-
-At any node in a circuit, charge cannot accumulate:
-
-$$\sum_{k} I_k = 0$$
-
-where currents entering the node are positive and currents leaving are negative (or vice versa, as long as you are consistent). This is charge conservation, not an approximation — it holds at every node, at every instant, in DC and in AC circuits (with the caveat that at high frequencies, displacement current in capacitors must be accounted for, but the generalized form still holds).
-
-The practical consequence: in a series circuit, current is identical at every point. There are no branch nodes, so there is nowhere else for current to go. In a parallel circuit, the source current splits among branches, and KCL tells you exactly how.
-
-### Kirchhoff's Voltage Law (KVL)
-
-Around any closed loop, the signed sum of all voltage differences is zero:
-
-$$\sum_{k} V_k = 0$$
-
-This is energy conservation. A charge carrier traversing a complete loop returns to its starting point, so the net work done on it is zero. Every volt gained through a source must be lost across loads. The sign convention: voltage rises (moving from − to + through a source) are positive; voltage drops (moving through a resistor in the direction of current) are negative.
-
-KVL is what makes "voltage" a well-defined concept — it guarantees that the potential at a node has a single value regardless of which path you took to get there. If KVL were violated, node voltages would be path-dependent and circuit analysis would be impossible.
-
----
+These three laws together form a complete linear description of any lumped‑element circuit composed of resistors, independent sources, and (later) linear capacitors/inductors via their impedance analogues.
 
 ## How It Works
+### From Laws to Equations  
+1. **Element Relations** – Replace each branch by its constitutive law: for a resistor \(V_k = I_k R_k\); for a voltage source \(V_k = V_{s,k}\); for a current source \(I_k = I_{s,k}\).  
+2. **KCL at Nodes** – Write \(\sum I_{\text{leaving}} = 0\) for every independent node (reference node excluded). Substituting the element relations gives equations linear in the unknown node voltages.  
+3. **KVL around Loops** – Write \(\sum V = 0\) for each independent loop. Substituting the element relations yields equations linear in the unknown loop currents (mesh analysis).  
 
-### Resistor-Based Current Source and Its Fundamental Limit
+Because the element relations are linear (Ohm’s law), the resulting system is a set of linear algebraic equations. Solving them yields all branch currents and node voltages.
 
-The simplest way to source a constant current is a resistor in series with a supply. If the supply is $V_S$ and the total series resistance is $R$, the current into a load $R_L$ is:
+#### Nodal Analysis Derivation (Key Step)  
+Select a reference node (ground). For each node \(i\) with voltage \(V_i\), the current leaving node \(i\) through a resistor connecting to node \(j\) is  
+\[
+I_{ij} = \frac{V_i - V_j}{R_{ij}} .
+\]  
+Summing over all resistors attached to node \(i\) and adding any attached current sources \(I_{s,i}\) gives the KCL equation:  
+\[
+\sum_{j} \frac{V_i - V_j}{R_{ij}} + I_{s,i} = 0 .
+\]  
+Rearranging:  
+\[
+\left(\sum_{j}\frac{1}{R_{ij}}\right) V_i - \sum_{j}\frac{1}{R_{ij}} V_j = - I_{s,i}.
+\]  
+In matrix form \(\mathbf{G}\mathbf{V} = \mathbf{I}_s\), where \(\mathbf{G}\) is the conductance matrix (symmetric, positive‑definite for passive networks). Solving \(\mathbf{V} = \mathbf{G}^{-1}\mathbf{I}_s\) gives node voltages; branch currents follow from Ohm’s law.
 
-$$I = \frac{V_S}{R + R_L}$$
+#### Mesh Analysis Derivation (Key Step)  
+Assign a loop current \(I_k\) to each independent mesh. The voltage drop across a resistor shared by meshes \(k\) and \(l\) is \(R_{kl}(I_k - I_l)\). Summing drops around mesh \(k\) and equating to any mesh‑inserted voltage sources \(V_{s,k}\) yields:  
+\[
+\sum_{l} R_{kl}(I_l - I_k) = V_{s,k}.
+\]  
+Collecting terms gives the impedance matrix equation \(\mathbf{Z}\mathbf{I} = \mathbf{V}_s\).  
 
-For the current to be approximately constant as $R_L$ varies, you need $R \gg R_L$, so that $R_L$ contributes negligibly to the denominator. The fractional change in current for a change $\Delta R_L$ in load is:
+Both formulations are equivalent; the choice depends on which yields fewer equations (nodes vs meshes).
 
-$$\frac{\Delta I}{I} \approx \frac{\Delta R_L}{R + R_L} \approx \frac{\Delta R_L}{R}$$
+### Superposition and Linearity  
+Because the governing equations are linear, the response to multiple independent sources equals the sum of responses to each source acting alone (others set to zero: voltage sources → short, current sources → open). This principle underlies many analysis techniques and is directly used in SPICE’s *DC sweep* and *AC analysis* modes.
 
-**Example**: You need 10 mA ±1% into a load that swings 0–10 V (i.e., $R_L$ swings 0–1 kΩ).
+## Worked Examples
+### Example 1: Series Resistance (Node‑Based)  
+**Circuit:** 10 V source → \(R_1=5\;\Omega\) → \(R_2=10\;\Omega\) → back to source.  
+**Goal:** Find loop current \(I\).
 
-The load voltage swing of 10 V at 10 mA represents a $\Delta R_L$ of 1 kΩ. For 1% regulation:
+1. Choose reference node at the negative terminal of the source.  
+2. Node voltage \(V_1\) is the voltage across the series string (unknown).  
+3. KCL at the top node: current entering from source equals current leaving through \(R_1\) (same as through \(R_2\) because series):  
+   \[
+   \frac{V_s - V_1}{0} = \frac{V_1 - 0}{R_1+R_2}
+   \]  
+   (the source is ideal, so its internal resistance is 0 Ω; we treat it as a known voltage).  
+4. Directly, the series resistance is \(R_{eq}=R_1+R_2=15\;\Omega\).  
+5. Apply Ohm’s law:  
+   \[
+   I = \frac{V_s}{R_{eq}} = \frac{10\text{ V}}{15\;\Omega}= \frac{2}{3}\text{ A}\approx0.667\text{ A}.
+   \]  
 
-$$\frac{\Delta R_L}{R} < 0.01 \implies R > \frac{1\,\text{k}\Omega}{0.01} = 100\,\text{k}\Omega$$
+### Example 2: Parallel Resistance (Node‑Based)  
+**Circuit:** 10 V source → node A → two resistors \(R_1=5\;\Omega\) and \(R_2=10\;\Omega\) to ground.  
+**Goal:** Currents \(I_1, I_2\).
 
-At 10 mA through 100 kΩ, the supply must be at least:
+1. Node A voltage \(V_A\) unknown; ground is 0 V.  
+2. KCL at node A (current from source splits):  
+   \[
+   I_s = I_1 + I_2 .
+   \]  
+   The source current \(I_s\) equals the current delivered by the 10 V source: \(I_s = V_s / R_{eq}\) where \(R_{eq}\) is the parallel combination.  
+3. Express branch currents via Ohm’s law:  
+   \[
+   I_1 = \frac{V_A}{R_1},\qquad I_2 = \frac{V_A}{R_2}.
+   \]  
+4. KCL gives:  
+   \[
+   \frac{V_s - V_A}{0} = \frac{V_A}{R_1} + \frac{V_A}{R_2} \;\Rightarrow\; V_A = V_s = 10\text{ V}
+   \]  
+   (ideal source forces node voltage to source voltage).  
+5. Hence:  
+   \[
+   I_1 = \frac{10}{5}=2\text{ A},\qquad I_2 = \frac{10}{10}=1\text{ A}.
+   \]  
 
-$$V_S = I \cdot R = 0.01\,\text{A} \times 100\,\text{k}\Omega = 1000\,\text{V}$$
+### Example 3: Bridge Circuit (Nodal Analysis)  
+**Circuit:** Diamond‑shaped bridge with resistors:  
+- Top left \(R_1=5\;\Omega\) (between node 1 and node 2)  
+- Top right \(R_2=10\;\Omega\) (node 2 to node 3)  
+- Bottom left \(R_3=15\;\Omega\) (node 1 to node 4)  
+- Bottom right \(R_4=20\;\Omega\) (node 4 to node 3)  
+- Cross‑branch \(R_5=25\;\Omega\) (node 2 to node 4)  
+A 12 V source connects node 1 (positive) to node 3 (negative).  
 
-and the resistor dissipates:
+**Goal:** Find current through \(R_5\).
 
-$$P_R = I^2 R = (0.01)^2 \times 100{,}000 = 10\,\text{W}$$
+1. Choose node 3 as reference (0 V). Unknown node voltages: \(V_1, V_2, V_4\).  
+2. Write KCL at each unknown node (currents leaving node = sum of \((V_i-V_j)/R_{ij}\)).  
 
-This is the fundamental problem with resistor-based current sources: tight regulation requires enormous headroom voltage, and that headroom is entirely dissipated as heat. A transistor current source (or a dedicated IC like the LT3092) decouples regulation quality from supply voltage by using active feedback instead of a large passive impedance.
+   *Node 1:*  
+   \[
+   \frac{V_1-V_2}{R_1} + \frac{V_1-V_4}{R_3} + \frac{V_1-0}{R_s}=0,
+   \]  
+   where the source is modeled as a 12 V voltage source to reference → we replace the term \(\frac{V_1-0}{R_s}\) with a known current injection:  
+   \[
+   I_s = \frac{12\text{ V}}{0}\;\text{(ideal)} \;\Rightarrow\; \text{instead set } V_1 = 12\text{ V}.
+   \]  
+   Since node 1 is forced to 12 V by the source, we eliminate it.
 
-### Voltage Divider via KVL + KCL
+   *Node 2:*  
+   \[
+   \frac{V_2-12}{R_1} + \frac{V_2-V_4}{R_5} + \frac{V_2-0}{R_2}=0 .
+   \]  
 
-Two resistors in series across supply $V_S$:
+   *Node 4:*  
+   \[
+   \frac{V_4-12}{R_3} + \frac{V_4-V_2}{R_5} + \frac{V_4-0}{R_4}=0 .
+   \]  
 
+3. Substitute numbers (all resistances in Ω):  
+
+   Node 2:  
+   \[
+   \frac{V_2-12}{5} + \frac{V_2-V_4}{25} + \frac{V_2}{10}=0
+   \]  
+   → multiply by 50:  
+   \[
+   10(V_2-12) + 2(V_2-V_4) + 5V_2 = 0
+   \]  
+   → \(10V_2-120 + 2V_2-2V_4 +5V_2 =0\)  
+   → \((10+2+5)V_2 -2V_4 =120\)  
+   → \(17V_2 -2V_4 =120\) (1)
+
+   Node 4:  
+   \[
+   \frac{V_4-12}{15} + \frac{V_4-V_2}{25} + \frac{V_4}{20}=0
+   \]  
+   → multiply by 300 (LCM):  
+   \[
+   20(V_4-12) + 12(V_4-V_2) + 15V_4 =0
+   \]  
+   → \(20V_4-240 +12V_4-12V_2 +15V_4 =0\)  
+   → \((20+12+15)V_4 -12V_2 =240\)  
+   → \(47V_4 -12V_2 =240\) (2)
+
+4. Solve (1)–(2):  
+
+   From (1): \(V_2 = \frac{120+2V_4}{17}\).  
+   Insert into (2):  
+   \[
+   47V_4 -12\left(\frac{120+2V_4}{17}\right)=240
+   \]  
+   → \(47V_4 -\frac{1440+24V_4}{17}=240\)  
+   → multiply 17: \(799V_4 -1440 -24V_4 =4080\)  
+   → \((799-24)V_4 =4080+1440=5520\)  
+   → \(775V_4 =5520\) → \(V_4 = \frac{5520}{775}\approx7.122\text{ V}\).  
+
+   Then \(V_2 = \frac{120+2(7.122)}{17}= \frac{120+14.244}{17}= \frac{134.244}{17}\approx7.896\text{ V}\).  
+
+5. Current through \(R_5\) (from node 2 to node 4):  
+   \[
+   I_{R_5}= \frac{V_2-V_4}{R_5}= \frac{7.896-7.122}{25}= \frac{0.774}{25}\approx0.03096\text{ A}=31\text{ mA}.
+   \]  
+
+The bridge is not balanced; a small current flows diagonally.
+
+## Common Mistakes
+| Mistake | Why It’s Wrong | How to Avoid |
+|---|---|---|
+| **Assuming the same current through parallel branches** | Parallel elements share the same voltage, not the same current; current divides according to conductance (\(I_i = V/R_i\)). | Write KCL at the shared node; compute each branch current separately using Ohm’s law. |
+| **Using a voltmeter with non‑infinite internal resistance** | A real voltmeter draws a small current, loading the circuit and altering node voltages, especially in high‑impedance nodes. | Model the voltmeter as a large resistance (typically 10 MΩ) and include it in the nodal equations, or use a buffer amplifier. |
+| **Treating a diode as a linear resistor** | Diodes exhibit exponential I‑V; linearizing only works around a bias point. | Use the Shockley diode equation or piecewise‑linear model; verify operating point before applying \(V=IR\). |
+| **Mixing RMS and peak values in AC power calculations** | Power \(P = V_{\text{rms}} I_{\text{rms}}\cos\phi\); using peak values gives a factor of 2 error. | Convert sinusoidal amplitudes to RMS (\(V_{\text{rms}}=V_{p}/\sqrt{2}\)) before computing power or energy. |
+| **Neglecting temperature dependence of resistance** | \(R(T)=R_0[1+\alpha (T-T_0)]\); ignoring \(\alpha\) leads to bias in power‑dissipation estimates. | Include temperature coefficient \(\alpha\) in simulations or measure resistance at operating temperature. |
+| **Assuming zero internal resistance for batteries** | Real sources have internal resistance \(r\); neglecting it overestimates deliverable current and ignores voltage sag under load. | Model the source as an ideal voltage source in series with \(r\); solve the resulting circuit. |
+| **Applying KVL to a loop with changing magnetic flux without emf term** | Faraday’s law adds \(\mathcal{E}= -d\Phi_B/dt\); omitting it yields incorrect loop equations. | Include the induced emf as an additional voltage source in the KVL sum. |
+
+## Exercises
+### Easy  
+1. A 9 V battery powers a single resistor of 470 Ω. Compute the current and the power dissipated in the resistor.  
+
+### Medium  
+2. Three resistors are connected: \(R_1=100\;\Omega\) and \(R_2=220\;\Omega\) in parallel, and this combination is in series with \(R_3=330\;\Omega\). A 15 V source drives the network.  
+   a) Find the equivalent resistance.  
+   b) Determine the total current from the source.  
+   c) Calculate the voltage across \(R_2\) and the current through it.  
+
+### Hard  
+3. Consider the bridge circuit of Example 3 but replace the 12 V source with a sinusoidal source \(v_s(t)=12\sqrt{2}\cos(2\pi 60t)\) V (peak 12 V RMS). Assume all resistors are unchanged and the circuit is purely resistive.  
+   a) Derive the expression for the instantaneous current through \(R_5\).  
+   b) Compute the RMS value of that current.  
+   c) If a 10 µF capacitor is placed in parallel with \(R_5\), write the differential equation governing the voltage across the capacitor and solve for its steady‑state sinusoidal amplitude.  
+
+## Linux Connection
+### Simulating Circuits with ngspice  
+`ngspice` is the SPICE variant packaged in most distributions. A netlist file (`example.cir`) describes the circuit; `ngspice` performs DC, AC, or transient analysis and writes raw data that can be plotted with `gnuplot`.
+
+```bash
+# Create a simple RC low‑pass netlist
+cat > rc_lowpass.cir <<EOF
+* RC low‑pass filter
+Vin in 0 DC 5
+R1 in out 1k
+C1 out 0 1uF
+.tran 0.1ms 20ms
+.control
+run
+plot v(out) v(in)
+.endc
+.end
+EOF
+
+# Run the simulation
+ngspice -b rc_lowpass.cir
+
+# Plot the result (gnuplot reads the raw file produced by ngspice)
+gnuplot -p -e "set datafile separator whitespace; \
+               plot 'rc_lowpass.raw' using 1:2 with lines title 'Vout', \
+                    '' using 1:3 with lines title 'Vin'"
 ```
-    Vs
-    |
-   [R1]
-    |---- Vout
-   [R2]
-    |
-   GND
+
+### Measuring Power with the RAPL Interface (Intel)  
+Modern x86 CPUs expose energy counters via the Running Average Power Limit (RAPL) model. The counters reside in sysfs under `/sys/class/powercap/intel-rapl:0/`. Reading the counter twice and dividing by the elapsed time yields average power.
+
+```bash
+# Read initial energy (microjoules)
+E1=$(cat /sys/class/powercap/intel-rapl:0/energy_uj)
+
+# Wait 1 second
+sleep 1
+
+# Read final energy
+E2=$(cat /sys/class/powercap/intel-rapl:0/energy_uj)
+
+# Compute average power in watts
+P=$(( (E2 - E1) / 1000000 ))   # µJ → J, divided by 1 s → W
+echo "Average power over last second: $P W"
 ```
 
-KVL around the outer loop: $V_S - V_{R1} - V_{R2} = 0$
+### Accessing an ADC via the Industrial I/O (IIO) Subsystem  
+Many embedded Linux boards expose analog‑to‑digital converters through IIO. The following C snippet reads a single‑ended channel from an ADC device (`iio:device0`) using the sysfs interface.
 
-KCL at the middle node (with no current drawn from $V_{out}$): the current through $R_1$ equals the current through $R_2$, call it $I$.
+```c
+/* adc_read.c – read voltage from IIO channel 0 */
+#include <stdio.h>
+#include <stdlib.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <string.h>
 
-Ohm's law for each resistor: $V_{R1} = IR_1$, $V_{R2} = IR_2$.
+int main(void)
+{
+    const char *path = "/sys/bus/iio/devices/iio:device0/in_voltage0_raw";
+    int fd = open(path, O_RDONLY);
+    if (fd < 0) {
+        perror("open");
+        return EXIT_FAILURE;
+    }
 
-Substituting into KVL: $V_S = I(R_1 + R_2)$, so $I = V_S/(R_1 + R_2)$.
+    char buf[16];
+    ssize_t n = read(fd, buf, sizeof(buf)-1);
+    if (n < 0) {
+        perror("read");
+        close(fd);
+        return EXIT_FAILURE;
+    }
+    buf[n] = '\0';
+    close(fd);
 
-Therefore:
+    long raw = strtol(buf, NULL, 10);
+    /* Assume 12‑bit ADC with reference 3.3 V */
+    float voltage = (raw * 3.3f) / 4095.0f;
+    printf("ADC raw=%ld → voltage=%.3f V\n", raw, voltage);
+    return EXIT_SUCCESS;
+}
+```
 
-$$V_{out} = IR_2 = V_S \cdot \frac{R_2}{R_1 + R_2}$$
+Compile and run:
 
-The ratio $R_2/(R_1+R_2)$ is always less than 1, so $V_{out} < V_S$. The divider only works as derived when negligible current is drawn from the output — any load resistance in parallel with $R_2$ changes $R_2$ to $R_2 \| R_L = R_2 R_L/(R_2+R_L)$, lowering $V_{out}$.
+```bash
+gcc -Wall -O2 adc_read.c -o adc_read
+sudo ./adc_read   # needs read permission on sysfs IIO nodes
+```
 
-This equation directly controls the LM317 output voltage. The LM317 regulates the voltage between its OUT and ADJ pins to a fixed 1.25 V reference. With $R_1$ from OUT to ADJ and $R_2$ from ADJ to GND:
+These examples show how the abstract circuit laws become concrete Linux tools: simulation (ngspice), power accounting (RAPL), and analog sensing (IIO).
 
-$$V_{out} = 1.25\,\text{V} \cdot \left(1 + \frac{R_2}{R_1}\right)$$
-
-Changing $R_2$ programs the output. The derivation is pure KVL plus the definition of what the LM317 regulates.
-
-### KCL at a Switching Node: Buck Converter Output
-
-In a buck converter's output stage, $I_L$ is the inductor current, $I_{out}$ is the load current, and $I_C$ is the current into the output capacitor. KCL at the output node:
-
-$$I_L = I_{out} + I_C$$
-
-Rearranging: $I_C = I_L - I_{out}$
-
-When $I_L > I_{out}$, $I_C > 0$ — the capacitor is charging and the output voltage is rising. When $I_L < I_{out}$, $I_C < 0$ — the capacitor is discharging and the output voltage is falling. The converter's control loop adjusts the switching duty cycle to keep the average $I_L = I_{out}$, maintaining the output voltage. KCL is the mechanism by which this bookkeeping works at every instant.
-
-### KVL + Ohm's Law: Linear Regulator Heat Dissipation
-
-A linear regulator passes the full load current through a series pass transistor. The transistor drops the excess voltage. With 12 V input, 5 V output, 500 mA load:
-
-KVL around the series path: $V_{in} = V_{drop} + V_{out}$
-
-$$V_{drop} = 12\,\text{V} - 5\,\text{V} = 7\,\text{V}$$
-
-KCL says the same current passes through the transistor and the load (it's a series path). Power in the transistor:
-
-$$P = V_{drop} \cdot I = 7\,\text{V} \times 0.5\,\text{A} = 3.5\,\text{W}$$
-
-The efficiency is:
-
-$$\eta = \frac{P_{out}}{P_{in}} = \frac{V_{out}}{V_{in}} = \frac{5}{12} \approx 42\%$$
-
-The remaining 58% is heat. This is intrinsic to the linear topology — you cannot improve it without changing $V
+## Why This Matters
+Mastering Ohm’s law, KCL, and KVL gives you the analytical toolkit to predict how any interconnection of passive elements will behave under excitation. That predictive ability is the foundation of *circuit design*: choosing component values to meet voltage‑gain, bandwidth, or power‑budget targets. In the Linux ecosystem, those same principles appear everywhere the kernel manages energy—from the RAPL counters that let you measure and cap CPU power, to the IIO framework that turns a physical voltage into a readable integer for sensor drivers, to SPICE‑based tools like `ngspice` that let you prototype analog front‑ends before soldering a single resistor. By linking the first‑principles equations to real‑world interfaces (sysfs, ioctl, netlists), you can write drivers, power‑management policies, and validation scripts that are both electrically sound and Linux‑native. Thus, the circuit laws are not just textbook theory; they are the lingua franca that lets software and hardware speak the same language, enabling efficient, reliable, and measurable electronic systems.

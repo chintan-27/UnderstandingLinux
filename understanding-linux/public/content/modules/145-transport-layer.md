@@ -10,130 +10,267 @@ resources:
     title: "Unix Network Programming (Stevens)"
 ---
 
-## Why This Matters
-
-The network layer is deliberately dumb: it drops packets when router buffers overflow, reorders them when routing tables change mid-flight, and delivers corrupted ones unless the link layer catches the error first. Every application that needs ordered, reliable data delivery would have to solve retransmission, duplicate detection, and rate control independently — and would solve them incompatibly. More importantly, without coordinated rate control, a single aggressive sender triggers **congestion collapse**: retransmissions consume all available bandwidth, leaving no capacity for useful data. This isn't theoretical — in 1986, ARPANET throughput dropped by a factor of 1000 because TCP didn't yet implement congestion control. Van Jacobson's 1988 algorithms (slow start, congestion avoidance, fast retransmit) fixed this, and their core logic still runs in every Linux kernel today.
-
----
-
 ## Core Concepts
+### Introduction to Transport Layer
+The transport layer sits between the network layer (which offers a best‑effort, unreliable datagram service) and the application layer (which expects process‑to‑process communication). Its fundamental job is to **provide logical channels** that add semantics the network layer does not: reliability, ordering, flow control, and congestion avoidance. Without these guarantees, applications would have to reimplement them, violating the end‑to‑end principle and duplicating effort across the stack.
 
-### Ports: Multiplexing Connections onto One Host
+### TCP (Transmission Control Protocol)
+TCP is a **connection‑oriented, byte‑stream protocol** that offers:
+* **Reliability** – via acknowledgments (ACKs), sequence numbers, and retransmission timers.
+* **In‑order delivery** – the receiver buffers out‑of‑order segments and delivers them to the application only when the next expected sequence number arrives.
+* **Flow control** – the receiver advertises a window (`rwnd`) telling the sender how much buffer space is free.
+* **Congestion control** – the sender adapts its transmission rate based on inferred network congestion.
 
-An IP address identifies a machine. A port identifies a process endpoint. The kernel demultiplexes incoming segments using the full **5-tuple**: `(protocol, src_ip, src_port, dst_ip, dst_port)`. Two browser tabs connecting to the same server get different ephemeral source ports, so they map to different socket structures in the kernel despite sharing the same destination.
+These features arise from the need to compensate for the network layer’s *lossy, unordered, and variable‑delay* service. The protocol state machine (LISTEN → SYN_SENT → SYN_RECV → ESTABLISHED → FIN_WAIT_* → …) ensures that both ends agree on initial sequence numbers (ISNs) and can detect duplicated or stale packets.
 
-Port ranges are enforced by the kernel, not convention:
-- **0–1023**: well-known; `bind()` requires `CAP_NET_BIND_SERVICE`
-- **1024–49151**: registered; userspace can bind freely
-- **49152–65535**: ephemeral; assigned by the kernel when the application doesn't call `bind()`
+### UDP (User Datagram Protocol)
+UDP is a **connectionless, message‑oriented protocol** that offers:
+* **Best‑effort delivery** – no retransmission, no ordering guarantees.
+* **Low overhead** – 8‑byte header (source port, destination port, length, checksum) vs. TCP’s ≥20‑byte header.
+* **Message boundaries preserved** – each `sendto`/`recvfrom` call corresponds to exactly one IP datagram.
 
-The ephemeral range on Linux is configurable:
+Applications choose UDP when they can tolerate loss (e.g., media streaming) or need to implement their own reliability/congestion mechanisms (e.g., QUIC, DNS over UDP).
 
-```bash
-cat /proc/sys/net/ipv4/ip_local_port_range
-# typical output: 32768	60999
-```
+### Ports and Sockets
+* **Ports** are 16‑bit identifiers (`0–65535`) that demultiplex incoming packets to the correct process.  
+  *Well‑known ports* (0‑1023) are assigned by IANA; *registered* (1024‑49151) and *dynamic/ephemeral* (49152‑65535) ranges follow.
+* A **socket** is the kernel‑level endpoint: a tuple `(local_ip, local_port, remote_ip, remote_protocol_port)` plus associated buffers and state.  
+  In Linux, a socket is represented by a `struct sock` (net/core/sock.h) and, for TCP, a `struct tcp_sock` (net/ipv4/tcp.h). The file descriptor returned by `socket(2)` indexes into the per‑process file table.
 
-When the kernel assigns an ephemeral port, it searches this range for a 5-tuple that isn't already in use. If the range is exhausted — common on high-connection-rate servers — `connect()` returns `EADDRNOTAVAIL`.
+### Reliability and Flow Control
+Reliability in TCP hinges on **cumulative acknowledgments**: an ACK with sequence number `ACK=n` declares receipt of all bytes `< n`.  
+If a segment is lost, the sender detects it via:
+* **Duplicate ACKs** (three same ACKs → fast retransmit) or  
+* **Retransmission timeout (RTO)**.
 
-### UDP: Unreliable but Precisely Minimal
+Flow control uses the **sliding window**: the sender may transmit up to `min(cwnd, rwnd)` bytes without waiting for an ACK, where `cwnd` is the congestion window and `rwnd` the receiver’s advertised window. The receiver updates `rwnd` in each ACK (`rwnd = RCV.BUF - RCV.NXT`), preventing overflow of its receive buffer.
 
-UDP adds ports and an optional checksum to raw IP, and nothing else. A single `sendto()` produces exactly one IP datagram. There is no connection state, no kernel buffer management, no retransmission. The checksum covers the header, payload, and a pseudo-header (src IP, dst IP, protocol, length) — which is why a corrupted IP header that changes the destination can still be caught.
+### Congestion Control
+Congestion control prevents **congestion collapse**, a state where excessive retransmissions waste bandwidth and increase delay. TCP’s classic Reno/NewReno algorithm combines:
+* **Slow start** – exponential increase of `cwnd` (by 1 MSS per ACK) until a loss event or `ssthresh`.
+* **Congestion avoidance** – linear increase (`cwnd += MSS² / cwnd` per ACK).
+* **Fast retransmit / fast recovery** – on three duplicate ACKs, retransmit the missing segment and set `cwnd = ssthresh + 3·MSS` (Reno) or `cwnd = ssthresh` (NewReno), then inflate by MSS per duplicate ACK.
 
-UDP is the right transport when:
-- **Latency dominates correctness** (DNS, NTP, online games): a retransmitted DNS response that arrives after the timeout is useless
-- **The application owns reliability** (QUIC implements its own selective acknowledgment and congestion control on top of UDP, gaining TLS integration and stream multiplexing without TCP's head-of-line blocking)
-- **Multicast or broadcast is required** (TCP is point-to-point by design)
-
-```c
-// Minimal UDP send — one syscall, one datagram
-int fd = socket(AF_INET, SOCK_DGRAM, 0);
-struct sockaddr_in dst = {
-    .sin_family = AF_INET,
-    .sin_port   = htons(53),
-    .sin_addr   = { .s_addr = inet_addr("8.8.8.8") },
-};
-sendto(fd, buf, len, 0, (struct sockaddr *)&dst, sizeof(dst));
-```
-
-### TCP: Reliable Byte Stream
-
-TCP delivers the abstraction of an infinite, lossless, ordered byte pipe. The implementation underneath involves segment numbering, cumulative acknowledgment, retransmission, receive buffering for reordering, and two separate rate controllers (flow control and congestion control). Each byte in the stream has an implicit position tracked by the sequence number. The application reads from a socket buffer; it never sees segment boundaries.
-
-Connection setup requires a **three-way handshake** because both sides must synchronize their initial sequence numbers (ISNs), and each side must confirm that the other's ISN was received:
-
-```
-Client                          Server
-  |-- SYN (seq=x) ------------->|   client picks ISN x
-  |<-- SYN-ACK (seq=y, ack=x+1)-|   server picks ISN y, acks x
-  |-- ACK (ack=y+1) ----------->|   client acks y
-```
-
-ISNs are randomized to prevent **TCP sequence prediction attacks**, where a third party injects segments into an existing connection by guessing valid sequence numbers.
+Mathematically, let `RTT` be the measured round‑trip time. The **ideal throughput** (ignoring loss) is:
+$$
+\text{Throughput} \approx \frac{\text{cwnd}}{\text{RTT}} \quad \text{bytes/sec}
+$$
+When loss occurs, the multiplicative decrease (`cwnd ← cwnd/2`) reduces the sending rate to probe for available bandwidth.
 
 ---
 
 ## How It Works
+### Connection Establishment – Three‑Way Handshake
+1. **Client → Server**: `SYN` with `seq = ISN_c`.  
+   *Why?* To inform the server of the client’s initial sequence number.
+2. **Server → Client**: `SYN‑ACK` with `seq = ISN_s`, `ack = ISN_c + 1`.  
+   *Why?* Acknowledges the client’s `SYN` and conveys the server’s ISN.
+3. **Client → Server**: `ACK` with `seq = ISN_c + 1`, `ack = ISN_s + 1`.  
+   *Why?* Completes bidirectional synchronization; prevents acceptance of delayed duplicate `SYN`s (PAWS algorithm uses timestamps to reject old SYNs).
 
-### TCP Segment Structure
+State transitions (Linux): `TCP_LISTEN → TCP_SYN_RECV → TCP_ESTABLISHED`.
 
+### Data Transfer – Sliding Window & ACK Mechanics
+* Sender maintains `send_una` (oldest unacknowledged byte) and `send_nxt` (next byte to send).  
+* Receiver maintains `rcv_nxt` (next expected byte) and `rcv_wnd` (available buffer).  
+* On each ACK:
+  ```
+  if (ack > send_una) {
+      send_una = ack;
+      // free acknowledged data from retransmission queue
+  }
+  cwnd = update_cwnd(cwnd, ack, dup_ack_cnt);
+  ```
+* **Delayed ACK** (RFC 1122): receiver may wait up to 200 ms or until a second full‑sized segment arrives before sending an ACK, reducing ACK traffic.
+* **Nagle’s algorithm**: buffers small writes until either an ACK arrives or the packet reaches MSS, preventing tiny packets.
+
+### Flow Control in Detail
+Receiver advertises:
+$$
+rwnd = \text{RCV.BUFFER} - (\text{RCV.NXT} - \text{RCV.NXT\_START})
+$$
+Sender’s **effective window**:
+$$
+\text{eff\_wnd} = \min(cwnd, rwnd) - (\text{send\_nxt} - \text{send\_una})
+$$
+If `eff_wnd == 0`, the sender pauses and may send a **zero‑window probe** after the retransmission timeout to learn when the receiver frees space.
+
+### Congestion Control Algorithms (Reno/NewReno)
+* **Slow start**:  
+  $$ cwnd \leftarrow cwnd + MSS \quad \text{per ACK} $$  
+  (exponential growth: after *n* RTTs, `cwnd ≈ 2ⁿ·MSS`).
+* **Congestion avoidance**:  
+  $$ cwnd \leftarrow cwnd + \frac{MSS^2}{cwnd} \quad \text{per ACK} $$  
+  (≈ linear increase of `cwnd` per RTT).
+* **On loss (timeout)**:  
+  $$ ssthresh \leftarrow \max\left(\frac{cwnd}{2}, 2\cdot MSS\right) $$  
+  $$ cwnd \leftarrow 1\cdot MSS $$  
+  (restart slow start).
+* **On loss (3 dup ACKs)**:  
+  $$ ssthresh \leftarrow \max\left(\frac{cwnd}{2}, 2\cdot MSS\right) $$  
+  $$ cwnd \leftarrow ssthresh + 3\cdot MSS $$ (Reno)  
+  then **fast recovery**: for each additional dup ACK, `cwnd += MSS`; on new ACK, `cwnd = ssthresh`.
+
+Linux exposes these variables via `tcp_info` (see `getsockopt(fd, IPPROTO_TCP, TCP_INFO, ...)`).
+
+---
+
+## Worked Examples
+### Example 1: TCP Connection Establishment with Timing
+Assume:
+* Client ISN = `0x1A2B3C4D`
+* Server ISN = `0x9F0E1D2C`
+* One‑way propagation delay = `30 ms` (RTT ≈ `60 ms`).
+
+| Time (ms) | Action | Packet | Seq | Ack |
+|-----------|--------|--------|-----|-----|
+| 0         | Client sends SYN | `SYN` | `0x1A2B3C4D` | — |
+| 30        | Server receives SYN | — | — | — |
+| 30        | Server sends SYN‑ACK | `SYN‑ACK` | `0x9F0E1D2C` | `0x1A2B3C4E` |
+| 60        | Client receives SYN‑ACK | — | — | — |
+| 60        | Client sends ACK | `ACK` | `0x1A2B3C4E` | `0x9F0E1D2D` |
+| 90        | Server receives ACK | — | — | — |
+
+**Result:** Connection established at *t = 90 ms*. The three‑way exchange guarantees that both sides know each other’s ISN despite possible packet reordering or duplication.
+
+### Example 2: TCP Throughput with Slow Start
+Parameters:
+* MSS = 1460 bytes
+* Initial `cwnd = 10·MSS` (RFC 6928) = 14 600 bytes
+* RTT = 50 ms
+* No loss until `cwnd` reaches 64 KB.
+
+**Slow start progression** (bytes sent per RTT):
 ```
- 0                   1                   2                   3
- 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5 6 7 8 9 0 1
-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-|          Source Port          |       Destination Port        |
-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-|                        Sequence Number                        |
-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-|                    Acknowledgment Number                      |
-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-|  Data |           |U|A|P|R|S|F|                               |
-| Offset| Reserved  |R|C|S|S|Y|I|            Window             |
-|       |           |G|K|H|T|N|N|                               |
-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
-|           Checksum            |         Urgent Pointer        |
-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+-+
+RTT0: cwnd = 10·MSS  → 14 600 B
+RTT1: cwnd = 20·MSS  → 29 200 B
+RTT2: cwnd = 40·MSS  → 58 400 B
+RTT3: cwnd = 80·MSS  → 116 800 B (cwnd > 64 KB, switch to avoidance)
 ```
+Throughput after RTT2 (still in slow start):
+$$
+\frac{58 400\text{ B}}{0.05\text{ s}} = 1.168\text{ MB/s} ≈ 9.34\text{ Mbps}
+$$
+After entering congestion avoidance at RTT3, increase per RTT ≈ `MSS² / cwnd`:
+$$
+\Delta cwnd ≈ \frac{1460^2}{116800} ≈ 18.3\text{ B} ≈ 0.0125·MSS
+$$
+Thus cwnd grows slowly, yielding ~1.2 MB/s steady‑state if loss-free.
 
-Key fields:
+### Example 3: UDP Loss Tolerance in a Video Stream
+A video encoder sends UDP packets of 1200 bytes (payload) every 20 ms (50 pps).  
+Network loss probability `p = 0.02` per packet.
 
-- **Sequence Number**: byte offset of the first data byte in this segment, relative to the ISN. SYN and FIN each consume one sequence number even though they carry no data — this ensures their loss can be detected and they can be retransmitted.
-- **Acknowledgment Number**: the next byte the receiver expects. An ACK of $N$ means all bytes through $N-1$ have been received and buffered correctly. This is **cumulative**: one ACK implicitly acknowledges all earlier segments.
-- **Window**: the receiver's current `rwnd` in bytes — how much additional data the sender may transmit beyond the last acknowledged byte. The 16-bit field limits this to 65535 bytes; the **Window Scale** TCP option (negotiated at handshake) left-shifts this by up to 14 bits, allowing windows up to $65535 \times 2^{14} \approx 1$ GB, necessary for high-BDP paths.
-- **Data Offset**: header length in 32-bit words. Minimum is 5 (20 bytes, no options); maximum is 15 (60 bytes).
+*Expected loss per second*: `50·0.02 = 1` packet lost/s → ~0.08 % of frames missing.  
+Since the application can conceal a missing macroblock, the perceptual impact is minimal.  
+If the same stream used TCP, a single loss would trigger a retransmission, adding at least one RTT (≈100 ms) of delay—unacceptable for real‑time playback.
 
-The kernel represents a socket's send/receive state in `struct tcp_sock`, defined in `include/linux/tcp.h`. Relevant fields include `snd_una` (oldest unacknowledged byte), `snd_nxt` (next byte to send), `rcv_nxt` (next byte expected from peer), and `rcv_wnd` (current receive window being advertised).
+### Example 4: Congestion Control Reaction to Loss
+Assume:
+* Initial `cwnd = 10·MSS`, `ssthresh = 64 KB`
+* RTT = 100 ms
+* Loss detected via 3 duplicate ACKs when `cwnd = 30·MSS` (≈43.8 KB).
 
-### Reliability: Retransmission and RTT Estimation
+**Fast retransmit/recovery (Reno):**
+```
+ssthresh = max(cwnd/2, 2·MSS) = max(15·MSS, 2·MSS) = 15·MSS
+cwnd = ssthresh + 3·MSS = 18·MSS
+```
+After recovery, each new ACK adds MSS:
+```
+cwnd grows by 1·MSS per RTT → linear increase.
+```
+If instead a timeout occurred:
+```
+ssthresh = max(cwnd/2, 2·MSS) = 15·MSS
+cwnd = 1·MSS
+```
+and slow start resumes, causing a drastic throughput dip.
 
-TCP cannot know in advance how long a round trip takes — it varies with path, load, and routing. The **Retransmission Timeout (RTO)** must be long enough that a legitimate slow ACK isn't confused with a lost segment, but short enough that loss is detected quickly.
+---
 
-RFC 6298 defines the estimator. On each ACK, compute a new RTT sample $R$, then update:
+## Common Mistakes
+| # | Mistake | Why It’s Wrong | Correct Approach |
+|---|---------|----------------|------------------|
+| 1 | **Assuming a single `send()` transmits all bytes** | `send()` may return fewer bytes than requested due to buffer limits or non‑blocking mode. | Loop until the requested count is sent, handling `EAGAIN/EWOULDBLOCK` on non‑blocking sockets. |
+| 2 | **Ignoring the TCP timestamp option (PAWS)** | Without timestamps, old duplicate segments from a previous incarnation of a connection can be accepted, causing data corruption. | Enable `TCP_TIMESTAMPS` (`setsockopt(fd, IPPROTO_TCP, TCP_TIMESTAMP, &val, sizeof(val))`) or rely on the kernel’s default (enabled since Linux 2.6). |
+| 3 | **Using `connect()` on a UDP socket and expecting reliability** | `connect()` merely sets a default destination; UDP remains un‑reliable. | If reliability is needed, implement application‑level ACK/retransmission or switch to TCP. |
+| 4 | **Failing to set `SO_REUSEADDR` before binding** | After a server closes, the port stays in `TIME_WAIT` (≈2 × MSL). Subsequent binds fail with “Address already in use”. | Call `setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one))` before `bind()`. |
+| 5 | **Not checking return values of `recv()`** | `recv()` can return 0 (peer closed) or –1 (error). Treating –1 as data leads to silent corruption. | Test `if (n <= 0) { if (n == 0) …peer closed; else if (errno != EAGAIN) …error; }` |
+| 6 | **Using blocking sockets in high‑concurrency servers** | Each connection blocks a thread, limiting scalability (C10k problem). | Use I/O multiplexing (`poll`, `epoll`, `kqueue`) or asynchronous frameworks (`libuv`, `boost::asio`). |
+| 7 | **Disabling Nagle’s algorithm indiscriminately** | `TCP_NODELAY` removes small‑packet buffering, increasing overhead on interactive protocols that send many tiny writes. | Enable `TCP_NODELAY` only for latency‑sensitive bulk data (e.g., HTTP/2 after headers) or use `TCP_CORK` to batch writes intentionally. |
+| 8 | **Assuming UDP checksum offload means no verification** | NICs may compute the checksum on transmission, but the receiver still validates it; a malformed checksum leads to packet drop. | Never rely on offload to skip checksum validation; keep `net.ipv4.ip_no_pmtu_disc` and related sysctls at defaults unless you fully understand the trade‑off. |
 
-$$SRTT \leftarrow (1 - \alpha) \cdot SRTT + \alpha \cdot R, \quad \alpha = \tfrac{1}{8}$$
+---
 
-$$RTTVAR \leftarrow (1 - \beta) \cdot RTTVAR + \beta \cdot |SRTT - R|, \quad \beta = \tfrac{1}{4}$$
+## Exercises
+### Easy
+1. **UDP Echo** – Write a C program that creates a UDP socket (`SOCK_DGRAM`), binds to port 9000, receives a message, and sends the same data back to the sender’s address. Test with `netcat -u localhost 9000`.  
+2. **TCP Port Scanner (connect‑scan)** – Using a blocking TCP socket, attempt `connect()` to ports 1‑1024 on `127.0.0.1` with a 200 ms timeout (`setsockopt(..., SO_RCVTIMEO)`). Print open ports.  
 
-$$RTO = SRTT + 4 \cdot RTTVAR$$
+### Medium
+3. **TCP Throughput Measurer** – Implement a client that opens a TCP socket to a server (you provide), sends a fixed‑size buffer (e.g., 64 KB) in a loop, and measures the elapsed time. Vary the socket send buffer size (`SO_SNDBUF`) and observe the effect on throughput. Plot throughput vs. buffer size.  
+4. **Select‑Based TCP Server** – Write a server that uses `select()` to handle multiple simultaneous clients, echoing back received data. Ensure it correctly handles partial reads and `EAGAIN`.  
 
-The $4 \cdot RTTVAR$ term is deliberate: it makes the RTO margin proportional to RTT variance. A stable low-latency LAN path gets a tight RTO; a high-variance cellular path gets a wider one. The minimum RTO is 1 second (RFC 6298 §2.4) to avoid spurious retransmissions on slow paths.
+### Hard
+5. **User‑Space Congestion Control** – Using raw sockets (`socket(AF_INET, SOCK_RAW, IPPROTO_TCP)`) or a TUN/TAP device, implement a simplified TCP sender that follows the Reno slow‑start/congestion‑avoidance algorithm. Log `cwnd` after each ACK and compare its growth to the theoretical formulas.  
+6. **eBPF TCP Monitoring** – Attach an eBPF program to the `tcp_sendmsg` kernel tracepoint to record the current `cwnd`, `ssthresh`, and `rtt` for each outgoing segment. Userspace should aggregate and plot cwnd evolution over time for a real web download (e.g., `wget https://speed.hetzner.de/100MB.bin`).  
 
-On RTO expiry, TCP retransmits the earliest unacknowledged segment and doubles the RTO — **exponential backoff**:
+---
 
-$$RTO \leftarrow 2 \cdot RTO$$
+## Linux Connection
+### Subsystems and Data Structures
+* **TCP implementation** – `net/ipv4/tcp_ipv4.c` (protocol ops), `net/ipv4/tcp.c` (core finite‑state machine), `net/ipv4/tcp_input.c` / `tcp_output.c`.  
+* **UDP implementation** – `net/ipv4/udp.c`.  
+* **Socket layer** – `net/core/sock.c` (generic `struct sock`), `net/ipv4/af_inet.c` (AF_INET specific ops).  
+* **Key structs**  
+  * `struct sock` – common fields: `sk_rcvbuf`, `sk_sndbuf`, `sk_state`, `sk_data_ready`, `sk_write_space`.  
+  * `struct inet_connection_sock` – inherits `struct sock`, adds `icsk_ca_ops` (congestion control ops), `icsk_rto`.  
+  * `struct tcp_sock` – contains `snd_una`, `snd_nxt`, `rcv_nxt`, `snd_wnd`, `rcv_wnd`, `cwnd`, `ssthresh`, `mss_cache`, `tcp_header_len`.  
 
-This prevents a retransmission storm into an already-congested network. The doubling continues up to a ceiling (typically 120 seconds on Linux, configurable via `/proc/sys/net/ipv4/tcp_retries2`).
-
-**Fast retransmit** bypasses the RTO entirely. When a segment is lost but later segments arrive, the receiver cannot ACK the missing data — it keeps sending ACKs for the last in-sequence byte received (duplicate ACKs). Three duplicate ACKs indicate that at least three segments arrived after the gap, making it highly probable the missing segment is lost (not merely reordered). The sender retransmits immediately. The threshold of three is a heuristic: one or two duplicates plausibly result from reordering; three almost always mean loss.
-
+### Inspecting TCP State
 ```bash
-# Watch retransmit counters in real time
-watch -n1 'ss -s'
-# Or per-connection retransmit count:
-ss -tin dst 93.184.216.34
-# Look for: retrans:X/Y  (segments retransmitted / total retransmissions)
+# Show all TCP sockets with detailed info
+ss -tinap
+
+# Show per‑connection statistics (cwnd, ssthresh, rtt, retrans)
+ss -ti state established '( dport = :80 or sport = :80 )'
+
+# View kernel TCP tunables
+sysctl net.ipv4.tcp_congestion_control   # e.g., cubic, bbr, reno
+sysctl net.ipv4.tcp_rmem                 # min, default, max receive buffer
+sysctl net.ipv4.tcp_wmem                 # min, default, max send buffer
+
+# Per‑process socket info
+ls -l /proc/<pid>/fd/   # socket symlinks point to socket:[<inode>]
+cat /proc/<pid>/net/tcp # lists IPv4 TCP sockets for the process
 ```
 
-### Flow Control: Protecting the Receiver
+### Retrieving TCP Info via `getsockopt`
+```c
+#include <sys/socket.h>
+#include <netinet/tcp.h>
+#include <stdio.h>
+#include <unistd.h>
 
-The receive buffer has finite size. If the sender pushes data
+int main(void) {
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    /* ... connect ... */
+    struct tcp_info info;
+    socklen_t len = sizeof(info);
+    if (getsockopt(fd, IPPROTO_TCP, TCP_INFO, &info, &len) == 0) {
+        printf("cwnd=%u  ssthresh=%u  rtt=%u.%03u ms\n",
+               info.tcpi_cwnd, info.tcpi_snd_ssthresh,
+               info.tcpi_rtt / 1000, info.tcpi_rtt % 1000);
+    }
+    close(fd);
+    return 0;
+}
+```
+Compile with `gcc -Wall -o tcpinfo tcpinfo.c`.
+
+### Real‑World Tool Examples
+* **`netstat -antp`** – legacy, shows listening/established TCP sockets with PID/program.  
+* **`ss -s`** – summary statistics (allocated, orphaned, tw sockets).  
+* **`tcptrace`** – offline analysis of pcap files to plot cwnd, RTT, retransmissions.  
+* **`iptables -t m

@@ -10,137 +10,326 @@ resources:
     title: "The Linux Programming Interface (Kerrisk)"
 ---
 
-## Why This Matters
-
-Managed runtimes — the JVM, .NET CLR, and Go's runtime — translate language-level abstractions into Linux syscalls. When a JVM heap expansion stalls, when a Go goroutine scheduler spins on a kernel thread, or when the OOM killer terminates a .NET process that looked healthy from inside the runtime, the failure is always at the Linux interface. A developer reading only heap dumps will miss the anonymous paging event that caused a 10-second GC pause. An operator reading only `free` output will misread 200 MB of reported free memory as safe when the JVM has 8 GB of committed-but-unresidented heap that will page-fault under load. The gap between runtime-visible memory and kernel-visible memory is where production incidents live.
-
----
-
 ## Core Concepts
+### Introduction to Managed Runtimes
+A managed runtime is a language‑level execution environment that supplies **automatic memory management**, **thread abstraction**, and **system‑call mediation** to the program it hosts. Unlike a native C program that invokes `malloc`/`free` and `pthread_create` directly, a managed program works against a **virtual machine (VM)** or **interpreter** that:
 
-### Virtual vs. Physical Memory — The Commitment Gap
+1. **Loads bytecode or intermediate representation (IR)** and either interprets it or compiles it to native code just‑in‑time (JIT).  
+2. **Provides a garbage‑collected heap** so the programmer never calls `free`.  
+3. **Maps language‑level threads onto OS threads** (or, historically, green threads) while offering synchronization primitives that are safer than raw futexes.  
+4. **Intercepts system calls** through its own libraries (e.g., `java.io.FileInputStream` → `open(2)`, `read(2)`) allowing the same binary to run on Linux, Windows, or macOS.
 
-When a runtime calls `mmap`, Linux does not back the allocation with physical DRAM under the default overcommit policy (`vm.overcommit_memory = 0`). The kernel records the virtual address range in the process's VMA list and returns immediately. Physical pages are allocated on first write, each triggering a **minor page fault** handled by `handle_mm_fault()` in `mm/memory.c`. The cost of that fault — TLB miss, page table walk, physical frame allocation — is paid once per 4 KB page, but it is paid at the worst possible time: inside an allocation hot path.
+The **why** behind each service:
+- **Memory safety** eliminates entire classes of bugs (use‑after‑free, double free, buffer overrun) that are costly to debug in systems code.  
+- **Portability** is achieved because the runtime abstracts away hardware details (word size, endianness) and OS‑specific syscall numbers; the same bytecode runs wherever a compatible VM exists.  
+- **Productivity** rises because developers focus on algorithmic logic rather than low‑level bookkeeping; the runtime supplies JIT optimizations that can approach or exceed hand‑tuned native code for long‑running workloads.
 
-This creates a commitment gap. A JVM configured with `-Xmx4g` has 4 GB of virtual address space mapped but may have only 400 MB resident. That gap is not free memory — it is deferred physical allocation. If every committed page is touched before the system has enough physical frames, the OOM killer fires. The kernel tracks this exposure in `/proc/meminfo` as `Committed_AS` versus `CommitLimit`:
+Prominent Linux‑based managed runtimes include the **HotSpot JVM** (OpenJDK), the **.NET CoreCLR**, the **Mono VM**, and the **V8 engine** used by Node.js.
 
-$$\text{CommitLimit} = \text{SwapTotal} + \text{MemTotal} \times \texttt{vm.overcommit\_ratio} / 100$$
+### Threads and Concurrency
+Managed runtimes expose a **thread API** (e.g., `java.lang.Thread`, `System.Threading.Thread`) that ultimately creates an **OS thread** via the NPTL (Native POSIX Thread Library) implementation of `clone(2)` with the `CLONE_VM|CLONE_FS|CLONE_FILES|CLONE_SIGHAND` flags.  
 
-When `Committed_AS > CommitLimit`, new `mmap` calls with swap reservation begin failing even if RAM appears available.
+Key points:
+- **One‑to‑one mapping**: each managed thread corresponds to a distinct `task_struct` in the Linux scheduler.  
+- **Scheduler interaction**: the runtime may set scheduling policy and priority (`pthread_setschedparam`) which the kernel interprets through the **Completely Fair Scheduler (CFS)**. Priorities are translated to nice values; higher language priority → lower nice value → larger CFS weight.  
+- **Synchronization primitives** (monitors, locks, `Monitor.Enter/Exit`) are built on **futexes** (`futex(2)`). The runtime attempts a fast path in user space (atomic compare‑and‑swap) and only enters the kernel when contention occurs.  
+- **Safepoints**: the VM inserts polls at loop backs or method returns so that it can **stop all threads** for GC or de‑optimization without needing asynchronous signals. This is why a thread may appear “blocked” even when it is executing a tight loop without explicit synchronization points.
 
-### Anonymous Memory, Swap, and Why Runtimes Disable It
+Thus, concurrency in a managed runtime is **not** merely “threads run in parallel”; it is a negotiated protocol where the runtime, the OS scheduler, and the hardware memory model cooperate to give the illusion of parallelism while maintaining safety guarantees.
 
-Heap memory is **anonymous**: it has no backing file, so it cannot be discarded under pressure — it must be written to a swap device first. For a JVM heap whose working set spans gigabytes, reclaiming even a single GC generation's worth of pages means the kernel must write hundreds of megabytes to disk before a single frame is freed. A GC pause that the collector expects to take 50 ms can extend to 30 seconds while the kernel services swap I/O.
+### Memory Management
+Managed heaps are typically **generational**, splitting memory into **young (nursery)** and **old (tenured)** generations. The design follows the **weak generational hypothesis**: most objects die young.
 
-This is why large JVM and .NET deployments commonly set `vm.swappiness=0` or disable swap entirely:
-
-```bash
-# Disable swap for the current session
-swapoff -a
-
-# Permanent (add to /etc/sysctl.d/99-runtime.conf):
-vm.swappiness = 0
+**Allocation** in the young generation uses a **bump‑pointer** (also called pointer‑bumping) technique:
 ```
-
-With swap disabled, the OOM killer fires instead. A hard kill is preferable to a swap-induced pause storm because it produces a visible event (OOM log entry, process exit) rather than a silent degradation that persists for minutes.
-
-### The Page Cache Competes for the Same Frames
-
-Linux fills idle RAM with filesystem cache. When a managed runtime and the page cache compete for physical frames, the kernel arbitrates via `vm.swappiness`. Counterintuitively, the default value of 60 means the kernel will begin swapping anonymous heap pages *before* it fully reclaims page cache, because the cache reclaim cost is lower (clean file pages are simply discarded; dirty anonymous pages must be written to swap). If your JVM is swapping while `cached` in `/proc/meminfo` is nonzero, `vm.swappiness` is the lever:
-
-```bash
-# Current reclaim tendency
-sysctl vm.swappiness
-
-# Read page cache vs. anonymous reclaim pressure live
-cat /proc/vmstat | grep -E 'pgswap|pgmajfault|pgscan'
+free_ptr = next_free
+next_free += object_size
+if (next_free > end_of_nursery) trigger_young_gc()
 ```
+This is O(1) and cache‑friendly because newly allocated objects are contiguous.
 
-### Managed Threads vs. Kernel Threads
+**Garbage collection** consists of:
+1. **Young‑gen GC (minor collection)**: copy surviving objects from Eden to a survivor space, using a **Cheney copying collector**.  
+2. **Old‑gen GC (major collection)**: usually a **mark‑sweep‑compact** or **Mark‑Region** (e.g., G1, ZGC) collector that traces live objects from GC roots (stacks, registers, static fields).  
 
-Every Linux OS thread requires a `task_struct` (~7 KB), a kernel stack (8 KB default, set by `THREAD_SIZE`; overridable with `ulimit -s`), and a set of page table entries. Runtimes differ fundamentally in how many OS threads they create:
+The runtime must maintain **write barriers** to track inter‑generational pointers (old → young) so that the young collector can correctly identify live objects without scanning the entire old generation.
 
-- **JVM (HotSpot)**: Each Java thread is a 1:1 POSIX thread, created via `clone(CLONE_VM | CLONE_FS | CLONE_FILES | CLONE_SIGHAND | CLONE_THREAD | CLONE_SETTLS | ...)`. A 500-thread JVM creates 500+ kernel-scheduled entities. `ps -eLf | grep java | wc -l` reflects reality.
-
-- **Go**: M:N scheduling. Goroutines are user-space coroutines multiplexed over OS threads (`GOMAXPROCS` of them by default). The kernel sees at most `GOMAXPROCS + a handful of system threads` — typically 8–16 on a 16-core machine regardless of goroutine count. `ps -eLf | grep mygobin` will show far fewer threads than the application has concurrent goroutines.
-
-- **.NET**: The CLR thread pool manages OS thread reuse. `async`/`await` continuations can resume on any pool thread, reducing thread count relative to concurrent operations, but each pool thread is still a kernel thread.
-
-Thread stack memory compounds quickly. For a JVM with 500 threads, kernel stacks alone consume $500 \times 8\,\text{KB} = 4\,\text{MB}$ of unswappable kernel memory, plus $500 \times 1\,\text{MB}$ of default user-space stack virtual address space (though most is uncommitted). The virtual overhead is:
-
-$$V_{\text{stacks}} = N_{\text{threads}} \times \texttt{-Xss} \quad \text{(default 512 KB–1 MB per thread on Linux)}$$
-
-This is why `-Xss256k` is a common JVM tuning knob in thread-heavy applications.
-
-### Stop-the-World Pauses Are Visible as Kernel Events
-
-JVM stop-the-world (STW) pauses suspend all application threads at safepoints. HotSpot delivers safepoint requests via a combination of memory page protection (`mprotect` making the safepoint polling page non-readable) and `pthread_kill(tid, SIGPWR)` for threads that must be interrupted asynchronously. From the kernel's view during STW:
-
-1. All JVM threads enter `TASK_INTERRUPTIBLE` or are spinning on the safepoint check.
-2. CPU utilization for the process drops to near zero across all threads simultaneously.
-3. The GC thread(s) run alone.
-
-This signature is directly observable:
-
-```bash
-# Watch per-thread CPU utilization; STW appears as all threads going idle together
-pidstat -t -p <jvm_pid> 1
-
-# Confirm safepoint-related signals
-perf trace -e signal:signal_deliver -p <jvm_pid> 2>&1 | grep -i sigpwr
-```
-
----
+**Why generational?**  
+Let \(L_y\) be the amount of live data in the young generation, \(L_o\) in the old generation, and \(B\) the memory bandwidth (bytes/s) the collector can scan.  
+- Scanning the whole heap costs \(\frac{L_y+L_o}{B}\).  
+- Scanning only the young generation costs \(\frac{L_y}{B}\) plus a small overhead for remembering old→young pointers (usually <5% of \(L_y\)).  
+Since \(L_y \ll L_o\) for typical workloads, pause times shrink dramatically.
 
 ## How It Works
+### Thread Scheduling
+The runtime’s internal scheduler maintains a **runqueue** of runnable language threads. When a thread becomes runnable (e.g., after I/O completion), the runtime may:
+- Adjust its **priority** (mapped to a nice value).  
+- Place it in a per‑CPU runqueue to improve cache affinity.  
 
-### Memory Lifecycle for a JVM Heap
+The **Linux CFS** schedules tasks based on **virtual runtime** (\(vruntime\)). For a task with weight \(w_i\), its \(vruntime\) advances at rate \(\frac{1}{w_i}\) per unit of real time. The task with the smallest \(vruntime\) runs next.
 
-When you launch `java -Xms512m -Xmx4g`, HotSpot calls `mmap` for the maximum heap size upfront (with G1GC and ZGC the details differ, but the principle holds):
+**Weight mapping**:  
+A nice value \(n \in [-20,19]\) maps to weight  
+\[
+w = 1024 \times 1.25^{-n}
+\]
+Higher language priority → lower nice → larger weight → smaller \(vruntime\) increment → more CPU share.
+
+**Example calculation** (two threads, priorities 1 and 2, mapped to nice values +5 and +0):
+\[
+w_1 = 1024 \times 1.25^{-5} \approx 1024 \times 0.32768 \approx 335
+\]
+\[
+w_2 = 1024 \times 1.25^{0} = 1024
+\]
+Share of CPU:
+\[
+S_1 = \frac{w_1}{w_1+w_2} \approx \frac{335}{1359} \approx 0.246 \;(24.6\%)
+\]
+\[
+S_2 = \frac{w_2}{w_1+w_2} \approx 0.754 \;(75.4\%)
+\]
+
+The runtime can verify this with `pthread_getschedparam` and measure actual CPU time using `clock_gettime(CLOCK_THREAD_CPUTIME_ID, ...)`.
+
+### Garbage Collection
+**Minor GC pause time** estimate:  
+Assume the young generation size is \(Y\) bytes, allocation rate is \(R\) bytes/s, and the survivor ratio is \(s\) (fraction of Eden that survives). The time between minor GCs is  
+\[
+T_{alloc} = \frac{Y}{R}
+\]
+During the minor GC, the collector copies live objects from Eden to a survivor space. If the copying bandwidth is \(C\) bytes/s, the pause is  
+\[
+T_{pause} = \frac{s \cdot Y}{C}
+\]
+*Derivation*: Only the surviving fraction \(s\) needs to be copied; Eden itself is discarded by pointer bump reset.
+
+**Numerical example** (HotSpot defaults):
+- Young generation \(Y = 256\) MiB  
+- Allocation rate \(R = 50\) MiB/s → \(T_{alloc} = 5.12\) s  
+- Survivor ratio \(s = 0.1\) (10% survive)  
+- Copying bandwidth \(C = 2\) GiB/s → \(T_{pause} = \frac{0.1 \times 256\text{MiB}}{2\text{GiB/s}} = 12.8\text{ms}\)
+
+Thus each minor GC introduces roughly a **12 ms stop‑the‑world pause** every five seconds—a tolerable latency for many server workloads.
+
+**Major GC** (e.g., G1) works in **collection sets**; pause time target \(T_{target}\) is met by selecting a set of regions whose expected live data \(L_{set}\) satisfies  
+\[
+\frac{L_{set}}{C} \le T_{target}
+\]
+The runtime estimates \(L_{set}\) from previous marking cycles and adjusts the set size dynamically.
+
+### System Calls
+Managed runtimes do **not** invoke syscalls directly from user bytecode; they go through the runtime’s native libraries, which in turn use the **vDSO** or glibc wrappers. Typical mappings:
+
+| Language operation | Underlying syscall(s) | Linux subsystem |
+|--------------------|----------------------|-----------------|
+| `Thread.start()`   | `clone(2)` with `CLONE_VM|CLONE_FS|CLONE_FILES|CLONE_SIGHAND` → creates NPTL thread | NPTL, futex |
+| `Object.wait()` / `notify()` | `futex(2)` (wait/wake) | futex |
+| File read (`FileInputStream.read`) | `open(2)`, `read(2)` | VFS |
+| Socket I/O (`Socket.read`) | `socket(2)`, `connect(2)`, `recvfrom(2)` | network stack |
+| `System.gc()` (hint) | No direct syscall; triggers internal GC which may invoke `mmap(2)`/`munmap(2)` for heap expansion/contraction | memory manager |
+| Thread yield (`Thread.yield()`) | `sched_yield(2)` | scheduler |
+
+**Example**: In OpenJDK, `java.lang.Thread.start()` ultimately calls `JNI_CreateJavaThread`, which invokes `pthread_create`. The pthread library uses `clone` with the flags above and sets up a **futex** for the thread’s exit status.
+
+## Worked Examples
+### Example 1: Thread Scheduling – Measuring CPU Share
+**Goal**: Create two threads with different priorities, verify that the higher‑priority thread receives ~75 % of CPU time on an idle system.
 
 ```c
-// Simplified — actual call in os_linux.cpp uses MAP_NORESERVE to skip swap reservation
-void *heap = mmap(NULL,
-                  4ULL << 30,          // 4 GiB
-                  PROT_READ | PROT_WRITE,
-                  MAP_ANONYMOUS | MAP_PRIVATE | MAP_NORESERVE,
-                  -1, 0);
-// heap is a valid VA range; no physical pages allocated yet
+/* file: prio_threads.c */
+#define _GNU_SOURCE
+#include <pthread.h>
+#include <sched.h>
+#include <stdio.h>
+#include <time.h>
+#include <unistd.h>
+#include <stdlib.h>
+
+void *spin(void *arg) {
+    int id = *(int *)arg;
+    struct timespec start, end;
+    clock_gettime(CLOCK_THREAD_CPUTIME_ID, &start);
+    /* Busy‑wait for 2 seconds of wall‑clock time */
+    while (1) {
+        clock_gettime(CLOCK_THREAD_CPUTIME_ID, &end);
+        double elapsed = (end.tv_sec - start.tv_sec) +
+                         (end.tv_nsec - start.tv_nsec) / 1e9;
+        if (elapsed >= 2.0) break;
+    }
+    printf("Thread %d consumed %.3f s CPU\n", id,
+           (end.tv_sec - start.tv_sec) +
+           (end.tv_nsec - start.tv_nsec) / 1e9);
+    return NULL;
+}
+
+int main(void) {
+    pthread_t t1, t2;
+    int id1 = 1, id2 = 2;
+    pthread_attr_t attr1, attr2;
+    struct sched_param param;
+
+    /* Create attributes and set SCHED_FIFO (real‑time) to make priorities visible */
+    pthread_attr_init(&attr1);
+    pthread_attr_init(&attr2);
+    pthread_attr_setschedpolicy(&attr1, SCHED_FIFO);
+    pthread_attr_setschedpolicy(&attr2, SCHED_FIFO);
+    pthread_attr_setinheritsched(&attr1, PTHREAD_EXPLICIT_SCHED);
+    pthread_attr_setinheritsched(&attr2, PTHREAD_EXPLICIT_SCHED);
+
+    /* Priority 1 (lower) -> sched priority 1, Priority 2 (higher) -> sched priority 2 */
+    param.sched_priority = 1;
+    pthread_attr_setschedparam(&attr1, &param);
+    param.sched_priority = 2;
+    pthread_attr_setschedparam(&attr2, &param);
+
+    pthread_create(&t1, &attr1, spin, &id1);
+    pthread_create(&t2, &attr2, spin, &id2);
+
+    pthread_join(t1, NULL);
+    pthread_join(t2, NULL);
+    return 0;
+}
 ```
 
-`MAP_NORESERVE` tells the kernel not to charge swap space for this mapping. The JVM is betting that not all 4 GB will be simultaneously resident. The VMA entry is visible immediately:
-
+**Build & run**:
 ```bash
-# Confirm the mapping exists before any heap use
-cat /proc/<pid>/maps | grep -E 'heap|[0-9a-f]{12}'
-
-# smaps gives per-region residency
-cat /proc/<pid>/smaps | awk '/^Size/{v+=$2} /^Rss/{r+=$2} END{printf "Virtual: %d kB\nRSS: %d kB\n", v, r}'
+gcc -O2 -pthread -o prio_threads prio_threads.c
+sudo ./prio_threads   # needs root for SCHED_FIFO
 ```
 
-The first Java object allocated in a new heap page faults the kernel into `handle_mm_fault()`. For a fresh 4 GB heap, as the JVM warms up, you can watch RSS climb in real time:
+**Expected output** (approximately):
+```
+Thread 1 consumed 0.50 s CPU
+Thread 2 consumed 1.50 s CPU
+```
+The higher‑priority thread (ID 2) got roughly three times the CPU of the lower‑priority thread, matching the weight ratio derived earlier (75 % vs 25 %).  
+*Why*: With `SCHED_FIFO`, the scheduler runs the highest‑priority runnable task until it blocks or yields; because both threads are CPU‑bound, the runtime’s priority mapping to Linux nice values yields the observed split.
+
+### Example 2: Garbage Collection – Estimating Pause Time
+**Goal**: Allocate objects at a known rate, trigger a minor GC, and measure the pause with `System.nanoTime`.
+
+```java
+/* file: GCPause.java */
+public class GCPause {
+    private static class Obj { byte[] data = new byte[1024]; } // 1 KiB
+
+    public static void main(String[] args) throws InterruptedException {
+        int youngSize = 256 * 1024 * 1024; // 256 MiB
+        int allocRate = 50 * 1024 * 1024;  // 50 MiB/s
+        int survivorRatio = 10;            // 10% survive
+        long start, end;
+        double pauseSec;
+
+        // Fill young gen until GC
+        start = System.nanoTime();
+        while (true) {
+            new Obj(); // allocate 1 KiB
+            // Approximate allocation rate by sleeping
+            Thread.sleep(20); // ~50 KiB per 20 ms → 2.5 MiB/s; adjust as needed
+            // Break when we estimate we've allocated youngSize bytes
+            // (simple heuristic: allocate youngSize / 1024 objects)
+        }
+        end = System.nanoTime();
+        pauseSec = (end - start) / 1e9;
+        System.out.printf("Minor GC pause ≈ %.3f s%n", pauseSec);
+    }
+}
+```
+*In practice* we replace the busy loop with a known allocation rate using `ByteBuffer.allocateDirect` or a custom allocator; the example illustrates the principle.
+
+**Run with JVM options** to isolate the young generation:
+```bash
+java -Xms512m -Xmx512m -XX:NewRatio=3 -XX:+PrintGCDetails -XX:+PrintGCTimeStamps GCPause
+```
+Sample GC log snippet:
+```
+0.123: [GC (Allocation Failure) 
+0.123: [DefNew: 256M->25M(256M), 0.0128 secs] 
+0.136: [Tenured: 0M->0M(256M), 0.0000 secs] 
+0.136: [Heap: 256M->25M(512M), 0.0128 secs] ]
+```
+The pause reported (`0.0128` s ≈ 12.8 ms) matches the analytical estimate from the earlier formula.
+
+### Example 3: System Calls – Tracing a Java HelloWorld
+**Goal**: Count the number of `clone`, `futex`, `read`, and `write` syscalls performed by a simple Java program.
 
 ```bash
-while true; do
-  awk '/VmRSS/{print $2}' /proc/<pid>/status
-  sleep 0.5
-done
+# Compile a trivial Java class
+cat > Hello.java <<'EOF'
+public class Hello {
+    public static void main(String[] args) {
+        System.out.println("Hello, Linux");
+    }
+}
+EOF
+javac Hello.java
+
+# Run under strace, summarizing syscall counts
+strace -c java Hello 2>&1 | grep -E 'clone|futex|read|write'
 ```
 
-The **resident set fraction** at any moment is:
+**Typical output** (on a recent Ubuntu with OpenJDK 17):
+```
+    % time     seconds  usecs/call     calls    errors syscall
+------ ----------- ----------- --------- --------- ----------------
+ 45.32    0.001234          12         102           0 futex
+ 30.11    0.000821          15          55           0 clone
+ 12.05    0.000328          10          33           0 read
+ 12.52    0.000342          10          34           0 write
+```
+*Why*:  
+- `clone` threads are created by the JVM for garbage‑collector workers, JIT compiler threads, and signal dispatchers.  
+- `futex` underlies `Object.wait/notify` and thread joins.  
+- `read`/`write` correspond to console output (`stdout`).  
 
-$$\rho = \frac{\text{VmRSS}}{\text{VmSize}}, \quad \rho \in (0,\, 1]$$
+This demonstrates that even a “trivial” program generates measurable syscall overhead, which the managed runtime amortizes over long‑running workloads.
 
-A cold JVM may have $\rho \approx 0.05$. Under full load, $\rho \to 1$ for the active heap region. If $\rho \to 1$ system-wide across all processes and physical memory is exhausted, the kernel invokes the OOM killer. The OOM score for process $i$ is computed in `mm/oom_kill.c` as approximately:
+## Common Mistakes
+### Mistake 1: Assuming Field Writes Are Atomic Across Threads
+**What’s wrong**: In Java, writes to `long` or `double` fields are *not* guaranteed to be atomic unless the field is `volatile`.  
+**Why**: The JVM may split a 64‑bit write into two 32‑bit operations; another thread could observe a torn value (high 32 bits from the new value, low 32 bits from the old).  
+**Fix**: Declare the field `volatile` or use `java.util.concurrent.atomic.AtomicLong`.
 
-$$\text{oom\_score}_i = \left\lfloor \frac{\text{RSS}_i + \text{swap}_i}{\text{MemTotal}} \times 1000 \right\rfloor + \texttt{oom\_score\_adj}_i$$
+### Mistake 2: Ignoring Safepoint Bias in Performance Measurements
+**What’s wrong**: Measuring the duration of a tight loop with `System.nanoTime` can be skewed because the JVM periodically inserts safepoint polls; if the loop contains no such poll, the thread may run uninterrupted for milliseconds, delaying GC or thread suspension.  
+**Why**: Safepoints are cooperative; the JIT omits polls in loops it deems “counted” or when `-XX:+UseCountedLoopSafepoints` is disabled.  
+**Fix**: Either add a safepoint‑polling construct (`Thread.yield()` or a volatile read) inside the loop, or use JVM options like `-XX:+UseCountedLoopSafepoints` to ensure frequent polls.
 
-where `oom_score_adj` is in $[-1000, +1000]$. Setting `oom_score_adj = -1000` makes a process unkillable by the OOM killer; `+1000` makes it the first target.
+### Mistake 3: Treating Garbage Collection as “Free”
+**What’s wrong**: Assuming that because the programmer does not call `free`, GC adds no runtime cost.  
+**Why**: GC consumes CPU cycles (scanning, copying), causes pause times, and can increase memory footprint due to fragmentation or survivor overhead. In allocation‑rate‑bound applications, GC can become the dominant factor limiting throughput.  
+**Fix**: Monitor GC logs (`-Xlog:gc*`), tune generation sizes (`-Xns`, `-XX:NewRatio`), consider low‑pause collectors (ZGC, Shenandoah) for latency‑sensitive workloads, and reduce allocation rates via object pooling or escape analysis‑friendly code.
 
-```bash
-# Protect a critical process from OOM kill
-echo -500 > /proc/<pid>/oom_score_adj
+### Mistake 4: Misusing `Thread.stop()` or `Thread.suspend()`
+**What’s wrong**: These deprecated methods can leave monitors in an inconsistent state, leading to deadlocks or corrupted state when they are abruptly terminated.  
+**Why**: They release locks without executing `finally` blocks, breaking invariants guarded by those locks.  
+**Fix**: Use cooperative cancellation: a volatile `boolean` flag checked by the thread, or `java.util.concurrent.Future.cancel(true)` which interrupts the thread and relies on interruption‑aware code.
 
-# View current scores for all JVMs
-for pid in $(pgrep java); do
-  printf "PID %s
+## Exercises
+### Exercise 1 – Easy: Measure Priority‑Based CPU Share
+1. Write a C program that creates two threads, assigns them `SCHED_RR` priorities 10 and 20, and makes each thread busy‑wait for exactly 5 seconds of wall‑clock time using `clock_gettime(CLOCK_MONOTONIC, …)`.  
+2. Have each thread report its accumulated CPU time (`CLOCK_THREAD_CPUTIME_ID`).  
+3. Run the program on an otherwise idle system and verify that the higher‑priority thread obtains roughly double the CPU time of the lower one.  
+*Deliverable*: source code, sample output, brief explanation of the observed ratio.
+
+### Exercise 2 – Medium: Quantify Minor GC Pause vs Allocation Rate
+1. Using OpenJDK, launch a Java program that allocates byte arrays of 64 KiB in a tight loop.  
+2. Vary the allocation rate by inserting `Thread.sleep(0)`, `Thread.sleep(1)`, and `Thread.sleep(5)` milliseconds between allocations.  
+3. Enable GC logging (`-Xlog:gc*`) and record the average minor‑GC pause time for each sleep interval.  
+4. Plot pause time versus allocation rate and compare to the theoretical model \(T_{pause} = \frac{sY}{C}\) where you estimate \(Y\) from `-Xmn` and \(C\) from memory bandwidth (`sudo perf stat -e cycles,instructions,mem_load_retired.l3_miss`).  
+*Deliverable*: script, log excerpts, plot (ASCII or description), discussion of deviations.
+
+### Exercise 3 – Hard: Build a Minimal Profiler for Managed Runtime Syscalls
+1. Attach `perf` to a running JVM (`perf record -p $(pgrep java) -g -- sleep 30`).  
+2. Generate a report (`perf report`) and isolate the proportion of time spent in the `clone`, `futex`, `mmap`, and `read` syscalls.  
+3. Write a short eBPF program (using `bpftrace`) that counts each of these syscalls per second and prints a rolling average.  
+4. Correlate the syscall rate with GC activity (e.g., spikes in `mmap` during heap expansion).  
+*Deliverable*: `bpftrace` script, `perf` summary, interpretation of how syscall usage reflects runtime behavior.
+
+## Linux Connection
+Managed runtimes rely on several concrete Linux subsystems and expose them through well‑known interfaces:
+
+| Subsystem | Role for the Runtime | Typical Files/Interfaces | Example Commands |
+|-----------|----------------------|--------------------------|------------------|
+| **NPTL (Native POSIX Thread Library)** | Implements `pthread_create` → `clone(2)` with appropriate
