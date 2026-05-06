@@ -32,3 +32,13 @@ export interface OverallStats {
   masteryLevel2: number;
   masteryLevel3: number;
 }
+
+export interface HeatmapDay {
+  date: string;
+  count: number;
+}
+
+export interface RecentCompletion {
+  moduleId: number;
+  completedAt: string;
+}

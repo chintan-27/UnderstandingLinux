@@ -13,7 +13,14 @@ interface LessonSidebarProps {
 
 function SectionLabel({ children }: { children: string }) {
   return (
-    <p style={{ fontFamily: '"JetBrains Mono", monospace', fontSize: 10, letterSpacing: '0.12em', textTransform: 'uppercase', color: '#7a7570', marginBottom: 10 }}>
+    <p style={{
+      fontFamily: '"JetBrains Mono", monospace',
+      fontSize: 9,
+      letterSpacing: '0.12em',
+      textTransform: 'uppercase',
+      color: '#a09890',
+      marginBottom: 12,
+    }}>
       {children}
     </p>
   );
@@ -21,18 +28,19 @@ function SectionLabel({ children }: { children: string }) {
 
 export function LessonSidebar({ progress, resources, onStatusChange, onMasteryChange }: LessonSidebarProps) {
   return (
-    <div style={{ display: 'flex', flexDirection: 'column', gap: 14 }}>
-      <div style={{ background: '#ffffff', borderRadius: 20, padding: 18, boxShadow: '0 1px 3px rgba(0,0,0,.04)' }}>
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 0 }}>
+      <div style={{ borderBottom: '1px solid #d5cfc6', paddingBottom: 20, marginBottom: 20 }}>
         <SectionLabel>Status</SectionLabel>
         <ModuleStatusControl status={progress.status} onChange={onStatusChange} layout="stack" />
         {progress.status === 'completed' && (
-          <div style={{ marginTop: 16, paddingTop: 16, borderTop: '1px solid #f1f3f6' }}>
+          <div style={{ marginTop: 16, paddingTop: 16, borderTop: '1px solid #e5e0d8' }}>
             <MasterySelector level={progress.masteryLevel} onChange={onMasteryChange} />
           </div>
         )}
       </div>
+
       {resources.length > 0 && (
-        <div style={{ background: '#ffffff', borderRadius: 20, padding: 18, boxShadow: '0 1px 3px rgba(0,0,0,.04)' }}>
+        <div>
           <SectionLabel>Resources</SectionLabel>
           <ResourceList resources={resources} />
         </div>

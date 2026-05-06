@@ -5,7 +5,7 @@ export function RootLayout() {
   return (
     <div style={{ minHeight: '100vh', background: '#faf7f2' }}>
       <TopNav />
-      <main style={{ paddingTop: 56 }}>
+      <main style={{ paddingTop: 48 }}>
         <Outlet />
       </main>
     </div>

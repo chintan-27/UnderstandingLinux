@@ -6,6 +6,8 @@ import type {
   ProgressStore,
   SupermoduleStats,
   OverallStats,
+  HeatmapDay,
+  RecentCompletion,
 } from '../types/progress';
 
 const STORAGE_KEY = 'understandinglinux_progress_v1';
@@ -134,6 +136,60 @@ export function useProgress() {
     };
   }, [store]);
 
+  const getStudyStreak = useCallback((): { currentStreak: number; lastStudiedDaysAgo: number } => {
+    const activeDates = new Set<string>();
+    for (const p of Object.values(store.modules)) {
+      if (p.completedAt) activeDates.add(p.completedAt.slice(0, 10));
+      if (p.lastVisited) activeDates.add(p.lastVisited.slice(0, 10));
+    }
+    if (activeDates.size === 0) return { currentStreak: 0, lastStudiedDaysAgo: -1 };
+
+    const msPerDay = 86400000;
+    const toStr = (d: Date) => d.toISOString().slice(0, 10);
+    const today = new Date();
+    const todayStr = toStr(today);
+    const sorted = [...activeDates].sort().reverse();
+    const lastStudiedDaysAgo = Math.round(
+      (new Date(todayStr).getTime() - new Date(sorted[0]).getTime()) / msPerDay
+    );
+
+    let streak = 0;
+    let cursor = activeDates.has(todayStr) ? today : new Date(today.getTime() - msPerDay);
+    if (!activeDates.has(toStr(cursor))) return { currentStreak: 0, lastStudiedDaysAgo };
+    while (activeDates.has(toStr(cursor))) {
+      streak++;
+      cursor = new Date(cursor.getTime() - msPerDay);
+    }
+    return { currentStreak: streak, lastStudiedDaysAgo };
+  }, [store]);
+
+  const getHeatmapData = useCallback((weeks = 12): HeatmapDay[] => {
+    const dayCount = new Map<string, number>();
+    for (const p of Object.values(store.modules)) {
+      const dates = new Set<string>();
+      if (p.completedAt) dates.add(p.completedAt.slice(0, 10));
+      if (p.lastVisited) dates.add(p.lastVisited.slice(0, 10));
+      for (const d of dates) dayCount.set(d, (dayCount.get(d) ?? 0) + 1);
+    }
+    const result: HeatmapDay[] = [];
+    const total = weeks * 7;
+    const today = new Date();
+    for (let i = total - 1; i >= 0; i--) {
+      const d = new Date(today.getTime() - i * 86400000);
+      const dateStr = d.toISOString().slice(0, 10);
+      result.push({ date: dateStr, count: dayCount.get(dateStr) ?? 0 });
+    }
+    return result;
+  }, [store]);
+
+  const getRecentCompletions = useCallback((limit = 5): RecentCompletion[] => {
+    return Object.entries(store.modules)
+      .filter(([, p]) => p.status === 'completed' && p.completedAt)
+      .map(([id, p]) => ({ moduleId: Number(id), completedAt: p.completedAt! }))
+      .sort((a, b) => b.completedAt.localeCompare(a.completedAt))
+      .slice(0, limit);
+  }, [store]);
+
   const resetAll = useCallback(() => {
     const empty = { modules: {}, schemaVersion: SCHEMA_VERSION };
     saveStore(empty);
@@ -160,6 +216,9 @@ export function useProgress() {
     markVisited,
     getSupermoduleStats,
     getOverallStats,
+    getStudyStreak,
+    getHeatmapData,
+    getRecentCompletions,
     resetAll,
     exportJSON,
     importJSON,

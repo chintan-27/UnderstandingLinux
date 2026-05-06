@@ -1,4 +1,4 @@
-@import url("https://fonts.googleapis.com/css2?family=Plus+Jakarta+Sans:ital,wght@0,300;0,400;0,500;0,600;0,700;0,800;1,400&family=Inter:wght@300;400;500;600&family=JetBrains+Mono:wght@400;500&display=swap");
+@import url("https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@600;700&family=Plus+Jakarta+Sans:ital,wght@0,300;0,400;0,500;0,600;0,700;0,800;1,400&family=Inter:wght@300;400;500;600&family=JetBrains+Mono:wght@400;500&display=swap");
 @import "tailwindcss";
 @import "highlight.js/styles/atom-one-dark.css";
 @import "katex/dist/katex.min.css";
@@ -17,9 +17,26 @@
   --color-border:  #e5e0d8;
   --color-border-light: #f0ece6;
 
-  --font-sans:    "Inter", system-ui, sans-serif;
-  --font-display: "Plus Jakarta Sans", system-ui, sans-serif;
-  --font-mono:    "JetBrains Mono", "Fira Code", monospace;
+  --font-sans:       "Inter", system-ui, sans-serif;
+  --font-display:    "Plus Jakarta Sans", system-ui, sans-serif;
+  --font-mono:       "JetBrains Mono", "Fira Code", monospace;
+  --font-condensed:  "Barlow Condensed", system-ui, sans-serif;
+
+  --color-paper-rule: #d5cfc6;
+  --color-dot-done:   #1e1a16;
+  --color-dot-prog:   #a09890;
+  --color-dot-none:   #e5e0d8;
+}
+
+/* ── Responsive helpers ── */
+@media (max-width: 639px) {
+  .hide-mobile { display: none !important; }
+  .prose-lesson { font-size: 0.9375rem; }
+  .prose-lesson h2 { font-size: 1.4rem; margin-top: 2.5rem; }
+  .prose-lesson h3 { font-size: 1.1rem; }
+}
+@media (min-width: 640px) {
+  .hide-desktop { display: none !important; }
 }
 
 @layer base {
@@ -50,41 +67,61 @@
 }
 
 @layer components {
+  .paper-rule {
+    border: none;
+    border-top: 1px solid var(--color-paper-rule);
+    margin: 0;
+  }
+
+  .paper-section-label {
+    font-family: var(--font-condensed);
+    font-size: 11px;
+    font-weight: 700;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: #a09890;
+  }
+
   .prose-lesson {
     font-family: "Inter", system-ui, sans-serif;
-    font-size: 1rem;
+    font-size: 1.0625rem;
     line-height: 1.85;
     color: #3a3530;
-    max-width: 68ch;
   }
 
   .prose-lesson h1 {
-    font-family: "Plus Jakarta Sans", system-ui, sans-serif;
-    font-size: 2rem;
-    font-weight: 800;
+    font-family: "Barlow Condensed", "Arial Narrow", system-ui;
+    font-size: 2.5rem;
+    font-weight: 700;
     color: #131311;
-    line-height: 1.1;
-    letter-spacing: -0.035em;
+    line-height: 1;
+    letter-spacing: -0.01em;
+    text-transform: uppercase;
     margin: 0 0 2rem;
   }
 
   .prose-lesson h2 {
-    font-family: "Plus Jakarta Sans", system-ui, sans-serif;
-    font-size: 1.375rem;
+    font-family: "Barlow Condensed", "Arial Narrow", system-ui;
+    font-size: 1.75rem;
     font-weight: 700;
     color: #131311;
-    margin: 3rem 0 1rem;
-    padding-bottom: .625rem;
-    border-bottom: 2px solid #e5e0d8;
-    letter-spacing: -0.02em;
+    margin: 3.5rem 0 1rem;
+    padding-bottom: .75rem;
+    border-bottom: 1px solid #d5cfc6;
+    letter-spacing: 0.01em;
+    text-transform: uppercase;
+    line-height: 1;
   }
 
   .prose-lesson h3 {
-    font-family: "Plus Jakarta Sans", system-ui, sans-serif;
-    font-size: 1.0625rem;
-    font-weight: 600;
+    font-family: "Barlow Condensed", "Arial Narrow", system-ui;
+    font-size: 1.25rem;
+    font-weight: 700;
     color: #1e1a16;
-    margin: 2rem 0 .75rem;
+    margin: 2.5rem 0 .75rem;
+    text-transform: uppercase;
+    letter-spacing: 0.02em;
+    line-height: 1;
   }
 
   .prose-lesson p { margin-bottom: 1.375rem; }

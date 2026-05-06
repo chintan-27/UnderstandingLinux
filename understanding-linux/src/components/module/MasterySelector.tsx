@@ -5,19 +5,23 @@ interface MasterySelectorProps {
   onChange: (level: MasteryLevel) => void;
 }
 
-const LEVELS: { value: MasteryLevel; label: string; desc: string; bg: string; border: string; text: string }[] = [
-  { value: 1, label: 'Architectural', desc: 'Know the subsystem, why it exists, how it fits', bg: '#eff6ff', border: '#93c5fd', text: '#1d4ed8' },
-  { value: 2, label: 'Operational', desc: 'Can use tools, debug, read traces, explain behavior', bg: '#f5f3ff', border: '#c4b5fd', text: '#6d28d9' },
-  { value: 3, label: 'Implementer', desc: 'Can read and write kernel/systems code in this area', bg: '#fdf2f8', border: '#f9a8d4', text: '#be185d' },
+const LEVELS: { value: MasteryLevel; label: string; desc: string; dot: string }[] = [
+  { value: 1, label: 'Architectural', desc: 'Know the subsystem, why it exists', dot: '#60a5fa' },
+  { value: 2, label: 'Operational',   desc: 'Can use tools, debug, explain behavior', dot: '#a78bfa' },
+  { value: 3, label: 'Implementer',   desc: 'Can read and write systems code here', dot: '#f472b6' },
 ];
 
 export function MasterySelector({ level, onChange }: MasterySelectorProps) {
   return (
     <div>
-      <p style={{ fontSize: 10, fontWeight: 600, color: '#7a7570', textTransform: 'uppercase', letterSpacing: '0.1em', marginBottom: 8, fontFamily: '"JetBrains Mono", monospace' }}>
-        Mastery level
+      <p style={{
+        fontFamily: '"JetBrains Mono", monospace',
+        fontSize: 9, fontWeight: 600, color: '#a09890',
+        textTransform: 'uppercase', letterSpacing: '0.1em', marginBottom: 10,
+      }}>
+        Mastery Level
       </p>
-      <div style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
+      <div style={{ display: 'flex', flexDirection: 'column', gap: 0 }}>
         {LEVELS.map(l => {
           const isActive = level === l.value;
           return (
@@ -25,16 +29,25 @@ export function MasterySelector({ level, onChange }: MasterySelectorProps) {
               key={l.value}
               onClick={() => onChange(l.value)}
               style={{
-                width: '100%', textAlign: 'left', padding: '9px 12px',
-                borderRadius: 10, fontSize: 12, cursor: 'pointer',
-                transition: 'all 0.15s', fontFamily: '"Inter", system-ui',
-                background: isActive ? l.bg : '#f8f9fc',
-                border: `1px solid ${isActive ? l.border : 'transparent'}`,
-                color: isActive ? l.text : '#7a7570',
+                width: '100%', textAlign: 'left', padding: '8px 0',
+                fontSize: 11, cursor: 'pointer',
+                fontFamily: '"Inter", system-ui',
+                background: 'none', border: 'none',
+                borderBottom: '1px solid #f0ece6',
+                color: isActive ? '#131311' : '#a09890',
+                display: 'flex', alignItems: 'flex-start', gap: 8,
+                transition: 'color 0.1s',
               }}
             >
-              <div style={{ fontWeight: 600, fontSize: 12 }}>{l.label}</div>
-              <div style={{ opacity: 0.75, marginTop: 2, fontSize: 11, lineHeight: 1.4 }}>{l.desc}</div>
+              <span style={{
+                width: 8, height: 8, flexShrink: 0, marginTop: 2,
+                background: isActive ? l.dot : '#e5e0d8',
+                transition: 'background 0.1s',
+              }} />
+              <div>
+                <div style={{ fontWeight: isActive ? 600 : 400, fontSize: 11, marginBottom: 2 }}>{l.label}</div>
+                <div style={{ fontSize: 10, color: '#a09890', lineHeight: 1.4 }}>{l.desc}</div>
+              </div>
             </button>
           );
         })}

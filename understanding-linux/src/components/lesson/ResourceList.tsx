@@ -1,4 +1,4 @@
-import { Book, FileText, Film, Wrench, ExternalLink, Star } from 'lucide-react';
+import { Book, FileText, Film, Wrench, ExternalLink } from 'lucide-react';
 import type { Resource } from '../../types/content';
 
 const ICONS: Record<string, typeof Book> = {
@@ -10,44 +10,44 @@ const ICONS: Record<string, typeof Book> = {
   reference: ExternalLink,
 };
 
-interface ResourceListProps {
-  resources: Resource[];
-}
-
-export function ResourceList({ resources }: ResourceListProps) {
+export function ResourceList({ resources }: { resources: Resource[] }) {
   if (resources.length === 0) return null;
-
   return (
-    <div>
-      <p className="text-xs font-semibold text-surface-500 uppercase tracking-wider mb-3">Resources</p>
-      <div className="space-y-2">
-        {resources.map((r, i) => {
-          const Icon = ICONS[r.type] ?? ExternalLink;
-          return (
-            <a
-              key={i}
-              href={r.url}
-              target="_blank"
-              rel="noopener noreferrer"
-              className="flex items-start gap-2.5 p-2.5 rounded-xl border border-surface-200 hover:border-accent/30 hover:bg-accent-muted transition-all group"
-            >
-              <Icon size={13} className="text-surface-400 group-hover:text-accent mt-0.5 shrink-0" />
-              <div className="min-w-0">
-                <div className="flex items-center gap-1.5">
-                  <span className="text-xs font-medium text-surface-700 group-hover:text-surface-900 leading-snug">
-                    {r.title}
-                  </span>
-                  {r.required && <Star size={10} className="text-amber-400 shrink-0" fill="currentColor" />}
-                </div>
-                {r.description && (
-                  <p className="text-xs text-surface-400 mt-0.5 leading-snug">{r.description}</p>
-                )}
-                <span className="text-xs text-surface-300 capitalize">{r.type}</span>
+    <div style={{ display: 'flex', flexDirection: 'column', gap: 0 }}>
+      {resources.map((r, i) => {
+        const Icon = ICONS[r.type] ?? ExternalLink;
+        return (
+          <a
+            key={i}
+            href={r.url}
+            target="_blank"
+            rel="noopener noreferrer"
+            style={{
+              display: 'flex', alignItems: 'flex-start', gap: 10,
+              padding: '9px 0',
+              borderBottom: '1px solid #f0ece6',
+              textDecoration: 'none',
+              transition: 'opacity 0.1s',
+            }}
+            onMouseEnter={e => (e.currentTarget as HTMLElement).style.opacity = '0.65'}
+            onMouseLeave={e => (e.currentTarget as HTMLElement).style.opacity = '1'}
+          >
+            <Icon size={11} color="#a09890" style={{ flexShrink: 0, marginTop: 2 }} />
+            <div style={{ minWidth: 0 }}>
+              <div style={{ fontSize: 12, fontWeight: 500, color: '#131311', lineHeight: 1.35 }}>
+                {r.title}
               </div>
-            </a>
-          );
-        })}
-      </div>
+              <div style={{
+                fontFamily: '"JetBrains Mono", monospace',
+                fontSize: 9, color: '#a09890',
+                textTransform: 'capitalize', letterSpacing: '0.06em', marginTop: 2,
+              }}>
+                {r.type}
+              </div>
+            </div>
+          </a>
+        );
+      })}
     </div>
   );
 }

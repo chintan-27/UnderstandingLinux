@@ -1,20 +1,25 @@
-import { useEffect } from 'react';
+import { useEffect, useState } from 'react';
 import { useParams, Link, useNavigate } from 'react-router-dom';
-import { ArrowLeft, ArrowRight, Clock } from 'lucide-react';
 import { useCurriculum } from '../hooks/useCurriculum';
 import { useProgress } from '../hooks/useProgress';
 import { useModuleContent } from '../hooks/useModuleContent';
+import { useBreakpoint } from '../hooks/useBreakpoint';
 import { LessonBody } from '../components/lesson/LessonBody';
 import { LessonSidebar } from '../components/lesson/LessonSidebar';
 import { Spinner } from '../components/ui/Spinner';
-import { Breadcrumb } from '../components/nav/Breadcrumb';
+import { SUPERMODULE_COLORS } from '../data/supermoduleColors';
 import type { ModuleStatus, MasteryLevel } from '../types/progress';
+
+const MONO: React.CSSProperties = { fontFamily: '"JetBrains Mono", monospace' };
+const COND: React.CSSProperties = { fontFamily: '"Barlow Condensed", "Arial Narrow", system-ui' };
 
 export function ModulePage() {
   const { moduleSlug } = useParams<{ moduleSlug: string }>();
   const { getModuleBySlug, getSupermodule, getPreviousModule, getNextModule } = useCurriculum();
   const { getModuleProgress, setModuleStatus, setMasteryLevel, markVisited } = useProgress();
+  const { isMobile, isTablet } = useBreakpoint();
   const navigate = useNavigate();
+  const [sidebarOpen, setSidebarOpen] = useState(false);
 
   const module = getModuleBySlug(moduleSlug ?? '');
   const supermodule = module ? getSupermodule(module.supermoduleId) : undefined;
@@ -23,9 +28,10 @@ export function ModulePage() {
   const progress = module ? getModuleProgress(module.id) : { status: 'not_started' as const };
   const prev = module ? getPreviousModule(module.id) : undefined;
   const next = module ? getNextModule(module.id) : undefined;
+  const c = supermodule ? SUPERMODULE_COLORS[supermodule.id] : undefined;
+  const compact = isMobile || isTablet;
 
   useEffect(() => { if (module) markVisited(module.id); }, [module?.id]);
-
   useEffect(() => {
     const handler = (e: KeyboardEvent) => {
       if (e.target instanceof HTMLInputElement || e.target instanceof HTMLTextAreaElement) return;
@@ -39,181 +45,181 @@ export function ModulePage() {
   if (!module || !supermodule) {
     return (
       <div style={{ padding: 40 }}>
-        <p style={{ color: '#6b6560' }}>Module not found.</p>
-        <Link to="/curriculum" style={{ color: '#e85c2c', fontSize: 14 }}>← Curriculum</Link>
+        <p style={{ ...MONO, fontSize: 11, color: '#a09890' }}>Module not found.</p>
+        <Link to="/curriculum" style={{ ...MONO, fontSize: 11, color: '#131311', textDecoration: 'none' }}>← Curriculum</Link>
       </div>
     );
   }
 
+  const px = isMobile ? '16px' : isTablet ? '28px' : '48px';
+
   return (
-    <div style={{ padding: '28px 32px 40px', fontFamily: '"Inter", system-ui, sans-serif' }}>
-      <div style={{ maxWidth: 1100, display: 'grid', gap: 24, gridTemplateColumns: '1fr 280px' }}>
+    <div style={{ fontFamily: '"Inter", system-ui, sans-serif' }}>
 
-        {/* ── Left: lesson ── */}
-        <div style={{ minWidth: 0 }}>
-          <Breadcrumb crumbs={[
-            { label: 'Curriculum', to: '/curriculum' },
-            { label: supermodule.title, to: `/supermodule/${supermodule.slug}` },
-            { label: `#${module.id}` },
-          ]} />
-
-          {/* Module header card */}
-          <div style={{
-            marginTop: 16, marginBottom: 22,
-            background: '#ffffff', borderRadius: 24, padding: '26px 32px',
-            boxShadow: '0 1px 4px rgba(0,0,0,.05)',
-            position: 'relative', overflow: 'hidden',
-          }}>
-            {/* Gradient top accent */}
-            <div style={{
-              position: 'absolute', top: 0, left: 0, right: 0, height: 3,
-              background: 'linear-gradient(90deg, #e85c2c, #e85c2c)',
-            }} />
-
-            <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 12 }}>
-              <span style={{
-                padding: '3px 10px', borderRadius: 20,
-                fontFamily: '"JetBrains Mono", monospace', fontSize: 10.5,
-                background: '#fef2ee', color: '#c94a1e', fontWeight: 500,
+      {/* ── Header ── */}
+      <div style={{ borderBottom: '3px solid #131311' }}>
+        {/* Breadcrumb + topics bar */}
+        <div style={{
+          display: 'flex', alignItems: 'center', justifyContent: 'space-between',
+          padding: `10px ${px}`, borderBottom: '1px solid #d5cfc6', flexWrap: 'wrap', gap: 8,
+        }}>
+          <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+            <Link to="/curriculum" style={{ ...MONO, fontSize: 9, color: '#a09890', textDecoration: 'none', letterSpacing: '0.08em', textTransform: 'uppercase' }}>Curriculum</Link>
+            <span style={{ ...MONO, fontSize: 9, color: '#d5cfc6' }}>›</span>
+            {!isMobile && (
+              <>
+                <Link to={`/supermodule/${supermodule.slug}`} style={{ ...MONO, fontSize: 9, color: '#a09890', textDecoration: 'none', letterSpacing: '0.08em', textTransform: 'uppercase' }}>
+                  {supermodule.title}
+                </Link>
+                <span style={{ ...MONO, fontSize: 9, color: '#d5cfc6' }}>›</span>
+              </>
+            )}
+            <span style={{ ...MONO, fontSize: 9, color: '#6b6560', letterSpacing: '0.08em', textTransform: 'uppercase' }}>#{module.id}</span>
+          </div>
+          <div style={{ display: 'flex', gap: 12, alignItems: 'center', flexWrap: 'wrap' }}>
+            {!isMobile && module.topics.slice(0, 3).map(t => (
+              <span key={t} style={{ ...MONO, fontSize: 9, color: '#a09890', letterSpacing: '0.06em', textTransform: 'uppercase' }}>{t}</span>
+            ))}
+            {/* Mobile: inline status toggle */}
+            {compact && (
+              <button onClick={() => setSidebarOpen(o => !o)} style={{
+                ...MONO, fontSize: 9, color: '#a09890', background: 'none', border: '1px solid #d5cfc6',
+                padding: '4px 10px', cursor: 'pointer', letterSpacing: '0.08em', textTransform: 'uppercase',
               }}>
-                Part {module.part}
-              </span>
-              <span style={{ fontSize: 12.5, color: '#7a7570' }}>{module.partTitle}</span>
-            </div>
+                Status ↓
+              </button>
+            )}
+          </div>
+        </div>
 
+        {/* Mobile sidebar panel */}
+        {compact && sidebarOpen && (
+          <div style={{ padding: `16px ${px}`, borderBottom: '1px solid #d5cfc6', background: '#f8f5f0' }}>
+            <LessonSidebar
+              progress={progress}
+              resources={frontmatter?.resources ?? []}
+              onStatusChange={(s: ModuleStatus) => { setModuleStatus(module.id, s); setSidebarOpen(false); }}
+              onMasteryChange={(l: MasteryLevel) => setMasteryLevel(module.id, l)}
+            />
+          </div>
+        )}
+
+        {/* Title area */}
+        <div style={{
+          display: 'grid',
+          gridTemplateColumns: compact ? '1fr' : '100px 1fr',
+          padding: compact ? `20px ${px}` : '0 0 0 48px',
+        }}>
+          {!compact && (
+            <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'center', borderRight: '1px solid #d5cfc6', padding: '24px 0' }}>
+              <div style={{ textAlign: 'center' }}>
+                {c && <div style={{ width: 8, height: 8, background: c.dot, margin: '0 auto 8px' }} />}
+                <div style={{ ...COND, fontSize: 44, fontWeight: 700, color: '#d5cfc6', lineHeight: 1, letterSpacing: '-0.02em' }}>
+                  {String(module.id).padStart(3, '0')}
+                </div>
+              </div>
+            </div>
+          )}
+          <div style={{ padding: compact ? '0' : '24px 36px 20px' }}>
+            {compact && c && (
+              <div style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 8 }}>
+                <span style={{ width: 6, height: 6, background: c.dot }} />
+                <span style={{ ...MONO, fontSize: 9, color: '#a09890' }}>#{module.id}</span>
+              </div>
+            )}
             <h1 style={{
-              fontFamily: '"Plus Jakarta Sans", system-ui',
-              fontSize: 'clamp(1.45rem, 3vw, 1.9rem)',
-              fontWeight: 800, color: '#131311',
-              lineHeight: 1.12, letterSpacing: '-0.035em', marginBottom: 16,
+              ...COND, fontWeight: 700,
+              fontSize: isMobile ? 28 : isTablet ? 36 : 'clamp(28px, 3.5vw, 48px)',
+              textTransform: 'uppercase', letterSpacing: '-0.01em', lineHeight: 1,
+              color: '#131311', margin: 0,
             }}>
               {module.title}
             </h1>
+            {frontmatter?.estimatedMinutes && (
+              <div style={{ ...MONO, fontSize: 9, color: '#a09890', marginTop: 10, letterSpacing: '0.08em' }}>
+                ~{frontmatter.estimatedMinutes} MIN READ
+              </div>
+            )}
+          </div>
+        </div>
+      </div>
 
-            <div style={{ display: 'flex', flexWrap: 'wrap', alignItems: 'center', gap: 7 }}>
-              {frontmatter?.estimatedMinutes && (
-                <div style={{
-                  display: 'flex', alignItems: 'center', gap: 5,
-                  fontSize: 12, color: '#7a7570',
-                  padding: '4px 12px', borderRadius: 20, background: '#faf7f2',
-                  fontWeight: 500,
-                }}>
-                  <Clock size={12} /> ~{frontmatter.estimatedMinutes} min
-                </div>
-              )}
-              {module.topics.map(t => (
-                <span key={t} style={{
-                  fontSize: 11.5, borderRadius: 20, padding: '4px 12px',
-                  background: '#faf7f2', color: '#6b6560',
-                }}>
-                  {t}
-                </span>
-              ))}
+      {/* ── Two-column layout (desktop) / single (mobile) ── */}
+      <div style={{
+        display: 'grid',
+        gridTemplateColumns: compact ? '1fr' : '1fr 220px',
+        alignItems: 'start',
+      }}>
+        {/* Content */}
+        <div style={{
+          borderRight: compact ? 'none' : '1px solid #d5cfc6',
+          padding: isMobile ? '32px 16px 60px' : isTablet ? '40px 28px 60px' : '48px 56px 80px',
+        }}>
+          {loading && (
+            <div style={{ display: 'flex', justifyContent: 'center', padding: '80px 0' }}>
+              <Spinner size="lg" />
             </div>
-          </div>
+          )}
 
-          {/* Content card */}
-          <div style={{
-            background: '#ffffff', borderRadius: 24, padding: '32px 36px',
-            boxShadow: '0 1px 4px rgba(0,0,0,.05)', minHeight: 300,
-          }}>
-            {loading && (
-              <div style={{ display: 'flex', justifyContent: 'center', padding: '80px 0' }}>
-                <Spinner size="lg" />
+          {!loading && notFound && (
+            <div style={{ padding: '32px 0' }}>
+              <div style={{ ...MONO, fontSize: 10, color: '#a09890', letterSpacing: '0.1em', textTransform: 'uppercase', marginBottom: 14 }}>
+                Content coming soon
               </div>
-            )}
-
-            {!loading && notFound && (
-              <div style={{
-                background: '#faf7f2', borderRadius: 16, padding: 32, textAlign: 'center',
-              }}>
-                <div style={{
-                  width: 48, height: 48, borderRadius: 14,
-                  background: '#fef2ee', display: 'flex', alignItems: 'center', justifyContent: 'center',
-                  margin: '0 auto 16px',
-                }}>
-                  <span style={{ fontSize: 22 }}>📝</span>
-                </div>
-                <p style={{ fontFamily: '"Plus Jakarta Sans", system-ui', fontSize: 17, fontWeight: 700, color: '#1e1a16', marginBottom: 8 }}>
-                  Content coming soon
-                </p>
-                <p style={{ fontSize: 13, color: '#7a7570', marginBottom: 20 }}>This lesson will cover:</p>
-                <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8, justifyContent: 'center' }}>
-                  {module.topics.map(t => (
-                    <span key={t} style={{
-                      fontSize: 12.5, borderRadius: 20, padding: '6px 16px',
-                      background: '#ffffff', color: '#3a3530',
-                      boxShadow: '0 1px 4px rgba(0,0,0,.05)',
-                    }}>
-                      {t}
-                    </span>
-                  ))}
-                </div>
+              <div style={{ ...COND, fontSize: 22, fontWeight: 700, textTransform: 'uppercase', color: '#131311', marginBottom: 14 }}>
+                This lesson covers:
               </div>
-            )}
+              <div style={{ display: 'flex', flexDirection: 'column', gap: 0 }}>
+                {module.topics.map(t => (
+                  <div key={t} style={{ display: 'flex', alignItems: 'center', gap: 10, borderBottom: '1px solid #f0ece6', padding: '8px 0' }}>
+                    <span style={{ width: 4, height: 4, background: '#d5cfc6', flexShrink: 0 }} />
+                    <span style={{ fontSize: 13, color: '#6b6560' }}>{t}</span>
+                  </div>
+                ))}
+              </div>
+            </div>
+          )}
 
-            {!loading && markdown && <LessonBody markdown={markdown} />}
-          </div>
+          {!loading && markdown && <LessonBody markdown={markdown} />}
 
-          {/* Prev / Next nav */}
-          <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 14, marginTop: 18 }}>
+          {/* Prev / Next */}
+          <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: 0, marginTop: 48, borderTop: '1px solid #d5cfc6', paddingTop: 20 }}>
             {prev ? (
-              <Link to={`/module/${prev.slug}`} style={{
-                display: 'flex', alignItems: 'center', gap: 12, textDecoration: 'none',
-                flex: 1, padding: '14px 18px', borderRadius: 18,
-                background: '#ffffff', boxShadow: '0 1px 4px rgba(0,0,0,.05)',
-                transition: 'box-shadow 0.15s',
-              }}
-                onMouseEnter={e => (e.currentTarget as HTMLElement).style.boxShadow = '0 4px 16px rgba(0,0,0,.08)'}
-                onMouseLeave={e => (e.currentTarget as HTMLElement).style.boxShadow = '0 1px 4px rgba(0,0,0,.05)'}
+              <Link to={`/module/${prev.slug}`} style={{ display: 'block', textDecoration: 'none', padding: '14px 14px 14px 0', borderRight: '1px solid #e5e0d8', transition: 'background 0.1s' }}
+                onMouseEnter={e => (e.currentTarget as HTMLElement).style.background = '#f5f2ec'}
+                onMouseLeave={e => (e.currentTarget as HTMLElement).style.background = 'transparent'}
               >
-                <div style={{ width: 34, height: 34, borderRadius: 10, display: 'flex', alignItems: 'center', justifyContent: 'center', background: '#faf7f2', flexShrink: 0 }}>
-                  <ArrowLeft size={13} color="#6b6560" />
-                </div>
-                <div style={{ minWidth: 0 }}>
-                  <div style={{ fontSize: 10.5, color: '#7a7570', fontFamily: '"JetBrains Mono", monospace', textTransform: 'uppercase', letterSpacing: '0.07em' }}>Previous</div>
-                  <div style={{ fontSize: 13.5, fontWeight: 600, color: '#1e1a16', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{prev.title}</div>
-                </div>
+                <div style={{ ...MONO, fontSize: 9, color: '#a09890', letterSpacing: '0.08em', textTransform: 'uppercase', marginBottom: 5 }}>← Prev</div>
+                <div style={{ fontSize: 12, fontWeight: 500, color: '#131311', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{prev.title}</div>
               </Link>
-            ) : <div style={{ flex: 1 }} />}
-
+            ) : <div />}
             {next ? (
-              <Link to={`/module/${next.slug}`} style={{
-                display: 'flex', alignItems: 'center', gap: 12, textDecoration: 'none',
-                flex: 1, justifyContent: 'flex-end', textAlign: 'right',
-                padding: '14px 18px', borderRadius: 18,
-                background: '#ffffff', boxShadow: '0 1px 4px rgba(0,0,0,.05)',
-                transition: 'box-shadow 0.15s',
-              }}
-                onMouseEnter={e => (e.currentTarget as HTMLElement).style.boxShadow = '0 4px 16px rgba(0,0,0,.08)'}
-                onMouseLeave={e => (e.currentTarget as HTMLElement).style.boxShadow = '0 1px 4px rgba(0,0,0,.05)'}
+              <Link to={`/module/${next.slug}`} style={{ display: 'block', textDecoration: 'none', padding: '14px 0 14px 14px', textAlign: 'right', transition: 'background 0.1s' }}
+                onMouseEnter={e => (e.currentTarget as HTMLElement).style.background = '#f5f2ec'}
+                onMouseLeave={e => (e.currentTarget as HTMLElement).style.background = 'transparent'}
               >
-                <div style={{ minWidth: 0 }}>
-                  <div style={{ fontSize: 10.5, color: '#7a7570', fontFamily: '"JetBrains Mono", monospace', textTransform: 'uppercase', letterSpacing: '0.07em' }}>Next</div>
-                  <div style={{ fontSize: 13.5, fontWeight: 600, color: '#1e1a16', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{next.title}</div>
-                </div>
-                <div style={{ width: 34, height: 34, borderRadius: 10, display: 'flex', alignItems: 'center', justifyContent: 'center', background: '#fef2ee', flexShrink: 0 }}>
-                  <ArrowRight size={13} color="#e85c2c" />
-                </div>
+                <div style={{ ...MONO, fontSize: 9, color: '#a09890', letterSpacing: '0.08em', textTransform: 'uppercase', marginBottom: 5 }}>Next →</div>
+                <div style={{ fontSize: 12, fontWeight: 500, color: '#131311', overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>{next.title}</div>
               </Link>
-            ) : <div style={{ flex: 1 }} />}
+            ) : <div />}
           </div>
-
-          <p style={{ textAlign: 'center', marginTop: 10, fontSize: 10.5, color: '#c8c0b4', fontFamily: '"JetBrains Mono", monospace' }}>
-            <kbd style={{ background: '#f0ece6', borderRadius: 5, padding: '2px 6px', marginRight: 3, border: '1px solid #e5e0d8' }}>p</kbd> prev ·
-            <kbd style={{ background: '#f0ece6', borderRadius: 5, padding: '2px 6px', marginLeft: 3, marginRight: 3, border: '1px solid #e5e0d8' }}>n</kbd> next
-          </p>
+          <div style={{ ...MONO, fontSize: 9, color: '#c8c0b4', textAlign: 'center', marginTop: 10, letterSpacing: '0.06em' }}>
+            <kbd style={{ background: '#f0ece6', padding: '2px 5px', border: '1px solid #e5e0d8', fontSize: 9 }}>p</kbd> prev ·
+            <kbd style={{ background: '#f0ece6', padding: '2px 5px', border: '1px solid #e5e0d8', fontSize: 9, marginLeft: 4 }}>n</kbd> next
+          </div>
         </div>
 
-        {/* ── Right: sidebar ── */}
-        <div style={{ position: 'sticky', top: 28, alignSelf: 'start' }}>
-          <LessonSidebar
-            progress={progress}
-            resources={frontmatter?.resources ?? []}
-            onStatusChange={(s: ModuleStatus) => setModuleStatus(module.id, s)}
-            onMasteryChange={(l: MasteryLevel) => setMasteryLevel(module.id, l)}
-          />
-        </div>
+        {/* Desktop sidebar */}
+        {!compact && (
+          <div style={{ padding: '28px 20px', position: 'sticky', top: 48, alignSelf: 'start' }}>
+            <LessonSidebar
+              progress={progress}
+              resources={frontmatter?.resources ?? []}
+              onStatusChange={(s: ModuleStatus) => setModuleStatus(module.id, s)}
+              onMasteryChange={(l: MasteryLevel) => setMasteryLevel(module.id, l)}
+            />
+          </div>
+        )}
       </div>
     </div>
   );
