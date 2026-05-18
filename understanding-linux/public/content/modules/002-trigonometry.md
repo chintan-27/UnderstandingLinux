@@ -29,20 +29,26 @@ Euler’s formula $e^{i\theta}=\cos\theta+i\sin\theta$ links the exponential, tr
 Consider a point $P=(\cos\theta,\sin\theta)$ on the unit circle $x^2+y^2=1$. By definition of cosine and sine as the $x$‑ and $y$‑coordinates,
 $$\cos^2\theta+\sin^2\theta = 1 \quad\text{(Pythagorean identity).}$$  
 Differentiating $\sin\theta$ and $\cos\theta$ with respect to $\theta$ yields
-$$\frac{d}{d\theta}\sin\theta = \cos\theta,\qquad 
-\frac{d}{d\theta}\cos\theta = -\sin\theta,$$
-which follows from the geometry of the circle (arc length $= \radius \cdot \Delta\theta$).
+$$
+\frac{d}{d\theta}\sin\theta = \cos\theta,\qquad 
+\frac{d}{d\theta}\cos\theta = -\sin\theta,
+$$
+which follows from the geometry of the circle (arc length $= r \cdot \Delta\theta$).
 
 ### Angle‑Addition Formulas via Euler’s Formula
 Start with $e^{i(\alpha+\beta)} = e^{i\alpha}e^{i\beta}$. Expanding each side with Euler’s formula gives  
-$$\cos(\alpha+\beta)+i\sin(\alpha+\beta)=
-(\cos\alpha+i\sin\alpha)(\cos\beta+i\sin\beta).$$  
+$$
+\cos(\alpha+\beta)+i\sin(\alpha+\beta)=
+(\cos\alpha+i\sin\alpha)(\cos\beta+i\sin\beta).
+$$
 Multiplying the right‑hand side and equating real and imaginary parts produces  
 $$\boxed{\cos(\alpha+\beta)=\cos\alpha\cos\beta-\sin\alpha\sin\beta}$$  
 $$\boxed{\sin(\alpha+\beta)=\sin\alpha\cos\beta+\cos\alpha\sin\beta}.$$  
 Setting $\beta=\alpha$ yields the double‑angle formulas  
-$$\sin(2\alpha)=2\sin\alpha\cos\alpha,\qquad 
-\cos(2\alpha)=\cos^2\alpha-\sin^2\alpha.$$
+$$
+\sin(2\alpha)=2\sin\alpha\cos\alpha,\qquad 
+\cos(2\alpha)=\cos^2\alpha-\sin^2\alpha.
+$$
 
 ### From Time‑Domain to Frequency‑Domain
 A real‑valued sinusoid $x(t)=A\cos(\omega_0 t+\phi)$ can be written as the sum of two complex exponentials:
